@@ -1,0 +1,26 @@
+# OS / editor cruft
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+
+# Skill local state (per-machine, not for sharing)
+data/*.jsonl
+data/*.txt
+data/sample_*.txt
+
+# Skill config containing personal info (sender details, calendar URL, etc)
+# Always commit config.example.yaml — never the filled-in config.yaml
+config.yaml
+targets.yaml
+targets.csv
+targets.csv.bak

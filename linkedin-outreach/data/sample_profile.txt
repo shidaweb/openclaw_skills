@@ -1,0 +1,549 @@
+- generic [active] [ref=e1]:
+  - banner [ref=e2]:
+    - generic [ref=e6]:
+      - link [ref=e7] [cursor=pointer]:
+        - /url: /sales/index
+      - list [ref=e9]:
+        - listitem [ref=e10]:
+          - link "Home" [ref=e11] [cursor=pointer]:
+            - /url: /sales/home
+            - generic [ref=e12]: Home
+        - listitem [ref=e13]:
+          - link "Accounts" [ref=e14] [cursor=pointer]:
+            - /url: /sales/accounts/dashboard
+        - listitem [ref=e15]:
+          - link "Leads" [ref=e16] [cursor=pointer]:
+            - /url: /sales/lists/people
+        - listitem [ref=e17]:
+          - link "Messaging" [ref=e18] [cursor=pointer]:
+            - /url: /sales/inbox?trk=d_sales2_app_header_inbox
+            - generic [ref=e19]: Messaging
+        - listitem
+      - generic [ref=e20]:
+        - heading "Actions List" [level=2] [ref=e21]
+        - button "Referrals" [ref=e22] [cursor=pointer]:
+          - generic [ref=e25]: Referrals
+        - separator [ref=e26]
+      - button "Open help center" [ref=e27] [cursor=pointer]:
+        - img "Help" [ref=e29]:
+          - img [ref=e31]
+      - generic [ref=e33]:
+        - generic [ref=e34]:
+          - generic [ref=e35]: "2"
+          - generic [ref=e36]: 2 new notifications
+        - 'button "Notifications: You have 2 unseen notifications" [ref=e37] [cursor=pointer]':
+          - img [ref=e39]
+      - button "Norimitsu Shida Norimitsu Shida’s profile picture" [ref=e42] [cursor=pointer]:
+        - generic [ref=e43]:
+          - generic [ref=e44]: Norimitsu Shida
+          - img "Norimitsu Shida’s profile picture" [ref=e45]
+    - generic [ref=e49]:
+      - heading "Search" [level=2] [ref=e50]
+      - generic [ref=e51]:
+        - generic [ref=e54]:
+          - generic [ref=e55]:
+            - generic [ref=e56]:
+              - generic [ref=e57]: Search
+              - generic:
+                - img
+              - combobox "Search" [ref=e60]
+            - list [ref=e62]:
+              - listitem [ref=e63]:
+                - link "Lead filters" [ref=e64] [cursor=pointer]:
+                  - /url: /sales/search/people?viewAllFilters=true
+                  - img [ref=e66]
+                  - generic [ref=e68]: Lead filters
+              - listitem [ref=e69]:
+                - link "Account filters" [ref=e70] [cursor=pointer]:
+                  - /url: /sales/search/company?viewAllFilters=true
+                  - img [ref=e72]
+                  - generic [ref=e74]: Account filters
+          - generic:
+            - region "Search suggestions"
+        - button "Saved searches" [ref=e76] [cursor=pointer]:
+          - generic [ref=e77]: Saved searches
+        - button "Personas" [ref=e78] [cursor=pointer]:
+          - generic [ref=e79]: Personas
+  - main [ref=e80]:
+    - generic [ref=e84]:
+      - generic [ref=e86]:
+        - heading "Sales Navigator Lead Page" [level=1] [ref=e87]
+        - generic [ref=e88]:
+          - generic [ref=e89]:
+            - heading "Basic lead information for Evan Baehr" [level=1] [ref=e90]
+            - generic [ref=e93]:
+              - generic [ref=e94]:
+                - button "Enlarge Evan Baehr’s profile picture" [ref=e96] [cursor=pointer]:
+                  - img "’s profile picture" [ref=e98]
+                - generic [ref=e99]:
+                  - heading "Evan Baehr" [level=1] [ref=e100]
+                  - generic [ref=e101]: 3rd
+                  - generic [ref=e102]:
+                    - img "First time view" [ref=e103]
+                    - list
+                - generic [ref=e104]: Founder, community builder, venture investor, and Apple-TV show host.
+                - generic [ref=e105]:
+                  - generic [ref=e106]:
+                    - img [ref=e107]
+                    - text: Austin, Texas, United States
+                  - generic [ref=e109]:
+                    - img [ref=e110]
+                    - text: 500+ connections
+              - generic [ref=e113]:
+                - generic [ref=e114]:
+                  - button "Save Evan Baehr as a lead. Save to list." [ref=e116] [cursor=pointer]:
+                    - generic [ref=e117]: Save
+                  - button "Message" [ref=e119] [cursor=pointer]:
+                    - generic [ref=e120]: Message
+                - button "Open actions overflow menu" [ref=e122] [cursor=pointer]:
+                  - img [ref=e124]
+            - list [ref=e129]:
+              - listitem [ref=e130]:
+                - button "2 recent posts on Linkedin" [ref=e131] [cursor=pointer]:
+                  - generic [ref=e132]: 2 recent posts on Linkedin
+            - generic [ref=e133]:
+              - generic [ref=e134]:
+                - heading "Current roles" [level=2] [ref=e135]
+                - list [ref=e136]:
+                  - listitem [ref=e137]:
+                    - generic [ref=e138]:
+                      - link "Arena Hall" [ref=e140] [cursor=pointer]:
+                        - /url: /sales/company/104164782
+                        - img "Arena Hall" [ref=e141]
+                      - generic [ref=e142]:
+                        - paragraph [ref=e143]:
+                          - text: Chief Executive Officer at
+                          - link "Arena Hall" [ref=e144] [cursor=pointer]:
+                            - /url: /sales/company/104164782
+                          - button "See more about Arena Hall" [ref=e145] [cursor=pointer]
+                        - paragraph [ref=e146]:
+                          - generic [ref=e147]: Mar 2025–Present ·
+                          - text: 1 yr 3 mos
+                  - listitem [ref=e148]:
+                    - generic [ref=e149]:
+                      - link "Flourish Ventures" [ref=e151] [cursor=pointer]:
+                        - /url: /sales/company/107847751
+                        - img "Flourish Ventures" [ref=e152]
+                      - generic [ref=e153]:
+                        - paragraph [ref=e154]:
+                          - text: Managing Partner at
+                          - link "Flourish Ventures" [ref=e155] [cursor=pointer]:
+                            - /url: /sales/company/107847751
+                          - button "See more about Flourish Ventures" [ref=e156] [cursor=pointer]
+                        - paragraph [ref=e157]:
+                          - generic [ref=e158]: Sep 2024–Present ·
+                          - text: 1 yr 9 mos
+                - button "View job descriptions" [ref=e159] [cursor=pointer]:
+                  - generic [ref=e161]: View job descriptions
+                - paragraph [ref=e162]:
+                  - text: Also worked at
+                  - generic [ref=e163]: In the Arena,
+                  - link "Learn" [ref=e164] [cursor=pointer]:
+                    - /url: /sales/company/1736653
+                  - text: ","
+                  - link "Manhattan Institute" [ref=e165] [cursor=pointer]:
+                    - /url: /sales/company/76239
+                  - button "See more" [ref=e166] [cursor=pointer]:
+                    - generic [ref=e168]: See more
+              - generic [ref=e169]:
+                - heading "Contact information" [level=2] [ref=e170]
+                - generic [ref=e171]:
+                  - generic [ref=e172]:
+                    - list [ref=e173]:
+                      - listitem [ref=e174]:
+                        - img [ref=e176]
+                        - link "Evan’s website http://www.evanbaehr.com" [ref=e178] [cursor=pointer]:
+                          - /url: http://www.evanbaehr.com
+                          - generic [ref=e179]: Evan’s website
+                          - generic [ref=e180]: http://www.evanbaehr.com
+                      - listitem [ref=e181]:
+                        - img [ref=e183]
+                        - link "Evan’s Twitter evanbaehr" [ref=e186] [cursor=pointer]:
+                          - /url: https://twitter.com/evanbaehr
+                          - generic [ref=e187]: Evan’s Twitter
+                          - generic [ref=e188]: evanbaehr
+                    - button "Add contact info for Evan" [ref=e189] [cursor=pointer]:
+                      - generic [ref=e190]: Add contact info
+                  - paragraph [ref=e192]:
+                    - link "Search for Evan on Bing" [ref=e193] [cursor=pointer]:
+                      - /url: https://www.bing.com/search?q=Evan+Baehr
+                      - img [ref=e195]
+                      - generic [ref=e197]: Search on Bing
+            - generic [ref=e199]:
+              - button "Go to Lead IQ section, New" [ref=e200] [cursor=pointer]:
+                - generic "Lead IQ (new feature)" [ref=e201]: New Lead IQ
+              - button "Go to About section" [ref=e202] [cursor=pointer]:
+                - generic "About (new feature)" [ref=e203]: About
+              - button "Go to Relationship section" [ref=e204] [cursor=pointer]:
+                - generic "Relationship (new feature)" [ref=e205]: Relationship
+              - button "Go to Experience section" [ref=e206] [cursor=pointer]:
+                - generic "Experience (new feature)" [ref=e207]: Experience
+          - generic [ref=e211]:
+            - generic [ref=e212]:
+              - generic [ref=e213]:
+                - img [ref=e214]
+                - heading "Get insights about Evan BETA" [level=1] [ref=e216]:
+                  - text: Get insights about Evan
+                  - generic [ref=e218]: BETA
+              - paragraph [ref=e219]:
+                - text: View personalized AI powered insights based on Evan’s profile and activity.
+                - link "Learn more" [ref=e220] [cursor=pointer]:
+                  - /url: https://www.linkedin.com/help/sales-navigator/answer/a6841315
+            - button "Generate Lead IQ" [ref=e221] [cursor=pointer]:
+              - generic [ref=e223]:
+                - img [ref=e224]
+                - text: Generate Lead IQ
+          - generic [ref=e226]:
+            - heading "About" [level=1] [ref=e227]
+            - generic [ref=e228]:
+              - generic [ref=e229]:
+                - text: Evan Baehr is about human flourishing -- in companies, investments, books, TV shows, and relationships.
+                - button "… Show more" [ref=e230] [cursor=pointer]
+          - region "Relationship" [ref=e231]:
+            - generic "Relationship" [ref=e232]:
+              - heading "Relationship" [level=2] [ref=e233]
+            - region "Start a conversation with Evan" [ref=e234]:
+              - generic "Start a conversation with Evan" [ref=e235]:
+                - heading "Start a conversation with Evan" [level=2] [ref=e236]
+                - paragraph [ref=e237]: Comment on Evan’s posts or mention what you have in common in a message.
+              - region "Recent activity on LinkedIn" [ref=e238]:
+                - generic "Recent activity on LinkedIn" [ref=e239]:
+                  - heading "Recent activity on LinkedIn" [level=3] [ref=e240]
+                  - paragraph [ref=e241]: Posts by, comments from, and news mentions about Evan
+                - generic [ref=e242]:
+                  - list [ref=e243]:
+                    - listitem [ref=e244]:
+                      - button [ref=e245] [cursor=pointer]:
+                        - article [ref=e246]:
+                          - generic [ref=e247]:
+                            - heading "Evan Baehr shared a post" [level=4] [ref=e248]:
+                              - generic [ref=e249]: Evan Baehr shared a post
+                              - generic [ref=e250]: Evan Baehr shared a post
+                            - generic [ref=e251]: ·
+                            - time [ref=e252]: 1w ago
+                          - generic [ref=e257]: "Yesterday: Arena Hall deep tech tour: a bus, 40 builders and investors, and a 60-mile loop through Starlink → Boring → Black's BBQ → Proto-Town → Oklo's first nuclear reactor. The equation I see: Austin as the dynamic cosmopolitan city engineers want to live in. Land that is lightly regulated, easy to permit, has great utilities, and is low cost. Spirit of Texans: hard working subcontractors, lawmakers who clear pathways, pastors and rabbis who shepherd their flocks... all sitting together over BBQ and beers to say: let's build--for Texas, for America, for the world. 5 things I can't stop thinking about. — 1/ Boring isn't 20% better. It's 10x better. Vegas tendered a project to connect their convention centers. Runner-up bid: $500M. Boring delivered, fully operational: $45M. They're now boring 60 miles under Vegas. And the tunnels are the wedge — not the business. Same playbook SpaceX used to make Starlink possible: cut the cost of the underlying thing, then build everything that becomes economic on top of it. — 2/ Proto-Town is becoming a civil society, not just a campus. A common tool shop. Bunk-bed conversations between engineers from different companies. A speakeasy called the Pink Poodle Club. Limestone arriving for the first synagogue — Josh Kushner is delivering the Torah. Another founder is financing a church, where they'll host music nights and Sunday worship. This is what early SpaceX and early Neuralink felt like. Neuralink built robots above a bar. Boring was digging holes with no roof. Velocity comes from trust + proximity + shared tools. — 3/ The American Shenzhen — minus the parts we'd never copy. No forced labor. No human rights violations. No state-owned enterprises. Yes co-located manufacturing, shared specialty equipment, housing next to the lab, and regulators who say yes. Jacob DeWitte (Oklo) walked us through a small modular reactor built in ~230 days. Same project in Idaho: 3+ years. — 4/ The unsung infrastructure is a man named John Cyrier. 25-year Caldwell County resident. Former elected official. Built and sold a construction company. Knows hundreds of subs in Central Texas. He wasn't a \"nice to have.\" He was load-bearing. He has the relationships and trust--much needed and deserved. — 5/ The ecosystem is the product. Starlink's head of production told us their hardest hire isn't engineers. It's specialty trades who'll relocate to Austin — because if Starlink stops needing them tomorrow, there's no second customer. The fix: more atoms-economy companies in the same zip code. Re-industrializing America is a real thing. It's happening in Central Texas."
+                          - generic [ref=e258]:
+                            - list [ref=e259]:
+                              - listitem [ref=e260]:
+                                - img [ref=e261]:
+                                  - img [ref=e262]
+                              - listitem [ref=e264]:
+                                - img [ref=e265]:
+                                  - img [ref=e266]
+                              - listitem [ref=e268]:
+                                - img [ref=e269]:
+                                  - img [ref=e270]
+                              - listitem [ref=e272]:
+                                - img [ref=e273]:
+                                  - img [ref=e274]
+                            - generic [ref=e276]: "163"
+                            - generic [ref=e277]: 163 reactions
+                            - generic [ref=e278]: 15 Comments
+                    - listitem [ref=e279]:
+                      - button [ref=e280] [cursor=pointer]:
+                        - article [ref=e281]:
+                          - generic [ref=e282]:
+                            - heading "Evan Baehr shared a post" [level=4] [ref=e283]:
+                              - generic [ref=e284]: Evan Baehr shared a post
+                              - generic [ref=e285]: Evan Baehr shared a post
+                            - generic [ref=e286]: ·
+                            - time [ref=e287]: 2w ago
+                          - generic [ref=e290]:
+                            - img "Thumbnail image" [ref=e292]
+                            - generic [ref=e294]: "America has settled into a deserved 2nd place in most areas of competition, often behind China. But there is a framework for hope. Last week, I had the honor of emceeing Endless Frontiers. The question we kept circling: what is \"Remember the Alamo\" for this generation? A bit of Texas history. After months of crushing defeats, Sam Houston had no reason to be an optimist. Then on April 21, 1836, during the Mexican Army's afternoon siesta, he launched a surprise attack and won the war in 18 minutes — paving the way for Texas independence and American continental power. So what's our \"Remember the Alamo\" today? Three from history: → Sputnik (1957). A Soviet beach ball in orbit gave us DARPA, NASA, the National Defense Education Act, and a generation of moonshots. → Mountain Pass. America discovered rare earths. Molycorp, our champion, went bankrupt in 2015 after Chinese subsidies undercut it. The Pentagon now buys F-35 magnets from China. → Desert One (1980). Eight helicopters into Iran. Sandstorms, mechanical failures, a collision on the ground, eight Americans dead. That humiliation built modern SOCOM, Delta Force, and the 160th SOAR. Former Office of Net Assessment Director Jim Baker added contemporary ones: → The War on Terror — 20 years, $8 trillion, 7,000+ American dead, no strategic gains → The 2008 Financial Crisis — 6 million families lost their homes; no banker prosecutions → COVID — worst per-capita death rate among advanced democracies; half a year of schooling lost → The Afghanistan withdrawal — 11-day collapse, 13 Marines dead at Abbey Gate → The opioid crisis — hundreds of thousands dead, an inadequate response I'd add three more that haunt the industrial base: → U.S. shipbuilding — China builds about half the world's ships. We build less than 1%. → Bell Labs — the greatest corporate R&D engine in human history, dismantled. → The 155mm shell — when Ukraine asked for artillery, our industrial base couldn't keep up. So where's the hope? Tocqueville nailed it 200 years ago. When the French want something, they demand it of the bureaucrats. When the British, the aristocrats. When Americans want something, they simply do it. That voluntary self-organization explains everything from the VFW to garden clubs, the Rotary to the Elks Lodge. When former DNI Avril Haines was asked whether anything like that is happening in China right now, she answered: \"Absolutely not.\" What's happening here — at this conference and in this country — is people from different industries, professions, and ideologies self-organizing to understand our defeats, plot strategy, and steel themselves to do hard, important things. We may be #2 in synthetic biology, quantum, humanoid robotics, university research, and even national approval. We remain #1 at self-organizing, collaborating, and executing. There is no better moment to inject more of that spirit as we begin the next 250 years. #EndlessFrontiers #AmericanRenewal #Reindustrialization"
+                          - generic [ref=e295]:
+                            - list [ref=e296]:
+                              - listitem [ref=e297]:
+                                - img [ref=e298]:
+                                  - img [ref=e299]
+                              - listitem [ref=e301]:
+                                - img [ref=e302]:
+                                  - img [ref=e303]
+                              - listitem [ref=e305]:
+                                - img [ref=e306]:
+                                  - img [ref=e307]
+                              - listitem [ref=e309]:
+                                - img [ref=e310]:
+                                  - img [ref=e311]
+                            - generic [ref=e313]: "145"
+                            - generic [ref=e314]: 145 reactions
+                            - generic [ref=e315]: 18 Comments
+                    - listitem [ref=e316]:
+                      - button [ref=e317] [cursor=pointer]:
+                        - article [ref=e318]:
+                          - generic [ref=e319]:
+                            - heading "Evan Baehr shared a post" [level=4] [ref=e320]:
+                              - generic [ref=e321]: Evan Baehr shared a post
+                              - generic [ref=e322]: Evan Baehr shared a post
+                            - generic [ref=e323]: ·
+                            - time [ref=e324]: 2w ago
+                          - generic [ref=e327]:
+                            - img "Thumbnail image" [ref=e329]
+                            - generic [ref=e331]
+                          - generic [ref=e332]:
+                            - list [ref=e333]:
+                              - listitem [ref=e334]:
+                                - img [ref=e335]:
+                                  - img [ref=e336]
+                              - listitem [ref=e338]:
+                                - img [ref=e339]:
+                                  - img [ref=e340]
+                              - listitem [ref=e342]:
+                                - img [ref=e343]:
+                                  - img [ref=e344]
+                            - generic [ref=e346]: "231"
+                            - generic [ref=e347]: 231 reactions
+                            - generic [ref=e348]: 7 Comments
+                  - button "See all activities" [ref=e350] [cursor=pointer]:
+                    - generic [ref=e351]: See all activities
+              - region "What you share in common" [ref=e352]:
+                - generic "What you share in common" [ref=e353]:
+                  - heading "What you share in common" [level=3] [ref=e354]
+                  - paragraph [ref=e355]: Shared interest, groups, and past experience with Evan
+                - paragraph [ref=e356]: You and Evan don’t share any connections, groups or past experiences on LinkedIn.
+            - separator [ref=e357]
+            - region "Get introduced" [ref=e358]:
+              - generic "Get introduced" [ref=e359]:
+                - heading "Get introduced" [level=2] [ref=e360]
+                - paragraph [ref=e361]: Ask your colleagues and shared connections for a warm introduction to Evan.
+              - generic [ref=e362]:
+                - heading "Filter by connection type" [level=4] [ref=e363]
+                - radiogroup "Filter by connection type"
+                - generic [ref=e364]:
+                  - img [ref=e365]:
+                    - img [ref=e366]
+                  - paragraph [ref=e368]:
+                    - text: There aren’t any warm introductions available with Evan. Search for other leads at
+                    - strong [ref=e369]: Arena Hall
+                    - text: instead.
+                  - link "Search leads" [ref=e370] [cursor=pointer]:
+                    - /url: /sales/search/people?query=(filters%3AList((type%3ACURRENT_COMPANY%2Cvalues%3AList((id%3A104164782%2CselectionType%3AINCLUDED)))))
+                    - generic [ref=e371]: Search leads
+          - generic [ref=e372]:
+            - generic [ref=e373]:
+              - generic [ref=e374]:
+                - heading "Evan’s experience" [level=2] [ref=e375]
+                - paragraph [ref=e376]: Evan has worked for 13 different companies over their professional career
+                - list [ref=e377]:
+                  - listitem [ref=e378]:
+                    - generic [ref=e379]:
+                      - link "Arena Hall" [ref=e381] [cursor=pointer]:
+                        - /url: /sales/company/104164782
+                        - img "Arena Hall" [ref=e382]
+                      - generic [ref=e383]:
+                        - heading "Chief Executive Officer" [level=2] [ref=e384]
+                        - link "Arena Hall" [ref=e386] [cursor=pointer]:
+                          - /url: /sales/company/104164782
+                          - paragraph [ref=e387]: Arena Hall
+                        - paragraph [ref=e388]:
+                          - generic [ref=e389]: Mar 2025–Present ·
+                          - text: 1 yr 3 mos
+                        - paragraph [ref=e390]: Austin, Texas Metropolitan Area
+                    - 'generic "I couldn''t be more excited to be building this venture-backed startup in hospitality and community because it sits at the intersection of so many things that I love: community, entrepreneurship, hospitality, and shaping culture and leaders in ways that more people will flourish. We''re launching a community in an extraordinary physical asset in Austin, Texas, (cannot say yet!) that will eventually grow into a network of clubs, venues, and destinations." [ref=e391]':
+                      - generic [ref=e392]:
+                        - text: "I couldn't be more excited to be building this venture-backed startup in hospitality and community because it sits at the intersection of so many things that I love: community, entrepreneurship, hospitality, and shaping culture and leaders in ways that more people will flourish. We're launching a community in an extraordinary physical asset in Austin, Texas, (cannot say yet!) that will eventually grow into a network of clubs, v"
+                        - button "… Show more" [ref=e393] [cursor=pointer]
+                    - list [ref=e394]:
+                      - listitem [ref=e395]:
+                        - link "Arena Hall" [ref=e396] [cursor=pointer]:
+                          - /url: https://www.arenahall.com/
+                          - figure [ref=e397]:
+                            - img [ref=e400]
+                          - generic [ref=e402]: Arena Hall
+                  - listitem [ref=e403]:
+                    - generic [ref=e404]:
+                      - link "Flourish Ventures" [ref=e406] [cursor=pointer]:
+                        - /url: /sales/company/107847751
+                        - img "Flourish Ventures" [ref=e407]
+                      - generic [ref=e408]:
+                        - heading "Managing Partner" [level=2] [ref=e409]
+                        - link "Flourish Ventures" [ref=e411] [cursor=pointer]:
+                          - /url: /sales/company/107847751
+                          - paragraph [ref=e412]: Flourish Ventures
+                        - paragraph [ref=e413]:
+                          - generic [ref=e414]: Sep 2024–Present ·
+                          - text: 1 yr 9 mos
+                        - paragraph [ref=e415]: Austin, Texas Metropolitan Area
+                    - generic [ref=e416]:
+                      - generic [ref=e417]:
+                        - text: "I make direct investments in companies on a mission to drive human flourishing. What is that? I ask: are we making Earth a bit more like what we think heaven will look like?"
+                        - text: Humans that are physically and mentally healthy, clean water and air, healthy soil and whole foods, cheap clean energy for everyone, and continued rise in the s
+                        - button "… Show more" [ref=e418] [cursor=pointer]
+                  - listitem [ref=e419]:
+                    - generic [ref=e420]:
+                      - img "In the Arena" [ref=e421]
+                      - generic [ref=e422]:
+                        - heading "Host, In the Arena (Apple TV)" [level=2] [ref=e423]
+                        - paragraph [ref=e424]: In the Arena
+                        - paragraph [ref=e425]:
+                          - generic [ref=e426]: Jun 2023–Apr 2025 ·
+                          - text: 1 yr 11 mos
+                    - generic [ref=e427]: In collaboration with Freethink Media, Evan Baehr hosted two seasons of an in-depth interview series featuring bold founders building for-profit companies to solve some of the biggest problems in the world. The seasons were selected by Apple TV for distribution.
+                    - list [ref=e428]:
+                      - listitem [ref=e429]:
+                        - link "In the Arena TV Show Trailer" [ref=e430] [cursor=pointer]:
+                          - /url: https://www.youtube.com/watch?v=K3rms1yITEg
+                          - figure [ref=e431]:
+                            - img [ref=e434]
+                          - generic [ref=e436]: In the Arena TV Show Trailer
+                  - listitem [ref=e437]:
+                    - generic [ref=e438]:
+                      - link "Learn" [ref=e440] [cursor=pointer]:
+                        - /url: /sales/company/1736653
+                        - img "Learn" [ref=e441]
+                      - generic [ref=e442]:
+                        - heading "Managing Partner" [level=2] [ref=e443]
+                        - link "Learn" [ref=e445] [cursor=pointer]:
+                          - /url: /sales/company/1736653
+                          - paragraph [ref=e446]: Learn
+                        - paragraph [ref=e447]:
+                          - generic [ref=e448]: Jan 2022–Sep 2024 ·
+                          - text: 2 yrs 9 mos
+                        - paragraph [ref=e449]: Austin, Texas Metropolitan Area
+                    - 'generic "Learn is the first and leading VC focused on the $7+ trillion global education and human capital development sector. It manages $1 billion over 5 fund vehicles. We boast 8 unicorns, 3 IPOs, and 27 M&A outcomes. More importantly, our 204 companies serve over 1B users in 253 countries. Over 12 years, Learn has become the leading venture capital fund investing in companies that empower and accelerate individuals. We call it human flourishing. Our companies prove that startups are one of the best ways to solve huge, public problems. That’s my mission: to back and build the best, biggest, and most successful venture-backed companies because they organize the smartest and hardest working people around the world’s biggest problems." [ref=e450]':
+                      - generic [ref=e451]:
+                        - text: Learn is the first and leading VC focused on the $7+ trillion global education and human capital development sector. It manages $1 billion over 5 fund vehicles. We boast 8 unicorns, 3 IPOs, and 27 M&A outcomes. More importantly, our 204 companies serve over 1B users in 253 countries.
+                        - button "… Show more" [ref=e452] [cursor=pointer]
+                    - list [ref=e453]:
+                      - listitem [ref=e454]:
+                        - link "Learn Capital 2024 Annual Meeting Recap" [ref=e455] [cursor=pointer]:
+                          - /url: https://www.youtube.com/watch?v=SNg9RsOMp94
+                          - figure [ref=e456]:
+                            - img [ref=e459]
+                          - generic [ref=e461]: Learn Capital 2024 Annual Meeting Recap
+                      - listitem [ref=e462]:
+                        - link "Screenshot 2025-06-27 at 7.33.28 AM.png" [ref=e463] [cursor=pointer]:
+                          - /url: https://media.licdn.com/dms/image/v2/D562DAQFgTDS8d5PKaA/profile-treasury-image-shrink_800_800/B56ZexKnCnHoAg-/0/1751024039268?e=1778468218&v=beta&t=NtFmf6MiC_YNz4OXrP0y48dm-PNq43Hq7Lu39Mcfu6A
+                          - figure [ref=e464]:
+                            - img [ref=e467]
+                          - generic [ref=e469]: Screenshot 2025-06-27 at 7.33.28 AM.png
+                  - listitem [ref=e470]:
+                    - generic [ref=e471]:
+                      - link "Manhattan Institute" [ref=e473] [cursor=pointer]:
+                        - /url: /sales/company/76239
+                        - img "Manhattan Institute" [ref=e474]
+                      - generic [ref=e475]:
+                        - heading "Board Member, Founder - Adam Smith Society" [level=2] [ref=e476]
+                        - link "Manhattan Institute" [ref=e478] [cursor=pointer]:
+                          - /url: /sales/company/76239
+                          - paragraph [ref=e479]: Manhattan Institute
+                        - paragraph [ref=e480]:
+                          - generic [ref=e481]: May 2011–Feb 2022 ·
+                          - text: 10 yrs 10 mos
+                        - paragraph [ref=e482]: New York, NY
+                    - generic [ref=e483]:
+                      - generic [ref=e484]:
+                        - text: "Cofounder of Ideas@Work, is a non-partisan community of Harvard Business School students that explores political and economic ideas to promote human flourishing. These principles are three-fold: individual liberty, limited government, and free enterprise. This club was merged with the Manhattan Institute's Adam Smith Society, paving the way for this now 18-chapter national organization with over 10,000 members."
+                        - button "… Show more" [ref=e485] [cursor=pointer]
+                    - list [ref=e486]:
+                      - listitem [ref=e487]:
+                        - link "Advisor Jeff Yass on \"How Business Can Stand Up for Capitalism\"" [ref=e488] [cursor=pointer]:
+                          - /url: https://www.youtube.com/watch?v=wncgxj7-e3w
+                          - figure [ref=e489]:
+                            - img [ref=e492]
+                          - generic [ref=e494]: Advisor Jeff Yass on "How Business Can Stand Up for Capitalism"
+                      - listitem [ref=e495]:
+                        - link "Adam Smith Society Introductory Video" [ref=e496] [cursor=pointer]:
+                          - /url: https://www.youtube.com/watch?v=ahLWwM1yq6c
+                          - figure [ref=e497]:
+                            - img [ref=e500]
+                          - generic [ref=e502]: Adam Smith Society Introductory Video
+              - button "Show all positions" [ref=e503] [cursor=pointer]:
+                - img [ref=e505]
+                - generic [ref=e507]: Show all positions
+            - generic [ref=e509]:
+              - heading "Education" [level=2] [ref=e510]
+              - list [ref=e511]:
+                - listitem [ref=e512]:
+                  - link "Harvard Business School" [ref=e513] [cursor=pointer]:
+                    - /url: https://www.linkedin.com/school/harvard-business-school/
+                    - img "Harvard Business School" [ref=e514]
+                  - generic [ref=e515]:
+                    - heading "Harvard Business School" [level=3] [ref=e516]:
+                      - link "Harvard Business School" [ref=e517] [cursor=pointer]:
+                        - /url: https://www.linkedin.com/school/harvard-business-school/
+                    - paragraph [ref=e518]:
+                      - generic [ref=e519]: MBA (with distinction)
+                      - generic [ref=e520]: Entrepreneurship
+                    - paragraph [ref=e521]:
+                      - generic [ref=e522]:
+                        - time [ref=e523]: "2009"
+                        - text: –
+                        - time [ref=e524]: "2011"
+                - listitem [ref=e525]:
+                  - link "Yale University" [ref=e526] [cursor=pointer]:
+                    - /url: https://www.linkedin.com/school/yale-university/
+                    - img "Yale University" [ref=e527]
+                  - generic [ref=e528]:
+                    - heading "Yale University" [level=3] [ref=e529]:
+                      - link "Yale University" [ref=e530] [cursor=pointer]:
+                        - /url: https://www.linkedin.com/school/yale-university/
+                    - paragraph [ref=e531]:
+                      - generic [ref=e532]: M.A.R. (summa)
+                      - generic [ref=e533]: Ethics and Law
+                    - paragraph [ref=e534]:
+                      - generic [ref=e535]:
+                        - time [ref=e536]: "2006"
+                        - text: –
+                        - time [ref=e537]: "2008"
+                - listitem [ref=e538]:
+                  - link "Princeton University" [ref=e539] [cursor=pointer]:
+                    - /url: https://www.linkedin.com/school/princeton-university/
+                    - img "Princeton University" [ref=e540]
+                  - generic [ref=e541]:
+                    - heading "Princeton University" [level=3] [ref=e542]:
+                      - link "Princeton University" [ref=e543] [cursor=pointer]:
+                        - /url: https://www.linkedin.com/school/princeton-university/
+                    - paragraph [ref=e544]:
+                      - generic [ref=e545]: AB
+                      - generic [ref=e546]: Woodrow Wilson School of Public and International Affairs
+                    - paragraph [ref=e547]:
+                      - generic [ref=e548]:
+                        - time [ref=e549]: "2001"
+                        - text: –
+                        - time [ref=e550]: "2005"
+            - generic [ref=e551]:
+              - generic [ref=e552]:
+                - heading "Interests" [level=2] [ref=e553]
+                - list [ref=e554]:
+                  - listitem [ref=e555]:
+                    - link "Foreign Policy Discussion Group’s group image Foreign Policy Discussion Group 4,528 followers See more about Foreign Policy Discussion Group" [ref=e556] [cursor=pointer]:
+                      - /url: https://www.linkedin.com/groups/1809177
+                      - img "Foreign Policy Discussion Group’s group image" [ref=e558]
+                      - generic [ref=e559]:
+                        - generic [ref=e560]: Foreign Policy Discussion Group
+                        - generic [ref=e561]: 4,528 followers
+                      - button "See more about Foreign Policy Discussion Group" [ref=e562]
+                  - listitem [ref=e563]:
+                    - link "Reid Hoffman’s picture Reid Hoffman Co-Founder, LinkedIn, Manas AI & Inflection AI. Founding Team, PayPal. Author of Superagency. Podcaster of Possible and Masters of Scale. 2,765,344 followers See more about Reid Hoffman" [ref=e564] [cursor=pointer]:
+                      - /url: /sales/lead/ACwAAAAABL0BxitBjxhMFCHXP0jvjlSgZ45g3e0,NAME_SEARCH,gzEL
+                      - img "Reid Hoffman’s picture" [ref=e566]
+                      - generic [ref=e567]:
+                        - generic [ref=e568]: Reid Hoffman
+                        - generic [ref=e569]: Co-Founder, LinkedIn, Manas AI & Inflection AI. Founding Team, PayPal. Author of Superagency. Podcaster of Possible and Masters of Scale.
+                        - generic [ref=e570]: 2,765,344 followers
+                      - button "See more about Reid Hoffman" [ref=e571]
+                  - listitem [ref=e572]:
+                    - link "Daniels Fund’s logo Daniels Fund 7,443 followers See more about Daniels Fund" [ref=e573] [cursor=pointer]:
+                      - /url: /sales/company/35917
+                      - img "Daniels Fund’s logo" [ref=e575]
+                      - generic [ref=e576]:
+                        - generic [ref=e577]: Daniels Fund
+                        - generic [ref=e578]: 7,443 followers
+                      - button "See more about Daniels Fund" [ref=e579]
+                  - listitem [ref=e580]:
+                    - link "FLOURISHING at WORK Global Community’s group image FLOURISHING at WORK Global Community 371 followers See more about FLOURISHING at WORK Global Community" [ref=e581] [cursor=pointer]:
+                      - /url: https://www.linkedin.com/groups/14158524
+                      - img "FLOURISHING at WORK Global Community’s group image" [ref=e583]
+                      - generic [ref=e584]:
+                        - generic [ref=e585]: FLOURISHING at WORK Global Community
+                        - generic [ref=e586]: 371 followers
+                      - button "See more about FLOURISHING at WORK Global Community" [ref=e587]
+                  - listitem [ref=e588]:
+                    - link "Financial Technology Partners / FT Partners’ logo Financial Technology Partners / FT Partners 42,071 followers See more about Financial Technology Partners / FT Partners" [ref=e589] [cursor=pointer]:
+                      - /url: /sales/company/34727
+                      - img "Financial Technology Partners / FT Partners’ logo" [ref=e591]
+                      - generic [ref=e592]:
+  
+
+[...TRUNCATED - page too large]

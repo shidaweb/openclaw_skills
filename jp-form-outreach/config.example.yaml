@@ -1,0 +1,91 @@
+# jp-form-outreach: config
+#
+# Copy this file to config.yaml and fill in your own pitch/sender info.
+# The contents become a cached system prompt — keeping this file stable
+# across runs gives ~95% prompt cache hits and minimal Claude credit usage.
+
+sender:
+  name: "志田典道"
+  name_kana: "シダノリミツ"
+  name_furigana: "しだのりみつ"
+  role: "相談役"           # 役職名 used in form 役職 fields
+  company: "株式会社トラーナ"
+  company_short: "トラーナ"
+  email: "shida@torana.co.jp"
+  phone: "09016501629"      # No hyphens (most JP forms accept either)
+  phone_hyphenated: "090-1650-1629"
+  postal_code: "260-0003"   # ハイフンあり
+  postal_code_no_hyphen: "2600003"
+  prefecture: "千葉県"
+  city: "千葉市中央区"
+  address_line: "鶴沢町20-16"
+  building: "ユニバース千葉ビル1階"
+  full_address: "千葉県千葉市中央区鶴沢町20-16 ユニバース千葉ビル1階"
+  calendar_url: "https://tenbin.link/book/u-1302066f5d4f/torana-norimitsu-shida"
+  founded_year_month: "2018年04月"   # for forms requiring 設立年月 (e.g. 北の達人)
+  annual_revenue_band: "1〜3億円"   # for 年商 fields
+  employee_count_band: "1〜9名"     # for 従業員数 fields
+
+# What you're selling / why you're reaching out.
+pitch:
+  one_liner: "LINE公式アカウント運用×CRMコンサルを提供しております"
+  problem: |
+    日本企業のLINE公式アカウントは、運用が「友達追加クーポン止まり」または
+    CS対応に偏重しており、購買頻度向上やLTV最大化、ライフサイクル別シナリオ
+    配信などCRM視点の運用設計ができていないケースが多い。
+  solution: |
+    LINE公式アカウントを「売上ドライバー」として機能させる設計（セグメント
+    配信／解約予兆検知／クロスセル動線／本部×店舗の二層運用／メール・アプリ
+    通知との補完関係設計など）を、業界特性に合わせて支援する。
+  proof_points:
+    - "ソニーグローバルエデュケーション様（こども向け学習領域）のCRM支援実績"
+    - "オンライン診療MDOnline創業者として医療系CRMの設計知見"
+    - "教育・ヘルスケア・D2C・メディアなど業界横断の継続率改善ノウハウ"
+  call_to_action: "30分のオンラインでご相談いただけませんでしょうか。\nご都合よろしければ：https://tenbin.link/book/u-1302066f5d4f/torana-norimitsu-shida"
+
+# 想定ターゲットペルソナ。LLMがどう該当するかを判断する材料。
+target_persona:
+  industries:
+    - "EdTech / 通信教育 / 学習塾"
+    - "D2C / サブスク / 通販"
+    - "ヘルスケア / オンライン診療"
+    - "ペット / フィットネス / 葬儀"
+    - "結婚相談 / ブライダル / 家事代行"
+  founding_year_sweet_spot: "1995-2012"
+  reason: |
+    LINEがマーケ主流チャネルになる前から事業を運営してきた老舗ミドル中堅は、
+    LINEを後付けで導入したものの未最適化な状態にある典型例が多い。若い
+    スタートアップは最初からLINE×CRMネイティブで設計されている確率が高い
+    ため除外。
+  decision_makers:
+    - "事業企画 / マーケティング / CRMご担当者"
+    - "経営企画 / 事業開発"
+    - "DX推進"
+
+# Claude model & generation settings
+model:
+  name: "claude-cli/claude-sonnet-4-6"
+  max_chars: 400        # 多くのJP法人フォームの制限が400字
+  max_chars_extended: 1800  # ファビウス／カラダノート等は2000字許容
+  language: "ja"
+
+# Personalization rules
+personalization:
+  must_reference: |
+    必ず1つ以上、相手企業の固有な事実（直近のPRリリース／資金調達／
+    新サービス発表／メディア露出／IR資料の戦略テーマ等）に言及する。
+  avoid:
+    - "テンプレ感のある定型句（『突然のご連絡失礼いたします』を冒頭にしない）"
+    - "誇大広告（業界NO.1、必ず成功するなど）"
+    - "長すぎる自己紹介（自己紹介は2文以内）"
+    - "本部以外のFC教室へのプッシュ（FC型ビジネスは本部CRMで考える）"
+  tone: "敬語、ただし堅すぎない。同業界の人として自然に話す距離感。"
+
+# Filtering rules (applied before LLM, deterministic)
+filters:
+  exclude_already_sent: true     # data/sent_history.jsonl で除外
+  exclude_skip_history: true     # data/skip_history.jsonl で除外
+  exclude_categories:
+    - "b2c_only"     # B2C顧客フォームしかない会社（LinkedIn DMルートに回す）
+    - "iframe"       # 第三者ホスト iframe フォーム（v2で対応）
+    - "site_closed"  # 合併・サイト閉鎖

@@ -1,0 +1,66 @@
+# linkedin-outreach: config
+#
+# Copy this file to config.yaml and fill in your own pitch/persona.
+# The contents become a cached system prompt — keeping this file stable
+# across runs gives ~95% prompt cache hits and minimal Claude credit usage.
+#
+# Tip: write each section in the language you want the InMail in
+# (Japanese / English). The model will mirror the language.
+
+sender:
+  name: "Norimitsu Shida"
+  role: "Entrepreneur / Building Consumer & SMB Ventures in Healthcare and Education"
+  company: "CellCloud"
+  linkedin_url: "https://www.linkedin.com/in/norimitsu-shida-98629b1a/"
+
+# What you're selling / why you're reaching out.
+# Be concrete. The model uses this verbatim as the value prop anchor.
+pitch:
+  one_liner: "<例: ヘルスケアSMB向けの○○プラットフォームを提供しており、〜>"
+  problem: "<相手が抱えている課題、3-4文>"
+  solution: "<自社サービスがどう解決するか、3-4文>"
+  proof_points:
+    - "<事例1: 数字つきで>"
+    - "<事例2>"
+    - "<事例3>"
+  call_to_action: "<例: 15分のカジュアル面談をお願いできないでしょうか？>"
+
+# 想定ターゲットペルソナ。LLMがリードのプロフィールがどう該当するかを判断する材料。
+target_persona:
+  industries:
+    - "Healthcare"
+    - "Education"
+    - "SMB / SME"
+  job_titles:
+    - "CEO"
+    - "代表取締役"
+    - "事業部長"
+    - "DX推進担当"
+  company_size: "10-500 employees"
+  pain_signals:
+    - "<例: 紙ベース業務が残っている>"
+    - "<例: スタッフ採用に苦戦している>"
+
+# Claude model & generation settings
+model:
+  name: "claude-cli/claude-sonnet-4-6"
+  max_chars: 1800   # InMail limit is 1900; keep buffer
+  language: "ja"    # ja / en
+
+# Personalization rules
+personalization:
+  must_reference: "1つ以上、相手のプロフィール固有の事実（最近の投稿/職歴/会社の動き）"
+  avoid:
+    - "テンプレ感のある定型句"
+    - "誇大広告（業界NO.1、必ず成功するなど）"
+    - "長すぎる自己紹介（自己紹介は2文以内）"
+  tone: "professional but warm; 敬語、ただし堅すぎない"
+
+# Filtering rules (applied before LLM, deterministic)
+filters:
+  exclude_titles:
+    - "Intern"
+    - "Student"
+    - "Recruiter"
+  min_tenure_months: 3   # 現職就任から3ヶ月以上
+  exclude_already_connected: true

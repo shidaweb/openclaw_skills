@@ -1,0 +1,505 @@
+# jp-form-outreach: targets
+#
+# Curated company list. Pre-loaded with the May 2026 batch
+# (Torana → JP mid-market for LINE×CRM consult).
+#
+# Status legend:
+#   sent       — already submitted via this pipeline
+#   pending    — ready to draft & send
+#   blocked    — needs Nori's input (e.g. company profile data)
+#   manual     — needs human intervention (iframe, kintone, B2C-only)
+#   linkedin   — route via linkedin-outreach instead
+#   dropped    — out of scope (site closed, etc.)
+#
+# Category controls how stage_send treats the target:
+#   b2b_form        — standard B2B inquiry form (auto-send)
+#   b2c_only        — only B2C support form available (skip)
+#   iframe          — third-party iframe form (manual for now)
+#   site_closed     — company merged/closed (drop)
+#
+# field_map_overrides: per-form non-standard fields. Example:
+#   field_map_overrides:
+#     category_radio: "その他"          # what to select for the お問い合わせ種別 radio
+#     category_select: "業務提携について"  # what to select for the 概要 dropdown
+#     prefecture_select_format: "千葉県"
+#     phone_format: "hyphenated"        # use sender.phone_hyphenated (else use sender.phone)
+#     postal_format: "no_hyphen"        # use sender.postal_code_no_hyphen
+#     skip_fields: ["fax"]              # don't try to fill these
+#
+# flow:
+#   single   — fill → send (1 click)
+#   confirm  — fill → 確認 → 送信 (2 clicks, 2 page transitions)
+
+companies:
+
+  # =====================================================================
+  # SENT (12社) — already submitted, kept for reference
+  # =====================================================================
+
+  - id: yarukiswitch_hd
+    name: 株式会社やる気スイッチグループHD
+    industry: edtech_fc
+    founded: 1989
+    status: sent
+    sent_at: "2026-05-08"
+    category: b2b_form
+    form_url: https://www.yarukiswitch-holdings.co.jp/contact/input/
+    char_limit: 400
+    flow: confirm
+    captcha: none
+    direct_signals:
+      - "スクールIE 1,200教室超"
+      - "グループ売上578億円（2025年2月期）"
+    hook_context: |
+      FC型こども学習事業、本部主導CRM未整備。
+      WinBe／チャイルド・アイズ／Kids Duo等マルチブランド横断CRMに伸びしろ。
+    hypothesized_pain:
+      - "教室ごとにLINE分散、本部主導の統一運用なし"
+      - "退会兆候の早期検知シナリオ未整備"
+      - "ブランド横断CRM未統合"
+    field_map_overrides:
+      category_radio: "その他"
+
+  - id: lifeistech
+    name: ライフイズテック株式会社
+    industry: edtech_teen
+    founded: 2010
+    status: sent
+    sent_at: "2026-05-08"
+    sent_via: nori_manual
+    category: b2b_form
+    form_url: https://form.run/@lifeistech-form
+    char_limit: 1800
+    flow: single
+    captcha: recaptcha_v2_visible
+    direct_signals:
+      - "Spring Camp 2026"
+      - "AI共創バイブコーディング新カリキュラム"
+      - "累計受講生数十万人"
+    hook_context: |
+      中高生EdTech。単発キャンプ→継続レッスン化のジャンプ率がスケーラビリティ決定要因。
+    hypothesized_pain:
+      - "キャンプ参加→継続レッスンへの引き上げシナリオ未整備"
+      - "保護者LINE設計が手薄"
+    field_map_overrides:
+      category_radio: "企業協賛/団体協力について"
+    notes: "reCAPTCHA v2 visible — fill-only mode, manual submit"
+
+  - id: wonderfy
+    name: ワンダーファイ株式会社
+    industry: edtech_kids
+    founded: 2014
+    status: sent
+    sent_at: "2026-05-08"
+    category: b2b_form
+    form_url: https://wonderfy.inc/contact/
+    char_limit: 1800
+    flow: confirm
+    captcha: none
+    direct_signals:
+      - "Think!Think!累計250万ユーザー"
+      - "旧ワンダーラボから社名変更"
+      - "海外展開加速中"
+    hook_context: |
+      Think!Think!→WonderBox送客、サブスクEdTechの継続率改善。
+    hypothesized_pain:
+      - "オンボーディング期と6ヶ月目以降の継続率改善"
+      - "解約予兆セグメント配信"
+    field_map_overrides:
+      category_select: "協業・法人向けのご相談"
+
+  - id: mediplus
+    name: 株式会社メディプラス
+    industry: d2c_cosmetics
+    founded: 2003
+    status: sent
+    sent_at: "2026-05-08"
+    category: b2b_form
+    form_url: https://mediplus.co.jp/contact/
+    char_limit: 1800
+    flow: confirm
+    captcha: none
+    direct_signals:
+      - "2024年8月期売上45億円（+7%）"
+      - "2期連続増収"
+      - "TVインフォマーシャル中心のマーケ"
+    hook_context: |
+      D2C化粧品、ストレスオフ研究所。シニア寄り顧客層のLINE移行設計に伸びしろ。
+    hypothesized_pain:
+      - "TV→電話／Web注文後のLINE移行設計"
+      - "定期購入の継続率改善・アップセル"
+    field_map_overrides:
+      category_radio: "メディア関係以外の法人の方"
+
+  - id: fabius
+    name: 株式会社ファビウス
+    industry: d2c_health_food
+    founded: 2007
+    status: sent
+    sent_at: "2026-05-08"
+    category: b2b_form
+    form_url: https://fabius.co.jp/contact
+    char_limit: 2000
+    flow: single
+    captcha: none
+    direct_signals:
+      - "青汁・KUROJIRU等で年商60億円規模"
+      - "20商品近いラインナップ"
+    hook_context: |
+      D2C単品リピート通販、複数商品定期化×クロスセルが伸びしろ。
+    hypothesized_pain:
+      - "20商品横断のLINEレコメンド設計"
+      - "解約予兆検知と他商品提案による継続化"
+
+  - id: tameny
+    name: タメニー株式会社
+    industry: matchmaking
+    founded: 2006
+    status: sent
+    sent_at: "2026-05-08"
+    category: b2b_form
+    form_url: https://tameny.jp/contact/partner/
+    char_limit: 2000
+    flow: confirm
+    captcha: none
+    direct_signals:
+      - "2025年3月期売上推定60億円弱"
+      - "割引抑制で入会単価+48%、契約率+1pt改善"
+    hook_context: |
+      パートナーエージェント等の婚活相談所運営。価格訴求から質訴求への戦略転換中。
+    hypothesized_pain:
+      - "会員ステージ別（入会→活動→停滞→成婚／退会）のLINEシナリオ"
+      - "カウンセラー×会員の関係構築（医師×患者類比）"
+    field_map_overrides:
+      category_radio: "パートナーエージェント・OTOCON・CONNECT-ship"
+      address_required: true
+
+  - id: meikonet
+    name: 株式会社明光ネットワークジャパン
+    industry: edtech_fc
+    founded: 1984
+    status: sent
+    sent_at: "2026-05-08"
+    sent_via: nori_manual
+    category: b2b_form
+    form_url: https://cloud.swcms.net/meikonetPublic/ja/inquiry1.html
+    char_limit: 2000
+    flow: confirm
+    captcha: none
+    direct_signals:
+      - "売上248億円（+10%、2025年8月期）"
+      - "中計目標前倒し達成"
+      - "直営476教室＋FC1,800教室"
+    hook_context: |
+      明光義塾FC本部、本部CRMとFC教室LINE運用の分断。多事業横断CRM。
+    hypothesized_pain:
+      - "本部×FC教室の二層LINE運用設計"
+      - "退会兆候の早期検知シナリオ"
+      - "日本語学校・RED学習・学童など多事業の横断CRM"
+    field_map_overrides:
+      address_required: true
+      postal_lookup_overwrites_address: true
+    notes: "郵便番号→住所自動補完で住所が出洲港に書き換えられる事故あり。住所手入力後に郵便番号入力すべき。"
+
+  - id: karadanote
+    name: 株式会社カラダノート
+    industry: parenting_app
+    founded: 2008
+    status: sent
+    sent_at: "2026-05-08"
+    category: b2b_form
+    form_url: https://corp.karadanote.jp/contact
+    char_limit: 2000
+    flow: single
+    captcha: recaptcha_v3_invisible
+    direct_signals:
+      - "子育てアプリ累計1,000万DL"
+      - "住友生命3億円出資（10%）"
+    hook_context: |
+      子育てアプリ国内最大級の「ママDB」、ライフステージ別CRM未整備。
+    hypothesized_pain:
+      - "アプリユーザーのLINE化とライフステージ別配信"
+      - "提携企業（保険・金融・小売）への送客単価向上"
+    field_map_overrides:
+      category_select: "業務提携について"
+
+  - id: kizuna_hd
+    name: きずなホールディングス株式会社
+    industry: funeral
+    founded: 2000
+    status: sent
+    sent_at: "2026-05-08"
+    category: b2b_form
+    form_url: https://www.kizuna-hd.co.jp/contact/
+    char_limit: 400
+    flow: single
+    captcha: recaptcha_v3_invisible
+    direct_signals:
+      - "家族葬のファミーユ109店舗"
+      - "花駒ブランドでLINE運用開始"
+    hook_context: |
+      葬儀領域、事前相談→施行→アフターの長期接点。世代間引き継ぎCRM。
+    hypothesized_pain:
+      - "事前相談→施行→アフターの長期接点LINE設計"
+      - "親世代→子世代の世代間引き継ぎ"
+
+  - id: bears
+    name: 株式会社ベアーズ
+    industry: housekeeping
+    founded: 1999
+    status: sent
+    sent_at: "2026-05-08"
+    category: b2b_form
+    form_url: https://www.happy-bears.com/contact_other/
+    char_limit: 2000
+    flow: confirm
+    captcha: none
+    direct_signals:
+      - "毎年成長率120%"
+      - "250店舗体制への拡大計画"
+    hook_context: |
+      家事代行、定期顧客とスポット顧客のLTV格差大。ライフイベント期の引き上げ。
+    hypothesized_pain:
+      - "単発利用→定期プランへのLINE引き上げ動線"
+      - "ライフイベント別（出産・引越・介護等）セグメント配信"
+    field_map_overrides:
+      category_select: "法人提携について"
+      contact_method_radio: "メール"
+      contact_time_radio: "いつでも"
+      address_required: true
+
+  - id: lava_intl
+    name: 株式会社LAVA International
+    industry: hot_yoga
+    founded: 2004
+    status: sent
+    sent_at: "2026-05-08"
+    category: b2b_form
+    form_url: https://contents.bownow.jp/forms/view/sid_adbddc5a27bbd552668d/db663637-cb4c-4489-ab22-84bf3a367823
+    char_limit: 2000
+    flow: confirm
+    captcha: none
+    direct_signals:
+      - "230店舗、業界トップシェア"
+    hook_context: |
+      ホットヨガ。法人向け（健康経営）と並走するtoC個人会員のLINE運用に伸びしろ。
+    hypothesized_pain:
+      - "体験予約→入会→3ヶ月継続のファネル別LINEシナリオ"
+      - "休眠会員復帰のセグメント配信"
+    field_map_overrides:
+      consultation_radio: "LAVA法人会員サービスのお取組みに関して"
+      referral_source_radio: "LAVA法人サイト内の「健康経営コラム」"
+      employee_count_required: true
+    notes: "BowNow iframe、しかし直接URLでアクセス可能"
+
+  - id: curves_hd
+    name: 株式会社カーブスホールディングス
+    industry: fitness_seniors
+    founded: 2005
+    status: sent
+    sent_at: "2026-05-08"
+    category: b2b_form
+    form_url: https://www.curvesholdings.co.jp/contact/mail/
+    char_limit: 2000
+    flow: confirm
+    captcha: recaptcha_v3_invisible
+    direct_signals:
+      - "グループ売上376億円（2024年8月期）"
+      - "全国2,000店舗以上"
+      - "LINE公式アカウント2023年8月開設"
+    hook_context: |
+      女性中高年向けフィットネス。LINE運用は開設したばかり、本部×店舗二層運用設計が課題。
+    hypothesized_pain:
+      - "来店予約・継続会員化・退会抑止の各ファネルLINE設計"
+      - "2,000店舗の本部主導標準化テンプレ × 店舗個性運用ルール"
+    field_map_overrides:
+      gender_radio: "男性"
+      address_required: true
+
+  # =====================================================================
+  # PENDING / BLOCKED — 次の打ち手
+  # =====================================================================
+
+  - id: kitanotatsujin
+    name: 株式会社北の達人コーポレーション
+    industry: d2c_cosmetics_health
+    founded: 2002
+    status: blocked
+    blocker: "Torana設立年月／年商／従業員数を targets.yaml で確定する必要"
+    category: b2b_form
+    form_url: https://www.kitanotatsujin.com/contact/general/
+    char_limit: 2000
+    flow: confirm
+    captcha: recaptcha_v3_invisible
+    direct_signals:
+      - "2024年2月期売上146億円（+49.2%）"
+      - "LINE for Business事例（3ヶ月で新規集客299%）"
+    hook_context: |
+      上場D2C、LINE広告は最適化済。配信側CRM（解約予兆、アップセル、休眠掘り起こし）が次のレバレッジ。
+    hypothesized_pain:
+      - "LINE広告獲得層の配信CRM最適化"
+      - "定期購入の解約予兆検知"
+    field_map_overrides:
+      category_select: "広告・プロモーション関連のご提案"
+      requires_full_company_profile: true
+      address_required: true
+
+  - id: babycalendar
+    name: 株式会社ベビーカレンダー
+    industry: parenting_media
+    founded: 2007
+    status: manual
+    blocker: "iframeフォーム、自動操作不可"
+    category: iframe
+    form_url: https://corp.baby-calendar.jp/contact/
+    char_limit: 2000
+    flow: confirm
+    captcha: recaptcha_v2_visible
+    direct_signals:
+      - "月間1,400万MAU"
+      - "2026年3月「専門家相談AI」搭載"
+    hook_context: |
+      妊娠出産メディア、SNSフォロワーのLINE化＋週齢別配信が伸びしろ。
+    hypothesized_pain:
+      - "アプリユーザーのLINE化と週数別配信設計"
+      - "メディア→自社EC・提携先送客の単価向上"
+
+  - id: surala
+    name: 株式会社すららネット
+    industry: edtech_b2b2c
+    founded: 2008
+    status: manual
+    blocker: "kintoneフォーム読み込み停止、ボット検出疑い"
+    category: iframe
+    form_url: https://surala.form.kintoneapp.com/public/79f611655b7aeffd30b9eb34ab3f3448595a37a21e40b569bf7bb1f8f3127129
+    char_limit: 2000
+    flow: single
+    captcha: unknown
+    direct_signals:
+      - "2025年12月文科省「ネット出席制度」要望書"
+      - "「あした研究室」（不登校ポータル）公開"
+    hook_context: |
+      上場B2B2C EdTech、不登校保護者向け長期ナーチャリングに伸びしろ。
+    hypothesized_pain:
+      - "「あした研究室」リードのLINE化と長期ナーチャリング"
+      - "B2B（学校・自治体）×B2C（保護者）のクロスチャネル設計"
+
+  - id: ibj
+    name: 株式会社IBJ
+    industry: matchmaking
+    founded: 2006
+    status: linkedin
+    blocker: "コーポレート向けB2B窓口なし、行政・自治体向け窓口のみ"
+    category: b2c_only
+    form_url: null
+    char_limit: 400
+    direct_signals:
+      - "加盟店4,700社"
+      - "会員70,000名超"
+    hook_context: |
+      結婚相談所連盟、本部LINEと加盟店LINEの連携が課題。LinkedIn DM推奨。
+    hypothesized_pain:
+      - "本部LINEと加盟店LINEの二層運用設計"
+      - "成婚ステージ別シナリオ最適化"
+
+  # =====================================================================
+  # B2C-ONLY → LINKEDIN ROUTE (5社)
+  # =====================================================================
+
+  - id: riso_kyoiku
+    name: 株式会社リソー教育
+    industry: edtech_premium
+    founded: 1985
+    status: linkedin
+    category: b2c_only
+    form_url: https://www.riso-kyoikugroup.com/customer/form/
+    char_limit: 2000
+    direct_signals:
+      - "2024年2月期売上322億円"
+      - "TOMAS／伸芽会／Spec.TOMAS"
+    hook_context: |
+      富裕層×高単価（年間100万円超）。お客様相談室はB2C専用。LinkedIn DM推奨。
+    hypothesized_pain:
+      - "伸芽会→TOMAS→Spec.TOMASの世代間ライフサイクルCRM"
+      - "富裕層向け高単価セグメントへのパーソナライズ配信"
+
+  - id: petgo
+    name: ペットゴー株式会社
+    industry: pet_telemedicine
+    founded: 2004
+    status: linkedin
+    category: b2c_only
+    form_url: https://www.petgo.jp/contact
+    char_limit: 1800
+    direct_signals:
+      - "療法食・動物用医薬品の通販"
+    hook_context: |
+      療法食×継続購入のニッチ。MDOnline直球領域。LinkedIn DM推奨。
+    hypothesized_pain:
+      - "療法食の長期定期購入×解約抑止LINEシナリオ"
+      - "処方タイミング・獣医師指示変更への追従設計"
+
+  - id: petsfirst
+    name: 株式会社ペッツファースト
+    industry: pet_retail
+    founded: 2008
+    status: linkedin
+    category: b2c_only
+    form_url: https://www.pfirst.jp/contactus2
+    char_limit: 1800
+    direct_signals:
+      - "86店舗体制（販売・動物病院・サロン）"
+      - "ライフパートナーイケダのペットショップ事業承継"
+    hook_context: |
+      ペット販売×動物病院×サロンの総合事業。長期育成LTV設計。LinkedIn DM推奨。
+    hypothesized_pain:
+      - "お迎えサポートLINE→長期育成シナリオ"
+      - "販売・動物病院・サロン横断クロスセル"
+
+  - id: solia
+    name: 株式会社SOLIA
+    industry: d2c_baby
+    founded: 2010
+    status: linkedin
+    category: b2c_only
+    form_url: https://www.alo-organic.com/shop/contact
+    char_limit: 2000
+    direct_signals:
+      - "年商62億円突破、目標100億円"
+      - "3期連続200%成長"
+      - "ALOBABY／HALENA／SINCE beauté多ブランド化"
+    hook_context: |
+      D2Cベビースキンケア、ブランド横断クロスセルが100億達成のレバレッジ。LinkedIn DM推奨。
+    hypothesized_pain:
+      - "ALOBABY→HALENA／SINCE beautéへのクロスセル設計"
+      - "新生児期離脱の予兆検知と再活性化"
+
+  - id: ipet
+    name: 第一アイペット損害保険株式会社
+    industry: pet_insurance
+    founded: 2004
+    status: linkedin
+    category: b2c_only
+    form_url: null
+    char_limit: 1800
+    direct_signals:
+      - "2026年4月「第一アイペット損害保険」へ商号変更"
+      - "第一生命HD完全子会社"
+      - "hachidori導入（LINE活用先進）"
+    hook_context: |
+      ペット保険、商号変更後の第一生命グループ統合フェーズ。LinkedIn DM推奨。
+    hypothesized_pain:
+      - "第一生命グループ統合後のLINE×CRM再設計"
+      - "ペットライフサイクル全体（お迎え→終末期）の長期接点"
+
+  # =====================================================================
+  # DROPPED (1社) — out of scope
+  # =====================================================================
+
+  - id: escrit
+    name: 株式会社エスクリ
+    industry: bridal
+    founded: 2003
+    status: dropped
+    category: site_closed
+    notes: "2026年3月31日付ノバレーゼと合併、新会社「株式会社オンザページ」として再編。サイト閉鎖。"
