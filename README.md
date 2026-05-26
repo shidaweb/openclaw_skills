@@ -59,12 +59,18 @@ Contract:
 - **Append-only history**.
 - **Cache-friendly**: phase 3 system prompt is byte-stable for prompt-cache hits.
 
-## Architecture (v2)
+## Architecture (v3)
 
-- **OpenClaw agent (Claude)**: リスト生成・承認・エスカレーション判断（WebSearch + SKILL.md）
-- **Python (`_outreach_core` + `run.py`)**: JSONL、dedup、フォーム入力、送信検証、Webhook 通知
-- **Slack 受信**: OpenClaw Slack plugin（自作しない）
-- **Slack 状況通知**: `sender_brief.yaml` の incoming webhook → `_outreach_core/notify.py`
+| Layer | Model |
+|---|---|
+| Slack で会話する OpenClaw エージェント | **Opus 4.7**（固定・本リポジトリ外で設定） |
+| Python `run.py draft` / `_llm_analyze_form` | **Sonnet 4.6**（`config.yaml` `model.name`） |
+| `verify` / `notify` / `progress` | **LLM なし** |
+
+- **OpenClaw agent (Opus)**: リスト生成・承認・エスカレーション（WebSearch + SKILL.md）
+- **Python**: JSONL、dedup、フォーム入力、決定論的 verify、Webhook 通知
+- **Slack 受信**: OpenClaw Slack plugin
+- **Slack 状況通知**: incoming webhook → `notify.py`
 
 ```bash
 cp sender_brief.example.yaml sender_brief.yaml   # webhook URL を設定

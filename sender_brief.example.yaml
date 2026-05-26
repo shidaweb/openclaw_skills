@@ -40,6 +40,12 @@ heartbeat:
     - "send"
     - "enrich"
 
+# Reference only — Python oc_infer reads each skill's config.yaml model.name (Sonnet).
+notes_on_models: |
+  - Slack で会話する OpenClaw エージェント本体は Claude Opus 4.7 で固定運用する前提。
+  - Python から呼ぶ oc_infer（draft / _llm_analyze_form）は Sonnet 既定。変更しない。
+  - verify.py / notify.py / progress.py は LLM を呼ばない。
+
 pitch:
   headline: "..."
 target_persona:

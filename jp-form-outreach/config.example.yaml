@@ -2,6 +2,8 @@
 #
 # Copy this file to config.yaml and fill in your own pitch/sender info.
 # Optional: copy ../sender_brief.example.yaml to ../sender_brief.yaml (merged; overrides apply).
+#
+# Model policy (v3): Slack/OpenClaw agent = Opus 4.7. Python oc_infer uses model.name (Sonnet).
 # The contents become a cached system prompt — keeping this file stable
 # across runs gives ~95% prompt cache hits and minimal Claude credit usage.
 

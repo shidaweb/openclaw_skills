@@ -1,4 +1,9 @@
-"""Post-send verification and needs_attention escalation."""
+"""
+Post-send verification and needs_attention escalation.
+
+Pure Python / DOM heuristics only — no oc_infer, no openclaw infer subprocess.
+Escalation copy and user Q&A are handled by the OpenClaw agent (Opus 4.7).
+"""
 
 from __future__ import annotations
 

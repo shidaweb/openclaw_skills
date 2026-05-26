@@ -389,15 +389,14 @@ Non-channel primitives live in `~/.openclaw/skills/_outreach_core/`:
 ```
 _outreach_core/
 ├── history.py       # skip/sent JSONL, load_global_exclude_set(), canonical_id
-├── infer.py         # oc_infer / oc_browser
+├── infer.py         # oc_infer (Sonnet default) / oc_browser / oc_evaluate
 ├── prompt.py        # build_system_block, extract_first_json
 ├── draft.py         # stage_draft (generic Personalize)
 ├── preview.py       # interactive Approve prompt helpers
-├── approve.py       # Slack pre-send approval
 ├── config.py        # load_merged_config() + sender_brief.yaml
-├── verify.py          # post-send verification, needs_attention.jsonl
-├── notify.py          # Slack incoming webhook (one-way)
-├── progress.py        # current_task.jsonl + optional heartbeat
+├── verify.py        # post-send verification (no LLM)
+├── notify.py        # Slack incoming webhook (no LLM)
+├── progress.py      # current_task.jsonl + optional heartbeat
 └── helpers/
     ├── dump_exclude_set.py
     ├── append_targets.py
@@ -407,7 +406,15 @@ _outreach_core/
 `linkedin-outreach` and `jp-form-outreach` import the core via `sys.path` and
 keep channel-specific Pull, Enrich, and Send in each `run.py`.
 
-### 11.3 JP-specific design notes
+### 11.3 Model topology (v3)
+
+| Layer | Model | Configured in |
+|---|---|---|
+| OpenClaw Slack agent | **Opus 4.7** (fixed) | OpenClaw gateway (outside repo) |
+| `run.py draft`, `_llm_analyze_form` | **Sonnet 4.6** | `config.yaml` → `model.name` |
+| `verify.py`, `notify.py`, `progress.py` | **No LLM** | N/A |
+
+### 11.4 JP-specific design notes
 
 When `jp-outreach` is implemented:
 

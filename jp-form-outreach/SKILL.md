@@ -22,6 +22,16 @@ This skill drives a full Japanese B2B inquiry-form outreach pipeline using
 the OpenClaw browser plugin (Chrome with the openclaw profile) and the
 OpenClaw inference CLI (Sonnet for personalization, with prompt caching).
 
+## Model assumption (v3)
+
+| Layer | Model | Where configured |
+|---|---|---|
+| Slack で会話する OpenClaw エージェント | **Opus 4.7（固定）** | OpenClaw gateway（本リポジトリ外） |
+| `run.py draft` / `_llm_analyze_form` | **Sonnet 4.6** | `config.yaml` → `model.name` |
+| `verify.py` / webhook / heartbeat | **LLM なし** | `_outreach_core` |
+
+リスト生成・承認・needs_attention への質問は Opus エージェントが担当。
+
 ## The Outreach Pattern (canonical 6-phase contract)
 
 This skill implements the same reusable **outreach pattern** as
@@ -207,15 +217,17 @@ cd ~/.openclaw/skills/jp-form-outreach
 .venv/bin/python run.py send --ids 1,3,5 --auto-send
 ```
 
-## List build flow (agent-led)
+## List build flow (agent-led, Opus 4.7 前提)
 
 （linkedin-outreach/SKILL.md と同手順。`append_targets --skill jp_form` / `linkedin` を使い分け）
 
 **禁止:** 実在しない企業の捏造。PR TIMES / IR / 公式サイトで検証してから採用。
 
+> Sonnet エージェントでは候補品質が落ちるため、リスト生成は Opus 4.7 前提。
+
 ## Send verification & escalation
 
-`run.py send --ids N --auto-send` 後に verify。想定外の必須フィールドは `needs_attention` へ。
+`run.py send --ids N --auto-send` 後に **決定論的** verify（LLM 不使用）。想定外フィールドは `needs_attention` へ。
 
 ```bash
 .venv/bin/python run.py history needs-attention
@@ -236,7 +248,7 @@ Webhook 通知（`sender_brief.yaml` の `slack.incoming_webhook_url`）:
 
 ## needs_attention の取り扱い
 
-1. Slack でユーザーに不足フィールドの値を聞く
+1. **Opus エージェント**が Slack でユーザーに不足フィールドの値を聞く
 2. `run.py resolve --target-id ... --field key=value` で overrides 更新 → 自動再 send
 3. 解決後 `history needs-attention` で open が減っていることを確認
 
@@ -289,7 +301,7 @@ linkedin-outreach.
 
 - Browser profile: `openclaw` (independent Chrome, no login needed for
   most JP corporate inquiry forms)
-- Models: `claude-cli/claude-sonnet-4-6` by default (configurable)
+- Python `oc_infer`: `claude-cli/claude-sonnet-4-6` via `config.yaml` `model.name`（Opus にしない）
 - State files in `data/*.jsonl` are append-only and resumable
 - Rate limiting: enrich and send sleep between page loads / sends
 - Forms hosted in iframes (kintone / BowNow / Microsoft Forms) flagged

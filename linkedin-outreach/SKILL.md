@@ -20,6 +20,16 @@ This skill drives a full LinkedIn InMail outreach pipeline using the OpenClaw
 browser plugin (Chrome with the user's signed-in profile) and the OpenClaw
 inference CLI (Sonnet for personalization, with prompt caching).
 
+## Model assumption (v3)
+
+| Layer | Model | Where configured |
+|---|---|---|
+| Slack で会話する OpenClaw エージェント | **Opus 4.7（固定）** | OpenClaw gateway / agent profile（本リポジトリ外） |
+| `run.py draft` / enrich 内の `oc_infer` | **Sonnet 4.6** | `config.yaml` → `model.name` |
+| `verify.py` / webhook / heartbeat | **LLM なし** | `_outreach_core`（純 Python） |
+
+リスト生成・承認・needs_attention への質問は **Opus エージェント**が担当。Python から Opus を呼ぶ CLI は作らない。
+
 ## The Outreach Pattern (canonical 6-phase contract)
 
 This skill implements a reusable **outreach pattern** that any future
@@ -220,9 +230,11 @@ With Sonnet and prompt caching, expect ~$0.005 per drafted InMail
 runs at well under $1 in API equivalent — most cost is on the
 Sales Nav subscription itself, not the LLM.
 
-## List build flow (agent-led)
+## List build flow (agent-led, Opus 4.7 前提)
 
 User 例: 「EdTech 中堅 10 社、フォームと LinkedIn に振り分けてリスト化」
+
+> Sonnet エージェントで動かすと候補品質が落ちます。本フローは Opus 4.7 エージェント前提です。
 
 1. `cat ~/.openclaw/skills/sender_brief.yaml` で送信者文脈
 2. `python3 -m _outreach_core.helpers.dump_exclude_set` で除外 ID（JSON）
@@ -237,12 +249,12 @@ User 例: 「EdTech 中堅 10 社、フォームと LinkedIn に振り分けて�
 
 ## Send verification & escalation
 
-`run.py send --ids N --auto-send` 後、各件は自動 verify されます。
+`run.py send --ids N --auto-send` 後、各件は **決定論的に** verify されます（LLM 不使用）。
 
 Slack（incoming webhook 経由）のサイン:
 - ✅ `<会社名>` 送信完了 → `sent_history.jsonl` 記録済
-- ⚠️ 送信完了が確認できません → 手動確認をユーザーに依頼
-- ⚠️ 想定外の入力項目 → `run.py resolve --target-id <id> --field ...`
+- ⚠️ 送信完了が確認できません → **Opus エージェント**が手動確認をユーザーに依頼
+- ⚠️ 想定外の入力項目 → **Opus エージェント**が値を聞き出し → `run.py resolve --target-id <id> --field ...`
 
 `data/needs_attention.jsonl` に保留。一覧: `run.py history needs-attention`
 
@@ -259,6 +271,6 @@ Slack（incoming webhook 経由）のサイン:
 ## Notes
 
 - Browser profile: `openclaw` (independent Chrome, login persists in `~/.openclaw`)
-- Models: `claude-cli/claude-sonnet-4-6` by default (configurable)
+- Python `oc_infer`: `claude-cli/claude-sonnet-4-6` via `config.yaml` `model.name`（Opus にしない）
 - State files in `data/*.jsonl` are append-only and resumable
 - Rate limiting: `fetch-leads` and `enrich` sleep between page loads

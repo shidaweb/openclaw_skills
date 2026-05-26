@@ -3,6 +3,9 @@
 # Copy this file to config.yaml and fill in your own pitch/persona.
 # Optional: copy ../sender_brief.example.yaml to ../sender_brief.yaml for shared
 # sender context (merged by load_merged_config; skill config overrides).
+#
+# Model policy (v3): Slack/OpenClaw agent = Opus 4.7 (outside this file).
+# Python run.py draft/enrich LLM calls use model.name below (keep Sonnet).
 # The contents become a cached system prompt — keeping this file stable
 # across runs gives ~95% prompt cache hits and minimal Claude credit usage.
 #

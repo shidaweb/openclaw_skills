@@ -132,40 +132,8 @@ oc_infer = core_infer.oc_infer
 
 
 def _evaluate(js: str) -> Any:
-    """Run a JS function in the browser via `openclaw browser evaluate --fn`."""
-    cmd = ["openclaw", "browser", "--browser-profile", BROWSER_PROFILE,
-           "evaluate", "--fn", js]
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    if res.returncode != 0:
-        print(f"[evaluate err] {res.stderr.strip()}", file=sys.stderr)
-        return None
-
-    body_lines: list[str] = []
-    for line in res.stdout.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        if s.startswith("🦞"):
-            continue
-        if all(ch in "│◇└├─┃|" for ch in s):
-            continue
-        body_lines.append(line)
-
-    if not body_lines:
-        return None
-
-    text = "\n".join(body_lines).strip()
-    try:
-        decoded = json.loads(text)
-        if isinstance(decoded, str):
-            try:
-                decoded = json.loads(decoded)
-            except Exception:
-                pass
-        return decoded
-    except json.JSONDecodeError as e:
-        print(f"[evaluate parse err] {e}: {text[:300]}", file=sys.stderr)
-        return None
+    """Browser evaluate via _outreach_core.infer.oc_evaluate (no LLM)."""
+    return core_infer.oc_evaluate(js, profile=BROWSER_PROFILE)
 
 
 # ============================================================================

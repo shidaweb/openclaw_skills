@@ -2,14 +2,22 @@
 
 Python utilities shared by `linkedin-outreach` and `jp-form-outreach`.
 
-**Not included here:** Slack Socket Mode / Bolt workers, list-generation LLM CLIs. Those are OpenClaw agent responsibilities (see each skill's `SKILL.md`).
+**Not included here:** Slack Socket Mode / Bolt workers, list-generation LLM CLIs, Opus via `oc_infer`. Those belong to the OpenClaw agent (Opus 4.7) or Sonnet sub-tasks in `config.yaml`.
+
+## Model policy (v3)
+
+| Component | Model |
+|---|---|
+| OpenClaw Slack agent | Opus 4.7 (outside repo) |
+| `oc_infer` default | `claude-cli/claude-sonnet-4-6` |
+| `verify` / `notify` / `progress` | No LLM |
 
 ## Modules
 
 | Module | Role |
 |---|---|
 | `history.py` | sent/skip JSONL, `load_global_exclude_set()` |
-| `infer.py` | `oc_infer` / `oc_browser` |
+| `infer.py` | `oc_infer` / `oc_browser` / `oc_evaluate` (Sonnet default for infer only) |
 | `prompt.py` | cache-stable `build_system_block`, `extract_first_json` |
 | `draft.py` / `preview.py` | Personalize / Approve helpers |
 | `verify.py` | post-send verification, `needs_attention.jsonl` |
