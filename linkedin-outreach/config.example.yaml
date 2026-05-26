@@ -1,6 +1,8 @@
 # linkedin-outreach: config
 #
 # Copy this file to config.yaml and fill in your own pitch/persona.
+# Optional: copy ../sender_brief.example.yaml to ../sender_brief.yaml for shared
+# sender context (merged by load_merged_config; skill config overrides).
 # The contents become a cached system prompt — keeping this file stable
 # across runs gives ~95% prompt cache hits and minimal Claude credit usage.
 #
@@ -64,3 +66,7 @@ filters:
     - "Recruiter"
   min_tenure_months: 3   # 現職就任から3ヶ月以上
   exclude_already_connected: true
+
+# Slack one-way status posts (see sender_brief.yaml — merged via load_merged_config)
+# slack:
+#   incoming_webhook_url: "https://hooks.slack.com/services/..."

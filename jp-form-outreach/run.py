@@ -23,6 +23,22 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from _outreach_core import draft as core_draft
+from _outreach_core import history as core_history
+from _outreach_core import infer as core_infer
+from _outreach_core import preview as core_preview
+from _outreach_core import prompt as core_prompt
+from _outreach_core.config import load_merged_config
+from _outreach_core.progress import HeartbeatSession
+from _outreach_core.verify import (
+    close_needs_attention,
+    handle_verify_result,
+    list_open_needs_attention,
+    verify_send_completed,
+)
+
 try:
     import yaml
 except ImportError:
@@ -34,8 +50,8 @@ DATA_DIR = SKILL_DIR / "data"
 PROMPTS_DIR = SKILL_DIR / "prompts"
 DATA_DIR.mkdir(exist_ok=True)
 
-DEFAULT_MODEL = "claude-cli/claude-sonnet-4-6"
-BROWSER_PROFILE = "openclaw"
+DEFAULT_MODEL = core_infer.DEFAULT_MODEL
+BROWSER_PROFILE = core_infer.BROWSER_PROFILE
 RATE_LIMIT_SECONDS = 4
 
 SKIP_HISTORY_PATH = DATA_DIR / "skip_history.jsonl"
@@ -46,69 +62,41 @@ SENT_HISTORY_PATH = DATA_DIR / "sent_history.jsonl"
 # History helpers (mirrors linkedin-outreach pattern)
 # ============================================================================
 
-def _load_id_set(path: Path) -> set[str]:
-    if not path.exists():
-        return set()
-    ids: set[str] = set()
-    for line in path.open():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-            if "id" in entry:
-                ids.add(entry["id"])
-        except Exception:
-            continue
-    return ids
-
-
 def load_skip_set() -> set[str]:
-    return _load_id_set(SKIP_HISTORY_PATH)
+    return core_history.load_skip_set(DATA_DIR)
 
 
 def load_sent_set() -> set[str]:
-    return _load_id_set(SENT_HISTORY_PATH)
+    return core_history.load_sent_set(DATA_DIR)
 
 
 def append_skip_history(skipped_drafts: list[dict[str, Any]]) -> None:
-    if not skipped_drafts:
-        return
-    now = datetime.utcnow().isoformat() + "Z"
-    with SKIP_HISTORY_PATH.open("a") as f:
-        for d in skipped_drafts:
-            reason_full = (d.get("draft") or {}).get("body") or ""
-            reason = reason_full.replace("INSUFFICIENT_DATA: ", "")[:400]
-            entry = {
-                "id": d["id"],
-                "name": d.get("name"),
-                "industry": d.get("industry"),
-                "skipped_at": now,
-                "reason": reason,
-            }
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    print(f"[skip-history] appended {len(skipped_drafts)} entries -> {SKIP_HISTORY_PATH.name}")
+    core_history.append_skip_history(
+        skipped_drafts,
+        DATA_DIR,
+        extra_fields=("name", "industry"),
+    )
 
 
 def append_sent_history(sent_drafts: list[dict[str, Any]]) -> None:
-    if not sent_drafts:
-        return
-    now = datetime.utcnow().isoformat() + "Z"
-    with SENT_HISTORY_PATH.open("a") as f:
-        for d in sent_drafts:
-            entry = {
-                "id": d["id"],
-                "name": d.get("name"),
-                "industry": d.get("industry"),
-                "form_url": d.get("form_url"),
-                "subject": (d.get("draft") or {}).get("subject"),
-                "sent_at": now,
-            }
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    print(f"[sent-history] appended {len(sent_drafts)} entries -> {SENT_HISTORY_PATH.name}")
+    core_history.append_sent_history(
+        sent_drafts,
+        DATA_DIR,
+        extra_fields=("name", "industry", "form_url"),
+    )
 
 
 def stage_history(action: str) -> None:
+    if action == "needs-attention":
+        rows = list_open_needs_attention(DATA_DIR)
+        print(f"needs_attention.jsonl: {len(rows)} open")
+        for e in rows[-20:]:
+            fields = e.get("unresolved_fields") or []
+            fl = ", ".join(
+                f"{f.get('label') or f.get('name')}" for f in fields[:3] if isinstance(f, dict)
+            )
+            print(f"  - {e.get('target_id')}: {e.get('name')} | {e.get('reason', '')[:60]} | {fl}")
+        return
     if action == "show":
         skip_n = sum(1 for _ in SKIP_HISTORY_PATH.open()) if SKIP_HISTORY_PATH.exists() else 0
         sent_n = sum(1 for _ in SENT_HISTORY_PATH.open()) if SENT_HISTORY_PATH.exists() else 0
@@ -139,46 +127,8 @@ def stage_history(action: str) -> None:
 # OpenClaw subprocess helpers
 # ============================================================================
 
-def _run(cmd: list[str]) -> tuple[int, str, str]:
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    return res.returncode, res.stdout, res.stderr
-
-
-def oc_browser(*args: str, profile: str = BROWSER_PROFILE) -> str | None:
-    cmd = ["openclaw", "browser", "--browser-profile", profile, *args]
-    rc, out, err = _run(cmd)
-    if rc != 0:
-        print(f"[browser err] {' '.join(args)}: {err.strip()}", file=sys.stderr)
-        return None
-    return out
-
-
-def oc_infer(prompt: str, model: str = DEFAULT_MODEL) -> str | None:
-    cmd = [
-        "openclaw", "infer", "model", "run",
-        "--prompt", prompt,
-        "--model", model,
-        "--json",
-    ]
-    rc, out, err = _run(cmd)
-    if rc != 0:
-        print(f"[infer err] {err.strip()}", file=sys.stderr)
-        return None
-    try:
-        data = json.loads(out)
-    except json.JSONDecodeError:
-        print(f"[infer json parse err] {out[:300]}", file=sys.stderr)
-        return None
-    if not data.get("ok"):
-        print(f"[infer not ok] {data.get('error')}", file=sys.stderr)
-        return None
-    outputs = data.get("outputs") or []
-    if outputs:
-        first = outputs[0] if isinstance(outputs[0], dict) else {}
-        for k in ("text", "content", "output_text"):
-            if first.get(k):
-                return first[k]
-    return json.dumps(data, ensure_ascii=False)
+oc_browser = core_infer.oc_browser
+oc_infer = core_infer.oc_infer
 
 
 def _evaluate(js: str) -> Any:
@@ -482,20 +432,7 @@ def stage_enrich(input_path: Path, out_path: Path) -> None:
 # ============================================================================
 
 def build_system_block(config: dict[str, Any]) -> str:
-    persona = (PROMPTS_DIR / "system_persona.md").read_text()
-    examples = (PROMPTS_DIR / "examples.md").read_text()
-    config_str = yaml.safe_dump(config, allow_unicode=True, sort_keys=False)
-    return (
-        "<system>\n"
-        f"{persona}\n\n"
-        "## Few-shot examples\n\n"
-        f"{examples}\n\n"
-        "## Your sender + pitch + persona configuration\n\n"
-        "```yaml\n"
-        f"{config_str}"
-        "```\n"
-        "</system>\n"
-    )
+    return core_prompt.build_system_block(config, PROMPTS_DIR)
 
 
 def build_user_block(target: dict[str, Any], max_chars: int) -> str:
@@ -522,30 +459,7 @@ def build_user_block(target: dict[str, Any], max_chars: int) -> str:
     )
 
 
-def extract_first_json(text: str) -> dict[str, Any] | None:
-    if not text:
-        return None
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    start = text.find("{")
-    while start != -1:
-        depth = 0
-        for i in range(start, len(text)):
-            ch = text[i]
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = text[start: i + 1]
-                    try:
-                        return json.loads(candidate)
-                    except Exception:
-                        break
-        start = text.find("{", start + 1)
-    return None
+extract_first_json = core_prompt.extract_first_json
 
 
 _REFINE_PROMPT_TEMPLATE = """You wrote the draft below for a Japanese B2B inquiry-form message.
@@ -636,63 +550,18 @@ def _refine_draft(target: dict[str, Any], draft: dict[str, Any],
 
 def stage_draft(input_path: Path, out_path: Path, config: dict[str, Any],
                  refine: bool = False) -> None:
-    targets = [json.loads(l) for l in input_path.open()]
-    print(f"[draft] {len(targets)} targets to draft" + (" (with --refine 2nd pass)" if refine else ""))
-
-    model_cfg = config.get("model", {}) or {}
-    model = model_cfg.get("name", DEFAULT_MODEL)
-    default_max = int(model_cfg.get("max_chars", 400))
-    extended_max = int(model_cfg.get("max_chars_extended", 1800))
-
-    system_block = build_system_block(config)
-    drafts: list[dict[str, Any]] = []
-
-    for i, t in enumerate(targets, 1):
-        # Per-target char limit: targets.yaml overrides config
-        max_chars = int(t.get("char_limit") or default_max)
-        max_chars = min(max_chars, extended_max)
-
-        prompt = system_block + build_user_block(t, max_chars)
-        print(f"[draft] ({i}/{len(targets)}) {t.get('name')} (pass 1) ...")
-        response = oc_infer(prompt, model=model)
-        draft = extract_first_json(response or "")
-        if not draft or "subject" not in draft or "body" not in draft:
-            print(f"[draft] parse failed for {t.get('name')}: {(response or '')[:200]}")
-            continue
-
-        # Second-pass refinement: critique and rewrite
-        # Skip refine for SKIP outputs (no point critiquing a SKIP)
-        if refine and draft.get("subject") != "SKIP":
-            print(f"[draft] ({i}/{len(targets)}) {t.get('name')} (pass 2 refine) ...")
-            refined = _refine_draft(t, draft, config, max_chars)
-            if refined and refined.get("body"):
-                critique = refined.get("critique", "")[:80]
-                print(f"          → critique: {critique}{'...' if len(refined.get('critique','')) > 80 else ''}")
-                # Use refined version, keep original around for debugging
-                draft = {
-                    "subject": refined.get("subject"),
-                    "body": refined["body"],
-                    "_pass1_subject": draft.get("subject"),
-                    "_pass1_body": draft.get("body"),
-                    "_critique": refined.get("critique"),
-                }
-            else:
-                print(f"          → refine failed, keeping pass-1 draft")
-
-        drafts.append({
-            **t,
-            "draft": draft,
-            "max_chars_used": max_chars,
-            "_drafted_at": datetime.utcnow().isoformat() + "Z",
-        })
-
-    with out_path.open("w") as f:
-        for d in drafts:
-            f.write(json.dumps(d, ensure_ascii=False) + "\n")
-    print(f"[draft] wrote {len(drafts)} drafts -> {out_path}")
-
-    new_skips = [d for d in drafts if (d.get("draft") or {}).get("subject") == "SKIP"]
-    append_skip_history(new_skips)
+    refine_fn = _refine_draft if refine else None
+    core_draft.stage_draft(
+        input_path,
+        out_path,
+        config,
+        prompts_dir=PROMPTS_DIR,
+        build_user_block=build_user_block,
+        oc_infer_fn=oc_infer,
+        append_skip_fn=append_skip_history,
+        default_model=DEFAULT_MODEL,
+        refine_fn=refine_fn,
+    )
 
 
 # ============================================================================
@@ -749,45 +618,21 @@ def stage_preview(input_path: Path, interactive_send: bool = True,
         print("All sendable drafts are already in sent_history. Nothing to send.")
         return
 
-    print(f"\nSend drafts? Pick one:")
-    print(f"  all  → send all not-yet-sent ({len(not_yet_sent)} drafts: {','.join(map(str, not_yet_sent))})")
-    print(f"  1,3  → comma-separated draft IDs (1-{len(sendable)})")
-    print(f"  n    → skip, exit")
-    try:
-        ans = input("→ ").strip().lower()
-    except EOFError:
-        print("\n(no stdin — skipping interactive send)")
+    valid = core_preview.prompt_send_ids(len(sendable), not_yet_sent)
+    if valid is None:
         return
-
-    if not ans or ans in ("n", "no", "skip", "q", "quit"):
-        print("Aborted. Run `python run.py send --ids ...` later when ready.")
-        return
-
-    if ans in ("all", "y", "yes", "a"):
-        ids = set(not_yet_sent)
-    else:
-        try:
-            ids = {int(x.strip()) for x in ans.split(",") if x.strip()}
-        except ValueError:
-            print(f"Could not parse '{ans}'. Aborted.")
-            return
-
-    valid = {i for i in ids if 1 <= i <= len(sendable)}
-    if not valid:
-        print(f"No valid IDs in {ids}. Aborted.")
-        return
-
-    chosen_names = [sendable[i - 1].get("name", "?") for i in sorted(valid)]
-    print(f"\nSending to: {', '.join(chosen_names)}")
 
     if config is None:
-        # Lazy-load config when stage_preview is invoked directly
-        cfg_path = SKILL_DIR / "config.yaml"
-        if not cfg_path.exists():
-            print(f"[preview] config.yaml not found at {cfg_path}; cannot send", file=sys.stderr)
+        try:
+            config = load_merged_config(SKILL_DIR)
+        except FileNotFoundError as e:
+            print(f"[preview] {e}; cannot send", file=sys.stderr)
             return
-        config = yaml.safe_load(cfg_path.read_text())
-    stage_send(input_path, valid, mode="interactive", config=config)
+
+    def _do_send(ids: set[int]) -> None:
+        stage_send(input_path, ids, mode="interactive", config=config)
+
+    core_preview.run_after_valid_ids(valid, sendable, _do_send)
 
 
 # ============================================================================
@@ -854,12 +699,12 @@ def stage_campaign(
 
     # --- Phase 3: Personalize ---
     print(f"\n{bar}\n[3/6] PERSONALIZE — Sonnet draft (cached system prompt)\n{bar}")
-    cfg_path = SKILL_DIR / "config.yaml"
-    if not cfg_path.exists():
-        print(f"[campaign] config.yaml not found at {cfg_path}", file=sys.stderr)
-        print(f"           cp {SKILL_DIR / 'config.example.yaml'} {cfg_path}", file=sys.stderr)
+    try:
+        cfg = load_merged_config(SKILL_DIR)
+    except FileNotFoundError as e:
+        print(f"[campaign] {e}", file=sys.stderr)
+        print(f"           cp {SKILL_DIR / 'config.example.yaml'} {SKILL_DIR / 'config.yaml'}", file=sys.stderr)
         return
-    cfg = yaml.safe_load(cfg_path.read_text())
     stage_draft(DATA_DIR / "enriched.jsonl", DATA_DIR / "drafts.jsonl", cfg, refine=refine)
 
     drafts = [json.loads(l) for l in (DATA_DIR / "drafts.jsonl").open() if l.strip()]
@@ -1542,8 +1387,13 @@ def _heuristic_fill_fallback(target: dict[str, Any], config: dict[str, Any],
     return diagnostics
 
 
-def stage_send(input_path: Path, ids: set[int], mode: str = "interactive",
-               config: dict[str, Any] | None = None) -> None:
+def stage_send(
+    input_path: Path,
+    ids: set[int],
+    mode: str = "interactive",
+    config: dict[str, Any] | None = None,
+    heartbeat: str | None = None,
+) -> None:
     if not config:
         print("[send] missing config", file=sys.stderr)
         return
@@ -1577,6 +1427,8 @@ def stage_send(input_path: Path, ids: set[int], mode: str = "interactive",
 
     sent: list[dict[str, Any]] = []
     filled_only: list[dict[str, Any]] = []
+    hb = HeartbeatSession(SKILL_DIR, "send", len(targets), heartbeat=heartbeat, data_dir=DATA_DIR)
+    hb.start(f"send {len(targets)} targets")
 
     for di, d in enumerate(targets):
         idx = sendable.index(d) + 1
@@ -1656,25 +1508,39 @@ def stage_send(input_path: Path, ids: set[int], mode: str = "interactive",
             print(f"  [send] clicked final: {click2.get('text')}")
             time.sleep(3)
 
-        # 6. Verify success (heuristic: URL change or success keywords)
+        # 6. Verify send (keywords, required fields, plan gaps)
         snap = oc_browser("snapshot")
-        success_keywords = ["送信完了", "ありがとうございました", "ご連絡", "完了画面", "THANKS", "thank you"]
-        success = False
+        snap_path = DATA_DIR / f"verify_snapshot_{d.get('id', di)}.txt"
         if snap:
-            success = any(k in snap for k in success_keywords)
+            snap_path.write_text(snap, encoding="utf-8")
 
-        if success:
-            print(f"  [send] ✅ verified success page")
-            sent.append(d)
+        if mode in ("auto", "interactive"):
+            vresult = verify_send_completed(
+                d,
+                "jp_form",
+                snapshot=snap or "",
+                plan=d.get("_llm_plan"),
+                evaluate_fn=_evaluate,
+                data_dir=DATA_DIR,
+                snapshot_path=snap_path if snap else None,
+            )
+            outcome = handle_verify_result(d, vresult, DATA_DIR, channel="jp_form")
+            if outcome == "sent_ok":
+                print(f"  [send] ✅ {vresult.get('reason')}")
+                sent.append(d)
+            else:
+                print(f"  [send] ⚠ verify: {vresult.get('status')} — {vresult.get('reason')}")
+                filled_only.append(d)
         else:
-            print(f"  [send] ⚠ no success keywords detected — verify manually")
             filled_only.append(d)
 
-        # Rate limit
+        hb.tick(di + 1, f"{name} · verify done")
+
         if di < len(targets) - 1:
             print(f"  [send] sleeping 30s before next...")
             time.sleep(30)
 
+    hb.end(f"send done · sent={len(sent)} · pending={len(filled_only)}")
     if sent:
         append_sent_history(sent)
     print(f"\n[send] done · sent={len(sent)} · filled-only={len(filled_only)}")
@@ -1838,6 +1704,41 @@ def stage_walkthrough(input_path: Path, config: dict[str, Any],
     print(bar)
 
 
+def stage_resolve(
+    target_id: str,
+    fields: dict[str, str],
+    config: dict[str, Any],
+    *,
+    drafts_path: Path | None = None,
+) -> None:
+    """Apply field overrides from Slack/user and retry send for one target."""
+    path = drafts_path or (DATA_DIR / "drafts.jsonl")
+    if not path.exists():
+        print(f"[resolve] {path} not found", file=sys.stderr)
+        return
+
+    drafts = [json.loads(line) for line in path.open() if line.strip()]
+    sendable = [d for d in drafts if (d.get("draft") or {}).get("subject") != "SKIP"]
+    found_idx = next((i for i, d in enumerate(sendable, 1) if d.get("id") == target_id), None)
+    if found_idx is None:
+        print(f"[resolve] target_id {target_id} not in sendable drafts", file=sys.stderr)
+        return
+
+    for d in drafts:
+        if d.get("id") == target_id:
+            overrides = dict(d.get("field_map_overrides") or {})
+            overrides.update(fields)
+            d["field_map_overrides"] = overrides
+            d.pop("_llm_plan", None)
+
+    with path.open("w") as f:
+        for d in drafts:
+            f.write(json.dumps(d, ensure_ascii=False) + "\n")
+    close_needs_attention(DATA_DIR, target_id, resolution=f"overrides: {fields}")
+    print(f"[resolve] updated overrides for {target_id}: {fields}")
+    stage_send(path, {found_idx}, mode="auto", config=config, heartbeat=None)
+
+
 def stage_mark_sent(input_path: Path, ids: set[int]) -> None:
     drafts = [json.loads(l) for l in input_path.open()]
     sendable = [d for d in drafts if d.get("draft", {}).get("subject") != "SKIP"]
@@ -1917,6 +1818,17 @@ def main() -> None:
                              help="Fill and submit without prompting")
     mode_group.add_argument("--no-confirm", action="store_true",
                              help="Fill only — you click submit manually")
+    p.add_argument(
+        "--heartbeat",
+        default=None,
+        choices=["slack"],
+        help="Post progress to Slack incoming webhook every ~5 min",
+    )
+
+    p = sub.add_parser("resolve", help="Resolve needs_attention with field overrides and retry send")
+    p.add_argument("--target-id", required=True)
+    p.add_argument("--field", action="append", default=[], help="key=value (repeatable)")
+    p.add_argument("--config", default=str(SKILL_DIR / "config.yaml"))
 
     p = sub.add_parser("walk",
                         help="Walkthrough: review each SENDABLE draft one-by-one and choose send/skip/fill/quit")
@@ -1932,8 +1844,10 @@ def main() -> None:
     p.add_argument("--all", action="store_true", help="Mark every not-yet-sent SENDABLE draft as sent")
 
     p = sub.add_parser("history", help="View / manage skip and sent history")
-    p.add_argument("action",
-                   choices=["show", "purge-skip", "purge-sent", "purge-all"])
+    p.add_argument(
+        "action",
+        choices=["show", "needs-attention", "purge-skip", "purge-sent", "purge-all"],
+    )
 
     args = ap.parse_args()
 
@@ -1959,32 +1873,32 @@ def main() -> None:
     elif args.cmd == "enrich":
         stage_enrich(Path(args.input_path), Path(args.out))
     elif args.cmd == "draft":
-        config_path = Path(args.config)
-        if not config_path.exists():
-            print(f"[draft] config not found: {config_path}", file=sys.stderr)
-            print(f"        cp {SKILL_DIR / 'config.example.yaml'} {config_path}", file=sys.stderr)
+        try:
+            cfg = load_merged_config(SKILL_DIR)
+        except FileNotFoundError as e:
+            print(f"[draft] {e}", file=sys.stderr)
             sys.exit(2)
-        cfg = yaml.safe_load(config_path.read_text())
         # Default: read from enriched.jsonl. With --from-targets, read leads.jsonl instead
         in_path = Path(args.input_path)
         if args.from_targets and not in_path.exists():
             in_path = DATA_DIR / "leads.jsonl"
         stage_draft(in_path, Path(args.out), cfg, refine=args.refine)
     elif args.cmd == "preview":
-        # Lazy-load config for interactive send chain
         cfg = None
-        cfg_path = SKILL_DIR / "config.yaml"
-        if cfg_path.exists() and not args.no_send:
-            cfg = yaml.safe_load(cfg_path.read_text())
+        if not args.no_send:
+            try:
+                cfg = load_merged_config(SKILL_DIR)
+            except FileNotFoundError:
+                cfg = None
         stage_preview(Path(args.input_path),
                       interactive_send=(not args.no_send),
                       config=cfg)
     elif args.cmd == "send":
-        config_path = Path(args.config)
-        if not config_path.exists():
-            print(f"[send] config not found: {config_path}", file=sys.stderr)
+        try:
+            cfg = load_merged_config(SKILL_DIR)
+        except FileNotFoundError as e:
+            print(f"[send] {e}", file=sys.stderr)
             sys.exit(2)
-        cfg = yaml.safe_load(config_path.read_text())
         ids = _resolve_ids_arg(args.ids, args.all, Path(args.input_path), cmd_name="send")
         if ids is None:
             sys.exit(2)
@@ -1994,7 +1908,27 @@ def main() -> None:
             mode = "fill-only"
         else:
             mode = "interactive"
-        stage_send(Path(args.input_path), ids, mode=mode, config=cfg)
+        stage_send(
+            Path(args.input_path),
+            ids,
+            mode=mode,
+            config=cfg,
+            heartbeat=args.heartbeat,
+        )
+    elif args.cmd == "resolve":
+        try:
+            cfg = load_merged_config(SKILL_DIR)
+        except FileNotFoundError as e:
+            print(f"[resolve] {e}", file=sys.stderr)
+            sys.exit(2)
+        fields: dict[str, str] = {}
+        for item in args.field:
+            if "=" not in item:
+                print(f"[resolve] bad --field {item!r}, want key=value", file=sys.stderr)
+                sys.exit(2)
+            k, v = item.split("=", 1)
+            fields[k.strip()] = v.strip()
+        stage_resolve(args.target_id, fields, cfg)
     elif args.cmd == "walk":
         config_path = Path(args.config)
         if not config_path.exists():

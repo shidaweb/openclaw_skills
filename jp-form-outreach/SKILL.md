@@ -110,6 +110,10 @@ Do NOT use for:
 | **"Send draft 1" / "1番送って"** | (see Send flow below — TWO-STEP confirmation in chat) |
 | **"How many already sent?"** | `cat ~/.openclaw/skills/jp-form-outreach/data/sent_history.jsonl \| wc -l` |
 | **"Show sent history" / "送信履歴"** | `… run.py history show` |
+| **"Build target list" / "リスト作って"** | List build flow（§下記） |
+| **"進捗どう？"** | `tail -n 20 data/current_task.jsonl` を要約 |
+| **needs_attention への回答** | `… run.py resolve --target-id <id> --field 業界=その他` |
+| **"全部止めて"** | `pkill -f "run.py send"` |
 
 ## Send flow (with Slack confirmation)
 
@@ -202,6 +206,39 @@ cd ~/.openclaw/skills/jp-form-outreach
 # Send approved drafts
 .venv/bin/python run.py send --ids 1,3,5 --auto-send
 ```
+
+## List build flow (agent-led)
+
+（linkedin-outreach/SKILL.md と同手順。`append_targets --skill jp_form` / `linkedin` を使い分け）
+
+**禁止:** 実在しない企業の捏造。PR TIMES / IR / 公式サイトで検証してから採用。
+
+## Send verification & escalation
+
+`run.py send --ids N --auto-send` 後に verify。想定外の必須フィールドは `needs_attention` へ。
+
+```bash
+.venv/bin/python run.py history needs-attention
+.venv/bin/python run.py resolve --target-id <id> --field 業界=その他 --field 紹介者=なし
+```
+
+Webhook 通知（`sender_brief.yaml` の `slack.incoming_webhook_url`）:
+- ✅ 送信完了
+- ⚠️ 完了画面未確認 / 想定外フィールド
+
+## Heartbeat behavior
+
+```bash
+.venv/bin/python run.py send --ids all --auto-send --heartbeat slack
+```
+
+`--heartbeat slack` 未指定時は従来どおり（5 分毎投稿なし）。
+
+## needs_attention の取り扱い
+
+1. Slack でユーザーに不足フィールドの値を聞く
+2. `run.py resolve --target-id ... --field key=value` で overrides 更新 → 自動再 send
+3. 解決後 `history needs-attention` で open が減っていることを確認
 
 ## Configuration
 

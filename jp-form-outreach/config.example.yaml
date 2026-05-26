@@ -1,6 +1,7 @@
 # jp-form-outreach: config
 #
 # Copy this file to config.yaml and fill in your own pitch/sender info.
+# Optional: copy ../sender_brief.example.yaml to ../sender_brief.yaml (merged; overrides apply).
 # The contents become a cached system prompt — keeping this file stable
 # across runs gives ~95% prompt cache hits and minimal Claude credit usage.
 
@@ -89,3 +90,7 @@ filters:
     - "b2c_only"     # B2C顧客フォームしかない会社（LinkedIn DMルートに回す）
     - "iframe"       # 第三者ホスト iframe フォーム（v2で対応）
     - "site_closed"  # 合併・サイト閉鎖
+
+# Slack one-way status posts (see sender_brief.yaml)
+# slack:
+#   incoming_webhook_url: "https://hooks.slack.com/services/..."

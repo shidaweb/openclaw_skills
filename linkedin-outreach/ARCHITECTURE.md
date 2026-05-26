@@ -382,25 +382,30 @@ channel.
 | Send | Sales Nav InMail compose | LinkedIn JP DM / Wantedly message / Email (himalaya skill) | Form auto-fill + submit |
 | Log | sent_history.jsonl | sent_history.jsonl | sent_history.jsonl |
 
-### 11.2 Shared core (refactor target)
+### 11.2 Shared core (implemented)
 
-The non-channel phases (Personalize, Approve, Log) and the history primitives
-should be extracted into a shared library at `~/.openclaw/skills/_outreach_core/`:
+Non-channel primitives live in `~/.openclaw/skills/_outreach_core/`:
 
 ```
 _outreach_core/
-├── run_core.py
-├── prompts/         # base persona templates (shared)
-└── lib/
-    ├── history.py   # skip_history / sent_history primitives
-    ├── prompt.py    # build_system_block, extract_first_json, cache-stable schema
-    ├── draft.py     # stage_draft generic
-    └── preview.py   # stage_preview generic (interactive prompt)
+├── history.py       # skip/sent JSONL, load_global_exclude_set(), canonical_id
+├── infer.py         # oc_infer / oc_browser
+├── prompt.py        # build_system_block, extract_first_json
+├── draft.py         # stage_draft (generic Personalize)
+├── preview.py       # interactive Approve prompt helpers
+├── approve.py       # Slack pre-send approval
+├── config.py        # load_merged_config() + sender_brief.yaml
+├── verify.py          # post-send verification, needs_attention.jsonl
+├── notify.py          # Slack incoming webhook (one-way)
+├── progress.py        # current_task.jsonl + optional heartbeat
+└── helpers/
+    ├── dump_exclude_set.py
+    ├── append_targets.py
+    └── backfill_canonical_ids.py
 ```
 
-Each concrete skill (`linkedin-outreach`, `jp-outreach`, `form-outreach`)
-imports the core and supplies channel-specific implementations of Pull,
-Enrich, and Send.
+`linkedin-outreach` and `jp-form-outreach` import the core via `sys.path` and
+keep channel-specific Pull, Enrich, and Send in each `run.py`.
 
 ### 11.3 JP-specific design notes
 
@@ -444,9 +449,9 @@ These would live in a separate `targets.csv` under
 | `lookup-urls` can hit same-name different-person (Sam Corcos → Evan Baehr) | Bad URL gets stored; enrich runs against wrong person; draft generates against wrong content; Sonnet usually SKIPs but not always | Add company-confidence threshold; on `?` match (company mismatch), leave URL empty and require human resolution |
 | CSV manual edits sometimes break quoting | Subsequent runs read garbled fields | Always write back with `QUOTE_ALL`; tolerate broken reads by merging stray columns into `note` |
 | Sales Nav InMail compose modal selectors hardcoded to current DOM | LinkedIn UI change will break send | Selectors centralized in `_FILL_COMPOSE_JS` / `_CLICK_SEND_JS`; one-place update on UI change |
-| `groupPolicy="open"` in Slack | Prompt-injection risk through any Slack message | Switch to `allowlist` + specific channel IDs before scaling |
+| `groupPolicy="open"` in Slack | Prompt-injection risk through any Slack message | OpenClaw plugin allowlist; Python only posts via incoming webhook |
 | Send-history dedup is by Sales Nav slug | If a lead's slug changes (rare), they could be re-sent | Acceptable given LinkedIn slug stability; monitor for false negatives |
-| `form-outreach` and `jp-outreach` not yet built | Volume-side strategy (500/月 forms) unimplemented | Build after `linkedin-outreach` is in steady-state operation |
+| Cross-channel duplicate detection (slug mismatch) | Same company may appear under different `id` values | `canonical_id` on history entries + `load_global_exclude_set()` for list_builder |
 
 ---
 

@@ -118,6 +118,10 @@ draft → preview into one command.
 | **"Show skip history" / "スキップ履歴"** | `… run.py history show` |
 | **"Look up LinkedIn URLs" / "URL自動取得して" / "name+companyからURL埋めて"** | `… run.py lookup-urls --input targets.csv` |
 | **"First N URLs only" / "Tier 1だけ自動で"** | `… run.py lookup-urls --input targets.csv --limit 5` |
+| **"Build target list" / "リスト作って"** | List build flow（§下記）— WebSearch + `dump_exclude_set` + `append_targets` |
+| **"進捗どう？" / "今何してる？"** | `tail -n 20 data/current_task.jsonl` を要約して返す |
+| **"<会社>に <値> で送って"** (needs_attention 応答) | `… run.py resolve --target-id <id> --field key=value` |
+| **"全部止めて"** | `pkill -f "run.py send"` + 必要なら webhook で中断通知 |
 
 ## Send flow (v2 — full automation with Slack confirmation)
 
@@ -215,6 +219,42 @@ With Sonnet and prompt caching, expect ~$0.005 per drafted InMail
 (system prompt ~95% cached, output ~500 tokens). 100 InMails/month
 runs at well under $1 in API equivalent — most cost is on the
 Sales Nav subscription itself, not the LLM.
+
+## List build flow (agent-led)
+
+User 例: 「EdTech 中堅 10 社、フォームと LinkedIn に振り分けてリスト化」
+
+1. `cat ~/.openclaw/skills/sender_brief.yaml` で送信者文脈
+2. `python3 -m _outreach_core.helpers.dump_exclude_set` で除外 ID（JSON）
+3. WebSearch で実在企業を抽出（PR TIMES / IR / 公式で検証。**捏造禁止**）
+4. 候補を Slack で表提示 → ユーザー確認
+5. OK 後:
+   ```bash
+   echo '<JSON array>' | python3 -m _outreach_core.helpers.append_targets --skill linkedin --input - --format jsonl
+   echo '<JSON array>' | python3 -m _outreach_core.helpers.append_targets --skill jp_form --input - --format jsonl
+   ```
+6. enrich → draft → preview に進むか確認
+
+## Send verification & escalation
+
+`run.py send --ids N --auto-send` 後、各件は自動 verify されます。
+
+Slack（incoming webhook 経由）のサイン:
+- ✅ `<会社名>` 送信完了 → `sent_history.jsonl` 記録済
+- ⚠️ 送信完了が確認できません → 手動確認をユーザーに依頼
+- ⚠️ 想定外の入力項目 → `run.py resolve --target-id <id> --field ...`
+
+`data/needs_attention.jsonl` に保留。一覧: `run.py history needs-attention`
+
+## Heartbeat behavior
+
+長時間 send では `--heartbeat slack` を付与（webhook URL 設定時のみ 5 分毎に状況投稿）:
+
+```bash
+.venv/bin/python run.py send --ids 1,2,3 --auto-send --heartbeat slack
+```
+
+未指定時は従来どおり（バックグラウンドスレッドなし）。
 
 ## Notes
 

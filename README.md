@@ -58,3 +58,24 @@ Contract:
 - **Resumable**: each phase reads its predecessor's JSONL output.
 - **Append-only history**.
 - **Cache-friendly**: phase 3 system prompt is byte-stable for prompt-cache hits.
+
+## Architecture (v2)
+
+- **OpenClaw agent (Claude)**: リスト生成・承認・エスカレーション判断（WebSearch + SKILL.md）
+- **Python (`_outreach_core` + `run.py`)**: JSONL、dedup、フォーム入力、送信検証、Webhook 通知
+- **Slack 受信**: OpenClaw Slack plugin（自作しない）
+- **Slack 状況通知**: `sender_brief.yaml` の incoming webhook → `_outreach_core/notify.py`
+
+```bash
+cp sender_brief.example.yaml sender_brief.yaml   # webhook URL を設定
+
+python3 -m _outreach_core.helpers.dump_exclude_set
+echo '[{"id":"co","name":"テスト株式会社"}]' \
+  | python3 -m _outreach_core.helpers.append_targets --skill jp_form --input - --format jsonl
+
+cd jp-form-outreach
+.venv/bin/python run.py send --ids 1 --auto-send --heartbeat slack
+.venv/bin/python run.py resolve --target-id co --field 業界=その他
+```
+
+See [`_outreach_core/README.md`](./_outreach_core/README.md) and [`docs/SCHEDULING.md`](./docs/SCHEDULING.md).

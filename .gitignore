@@ -21,6 +21,15 @@ data/sample_*.txt
 # Skill config containing personal info (sender details, calendar URL, etc)
 # Always commit config.example.yaml — never the filled-in config.yaml
 config.yaml
+sender_brief.yaml
 targets.yaml
 targets.csv
 targets.csv.bak
+
+# Shared core runtime data
+_outreach_core/data/
+
+# Per-skill escalation / progress logs
+**/data/needs_attention.jsonl
+**/data/current_task.jsonl
+**/data/verify_snapshot_*.txt

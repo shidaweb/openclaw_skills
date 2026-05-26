@@ -1,0 +1,46 @@
+# Shared sender context (copy to sender_brief.yaml at repo root; gitignored).
+# Merged into each skill's config.yaml via load_merged_config() — skill keys win.
+
+sender:
+  name: "Your Name"
+  company: "Your Company"
+  role: "Founder"
+
+product:
+  name: "Product Name"
+  one_liner: "One sentence value proposition"
+
+problems_solved:
+  - "Problem 1 you solve"
+
+target:
+  industries:
+    - "SaaS"
+    - "EdTech"
+  size_band: "50-500 employees"
+  decision_makers:
+    - "CEO"
+  geo: "JP"
+  must_have_signals:
+    - "Recent PR TIMES announcement"
+  must_not_signals:
+    - "B2C-only with no B2B line"
+
+desired_channels:
+  - "linkedin"
+  - "jp_form"
+
+slack:
+  incoming_webhook_url: ""   # one-way status posts (empty = notify no-op)
+  channel_id: ""             # align with OpenClaw Slack plugin channel
+
+heartbeat:
+  interval_sec: 300
+  enabled_for:
+    - "send"
+    - "enrich"
+
+pitch:
+  headline: "..."
+target_persona:
+  description: "..."

@@ -25,6 +25,22 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from _outreach_core import draft as core_draft
+from _outreach_core import history as core_history
+from _outreach_core import infer as core_infer
+from _outreach_core import preview as core_preview
+from _outreach_core import prompt as core_prompt
+from _outreach_core.config import load_merged_config
+from _outreach_core.progress import HeartbeatSession
+from _outreach_core.verify import (
+    close_needs_attention,
+    handle_verify_result,
+    list_open_needs_attention,
+    verify_send_completed,
+)
+
 try:
     import yaml
 except ImportError:
@@ -36,8 +52,8 @@ DATA_DIR = SKILL_DIR / "data"
 PROMPTS_DIR = SKILL_DIR / "prompts"
 DATA_DIR.mkdir(exist_ok=True)
 
-DEFAULT_MODEL = "claude-cli/claude-sonnet-4-6"
-BROWSER_PROFILE = "openclaw"
+DEFAULT_MODEL = core_infer.DEFAULT_MODEL
+BROWSER_PROFILE = core_infer.BROWSER_PROFILE
 RATE_LIMIT_SECONDS = 4  # between page loads, to look human
 
 SKIP_HISTORY_PATH = DATA_DIR / "skip_history.jsonl"
@@ -61,54 +77,31 @@ SENT_HISTORY_PATH = DATA_DIR / "sent_history.jsonl"
 # `--ignore-skip-history` to fetch-leads / fetch-from-csv, or just delete
 # the skip_history.jsonl file.
 
-def _load_id_set(path: Path) -> set[str]:
-    if not path.exists():
-        return set()
-    ids: set[str] = set()
-    for line in path.open():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-            if "id" in entry:
-                ids.add(entry["id"])
-        except Exception:
-            continue
-    return ids
-
-
 def load_skip_set() -> set[str]:
-    return _load_id_set(SKIP_HISTORY_PATH)
+    return core_history.load_skip_set(DATA_DIR)
 
 
 def load_sent_set() -> set[str]:
-    return _load_id_set(SENT_HISTORY_PATH)
+    return core_history.load_sent_set(DATA_DIR)
 
 
 def append_skip_history(skipped_drafts: list[dict[str, Any]]) -> None:
     """Append newly-SKIPped drafts to skip_history.jsonl."""
-    if not skipped_drafts:
-        return
-    now = datetime.utcnow().isoformat() + "Z"
-    with SKIP_HISTORY_PATH.open("a") as f:
-        for d in skipped_drafts:
-            reason_full = (d.get("draft") or {}).get("body") or ""
-            reason = reason_full.replace("INSUFFICIENT_DATA: ", "")[:400]
-            entry = {
-                "id": d["id"],
-                "name": d.get("name"),
-                "company": d.get("company"),
-                "title": d.get("title"),
-                "skipped_at": now,
-                "reason": reason,
-            }
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    print(f"[skip-history] appended {len(skipped_drafts)} entries -> {SKIP_HISTORY_PATH.name}")
+    core_history.append_skip_history(
+        skipped_drafts,
+        DATA_DIR,
+        extra_fields=("name", "company", "title"),
+    )
 
 
 def stage_history(action: str) -> None:
     """View or purge skip/sent history."""
+    if action == "needs-attention":
+        rows = list_open_needs_attention(DATA_DIR)
+        print(f"needs_attention.jsonl: {len(rows)} open")
+        for e in rows[-20:]:
+            print(f"  - {e.get('target_id')}: {e.get('name')} | {e.get('reason', '')[:80]}")
+        return
     if action == "show":
         skip_n = sum(1 for _ in SKIP_HISTORY_PATH.open()) if SKIP_HISTORY_PATH.exists() else 0
         sent_n = sum(1 for _ in SENT_HISTORY_PATH.open()) if SENT_HISTORY_PATH.exists() else 0
@@ -149,77 +142,15 @@ def stage_history(action: str) -> None:
 
 def append_sent_history(sent_drafts: list[dict[str, Any]]) -> None:
     """Append sent drafts to sent_history.jsonl (called from stage_send)."""
-    if not sent_drafts:
-        return
-    now = datetime.utcnow().isoformat() + "Z"
-    with SENT_HISTORY_PATH.open("a") as f:
-        for d in sent_drafts:
-            entry = {
-                "id": d["id"],
-                "name": d.get("name"),
-                "company": d.get("company"),
-                "subject": (d.get("draft") or {}).get("subject"),
-                "sent_at": now,
-            }
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    print(f"[sent-history] appended {len(sent_drafts)} entries -> {SENT_HISTORY_PATH.name}")
-
-# ============================================================================
-# OpenClaw subprocess helpers
-# ============================================================================
-
-def _run(cmd: list[str], capture_text: bool = True) -> tuple[int, str, str]:
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    return res.returncode, res.stdout, res.stderr
+    core_history.append_sent_history(
+        sent_drafts,
+        DATA_DIR,
+        extra_fields=("name", "company", "title"),
+    )
 
 
-def oc_browser(*args: str, profile: str = BROWSER_PROFILE) -> str | None:
-    """`openclaw browser ...` returning stdout text. None on error."""
-    cmd = ["openclaw", "browser", "--browser-profile", profile, *args]
-    rc, out, err = _run(cmd)
-    if rc != 0:
-        print(f"[browser err] {' '.join(args)}: {err.strip()}", file=sys.stderr)
-        return None
-    return out
-
-
-def oc_infer(prompt: str, model: str = DEFAULT_MODEL) -> str | None:
-    """
-    `openclaw infer model run --prompt ... --model ... --json` returning the
-    text output of the model. None on error.
-
-    Keeping --prompt structure stable across calls is what enables prompt
-    caching. We pass the long stable system block first, then the lead-specific
-    block, so the cache prefix matches across calls within the same run.
-    """
-    cmd = [
-        "openclaw", "infer", "model", "run",
-        "--prompt", prompt,
-        "--model", model,
-        "--json",
-    ]
-    rc, out, err = _run(cmd)
-    if rc != 0:
-        print(f"[infer err] {err.strip()}", file=sys.stderr)
-        return None
-    try:
-        data = json.loads(out)
-    except json.JSONDecodeError:
-        print(f"[infer json parse err] {out[:300]}", file=sys.stderr)
-        return None
-    if not data.get("ok"):
-        print(f"[infer not ok] {data.get('error')}", file=sys.stderr)
-        return None
-    outputs = data.get("outputs") or []
-    # Common shapes seen across providers:
-    #   [{"text": "..."}], [{"content": "..."}], [{"type": "text", "text": "..."}]
-    if outputs:
-        first = outputs[0] if isinstance(outputs[0], dict) else {}
-        for k in ("text", "content", "output_text"):
-            if first.get(k):
-                return first[k]
-    # Fallback: dump full output for inspection
-    return json.dumps(data, ensure_ascii=False)
+oc_browser = core_infer.oc_browser
+oc_infer = core_infer.oc_infer
 
 
 # ============================================================================
@@ -1023,11 +954,11 @@ def stage_campaign(
 
     # --- Phase 3: Personalize ---
     print(f"\n{bar}\n[3/6] PERSONALIZE — Sonnet draft (cached system prompt)\n{bar}")
-    cfg_path = SKILL_DIR / "config.yaml"
-    if not cfg_path.exists():
-        print(f"[campaign] config.yaml not found at {cfg_path}", file=sys.stderr)
+    try:
+        cfg = load_merged_config(SKILL_DIR)
+    except FileNotFoundError as e:
+        print(f"[campaign] {e}", file=sys.stderr)
         return
-    cfg = yaml.safe_load(cfg_path.read_text())
     stage_draft(DATA_DIR / "enriched.jsonl", DATA_DIR / "drafts.jsonl", cfg)
 
     # Quick stats
@@ -1081,25 +1012,8 @@ def stage_enrich(input_path: Path, out_path: Path) -> None:
 # ============================================================================
 
 def build_system_block(config: dict[str, Any]) -> str:
-    """
-    Build the stable, cacheable system block. The exact byte sequence here
-    must NOT change across leads in the same run, so the prompt cache gets
-    a hit. (Lead-specific data goes in the user block only.)
-    """
-    persona = (PROMPTS_DIR / "system_persona.md").read_text()
-    examples = (PROMPTS_DIR / "examples.md").read_text()
-    config_str = yaml.safe_dump(config, allow_unicode=True, sort_keys=False)
-    return (
-        "<system>\n"
-        f"{persona}\n\n"
-        "## Few-shot examples\n\n"
-        f"{examples}\n\n"
-        "## Your sender + pitch + persona configuration\n\n"
-        "```yaml\n"
-        f"{config_str}"
-        "```\n"
-        "</system>\n"
-    )
+    """Cache-stable system block (delegates to _outreach_core.prompt)."""
+    return core_prompt.build_system_block(config, PROMPTS_DIR)
 
 
 def build_user_block(lead: dict[str, Any], max_chars: int) -> str:
@@ -1118,62 +1032,20 @@ def build_user_block(lead: dict[str, Any], max_chars: int) -> str:
     )
 
 
-def extract_first_json(text: str) -> dict[str, Any] | None:
-    """Pull the first {...} block out of model output, tolerant of prose."""
-    if not text:
-        return None
-    # Try direct parse first
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    # Fall back: brace matching
-    start = text.find("{")
-    while start != -1:
-        depth = 0
-        for i in range(start, len(text)):
-            ch = text[i]
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = text[start: i + 1]
-                    try:
-                        return json.loads(candidate)
-                    except Exception:
-                        break
-        start = text.find("{", start + 1)
-    return None
+extract_first_json = core_prompt.extract_first_json
 
 
 def stage_draft(input_path: Path, out_path: Path, config: dict[str, Any]) -> None:
-    leads = [json.loads(l) for l in input_path.open()]
-    print(f"[draft] {len(leads)} leads to draft")
-    model = config.get("model", {}).get("name", DEFAULT_MODEL)
-    max_chars = int(config.get("model", {}).get("max_chars", 1800))
-    system_block = build_system_block(config)
-
-    drafts: list[dict[str, Any]] = []
-    for i, lead in enumerate(leads, 1):
-        prompt = system_block + build_user_block(lead, max_chars)
-        print(f"[draft] ({i}/{len(leads)}) {lead.get('name') or lead['id']} ...")
-        response = oc_infer(prompt, model=model)
-        draft = extract_first_json(response or "")
-        if not draft or "subject" not in draft or "body" not in draft:
-            print(f"[draft] parse failed for {lead.get('name')}: {(response or '')[:200]}")
-            continue
-        drafts.append({**lead, "draft": draft, "_drafted_at": datetime.utcnow().isoformat() + "Z"})
-
-    with out_path.open("w") as f:
-        for d in drafts:
-            f.write(json.dumps(d, ensure_ascii=False) + "\n")
-    print(f"[draft] wrote {len(drafts)} drafts -> {out_path}")
-
-    # Append newly-SKIPped drafts to skip_history so they're filtered out of
-    # future fetches automatically.
-    new_skips = [d for d in drafts if (d.get("draft") or {}).get("subject") == "SKIP"]
-    append_skip_history(new_skips)
+    core_draft.stage_draft(
+        input_path,
+        out_path,
+        config,
+        prompts_dir=PROMPTS_DIR,
+        build_user_block=build_user_block,
+        oc_infer_fn=oc_infer,
+        append_skip_fn=append_skip_history,
+        default_model=DEFAULT_MODEL,
+    )
 
 
 # ============================================================================
@@ -1214,37 +1086,12 @@ def stage_preview(input_path: Path, interactive_send: bool = True) -> None:
         print("All sendable drafts are already in sent_history. Nothing to send.")
         return
 
-    print(f"\nSend drafts? Pick one:")
-    print(f"  all  → send all not-yet-sent ({len(not_yet_sent)} drafts: {','.join(map(str, not_yet_sent))})")
-    print(f"  1,3  → comma-separated draft IDs (1-{len(sendable)})")
-    print(f"  n    → skip, exit")
-    try:
-        ans = input("→ ").strip().lower()
-    except EOFError:
-        print("\n(no stdin — skipping interactive send)")
+    valid = core_preview.prompt_send_ids(len(sendable), not_yet_sent)
+    if valid is None:
         return
-
-    if not ans or ans in ("n", "no", "skip", "q", "quit"):
-        print("Aborted. Run `python run.py send --ids ...` later when ready.")
-        return
-
-    if ans in ("all", "y", "yes", "a"):
-        ids = set(not_yet_sent)
-    else:
-        try:
-            ids = {int(x.strip()) for x in ans.split(",") if x.strip()}
-        except ValueError:
-            print(f"Could not parse '{ans}'. Aborted.")
-            return
-
-    valid = {i for i in ids if 1 <= i <= len(sendable)}
-    if not valid:
-        print(f"No valid IDs in {ids}. Aborted.")
-        return
-
-    chosen_names = [sendable[i - 1].get("name", "?") for i in sorted(valid)]
-    print(f"\nSending to: {', '.join(chosen_names)}")
-    stage_send(input_path, valid, mode="interactive")
+    core_preview.run_after_valid_ids(
+        valid, sendable, lambda ids: stage_send(input_path, ids, mode="interactive")
+    )
 
 
 # ============================================================================
@@ -1433,8 +1280,12 @@ def _find_message_compose_fields(snapshot: str) -> tuple[str | None, str | None]
     return subject_ref, body_ref
 
 
-def stage_send(input_path: Path, ids: set[int],
-                mode: str = "interactive") -> None:
+def stage_send(
+    input_path: Path,
+    ids: set[int],
+    mode: str = "interactive",
+    heartbeat: str | None = None,
+) -> None:
     """
     Drive the Sales Nav InMail compose UI for the given draft IDs.
 
@@ -1489,6 +1340,8 @@ def stage_send(input_path: Path, ids: set[int],
 
     sent: list[dict[str, Any]] = []
     filled_only: list[dict[str, Any]] = []
+    hb = HeartbeatSession(SKILL_DIR, "send", len(targets), heartbeat=heartbeat, data_dir=DATA_DIR)
+    hb.start(f"send {len(targets)} InMails")
     for di, d in enumerate(targets):
         is_last = di == len(targets) - 1
         idx = sendable.index(d) + 1
@@ -1585,15 +1438,23 @@ def stage_send(input_path: Path, ids: set[int],
         time.sleep(3.0)
 
         # 6. Verify
-        verify = _verify_sent_via_js()
-        if not verify or not verify.get("sent"):
-            print(f"  [send] ⚠ verification failed: {verify and verify.get('reason')}")
-            print(f"  [send] Message may NOT have sent. Not logging to history.")
+        browser_verify = _verify_sent_via_js()
+        vresult = verify_send_completed(
+            d,
+            "linkedin",
+            browser_verify=browser_verify,
+            data_dir=DATA_DIR,
+        )
+        outcome = handle_verify_result(d, vresult, DATA_DIR, channel="linkedin")
+        if outcome != "sent_ok":
+            print(f"  [send] ⚠ {vresult.get('status')}: {vresult.get('reason')}")
             filled_only.append(d)
+            hb.tick(sendable.index(d) + 1, f"{name} verify {vresult.get('status')}")
             continue
 
-        print(f"  [send] ✅ sent ({verify.get('reason')}).")
+        print(f"  [send] ✅ sent ({vresult.get('reason')}).")
         sent.append(d)
+        hb.tick(sendable.index(d) + 1, f"{name} sent")
 
         # Rate limit between sends — look human, avoid LinkedIn spam detection
         if not is_last:
@@ -1601,6 +1462,7 @@ def stage_send(input_path: Path, ids: set[int],
             print(f"  [send] sleeping {delay}s before next send...")
             time.sleep(delay)
 
+    hb.end(f"send done · sent={len(sent)} · pending={len(filled_only)}")
     if sent:
         append_sent_history(sent)
     print(f"\n[send] done · sent={len(sent)} · filled-only={len(filled_only)}")
@@ -1610,6 +1472,27 @@ def stage_send(input_path: Path, ids: set[int],
         print(f"[send] If you DID send any of those manually, run:")
         ids_str = ",".join(str(sendable.index(d) + 1) for d in filled_only)
         print(f"      .venv/bin/python run.py mark-sent --ids {ids_str}")
+
+
+def stage_resolve(target_id: str, fields: dict[str, str], config: dict[str, Any]) -> None:
+    """Retry send after needs_attention (fields kept for logging; LinkedIn uses re-send)."""
+    _ = fields, config
+    path = DATA_DIR / "drafts.jsonl"
+    if not path.exists():
+        print(f"[resolve] {path} not found", file=sys.stderr)
+        return
+    sendable = [
+        json.loads(line)
+        for line in path.open()
+        if line.strip() and json.loads(line).get("draft", {}).get("subject") != "SKIP"
+    ]
+    found_idx = next((i for i, d in enumerate(sendable, 1) if d.get("id") == target_id), None)
+    if not found_idx:
+        print(f"[resolve] {target_id} not in sendable drafts", file=sys.stderr)
+        return
+    close_needs_attention(DATA_DIR, target_id, resolution="retry send")
+    print(f"[resolve] retrying send for {target_id} (draft #{found_idx})")
+    stage_send(path, {found_idx}, mode="auto", heartbeat=None)
 
 
 def stage_mark_sent(input_path: Path, ids: set[int]) -> None:
@@ -1666,11 +1549,13 @@ def main() -> None:
     p.add_argument("--dry-run", action="store_true", help="Show targets without searching")
 
     p = sub.add_parser("history", help="View / manage skip and sent history")
-    p.add_argument("action",
-                   choices=["show", "bootstrap", "purge-skip", "purge-sent", "purge-all"],
-                   help=("show: print summary | "
-                         "bootstrap: import SKIPs from current data/drafts.jsonl | "
-                         "purge-*: delete history files"))
+    p.add_argument(
+        "action",
+        choices=["show", "needs-attention", "bootstrap", "purge-skip", "purge-sent", "purge-all"],
+        help=(
+            "show | needs-attention | bootstrap | purge-skip | purge-sent | purge-all"
+        ),
+    )
 
     p = sub.add_parser("enrich", help="Open each profile and capture detail")
     p.add_argument("--in", dest="input_path", default=str(DATA_DIR / "leads.jsonl"))
@@ -1694,6 +1579,16 @@ def main() -> None:
                              help="Fill and click Send without prompting. Used by Slack agent AFTER user has confirmed.")
     mode_group.add_argument("--no-confirm", action="store_true",
                              help="Fill the compose modal and stop — human clicks Send manually.")
+    p.add_argument(
+        "--heartbeat",
+        default=None,
+        choices=["slack"],
+        help="Post progress to Slack incoming webhook every ~5 min",
+    )
+
+    p = sub.add_parser("resolve", help="Close needs_attention and retry send")
+    p.add_argument("--target-id", required=True)
+    p.add_argument("--field", action="append", default=[], help="key=value (jp_form overrides)")
 
     p = sub.add_parser("mark-sent", help="Log specific drafts to sent_history.jsonl")
     p.add_argument("--in", dest="input_path", default=str(DATA_DIR / "drafts.jsonl"))
@@ -1729,12 +1624,11 @@ def main() -> None:
     elif args.cmd == "enrich":
         stage_enrich(Path(args.input_path), Path(args.out))
     elif args.cmd == "draft":
-        config_path = Path(args.config)
-        if not config_path.exists():
-            print(f"[draft] config not found: {config_path}", file=sys.stderr)
-            print(f"        cp {SKILL_DIR / 'config.example.yaml'} {config_path}", file=sys.stderr)
+        try:
+            cfg = load_merged_config(SKILL_DIR)
+        except FileNotFoundError as e:
+            print(f"[draft] {e}", file=sys.stderr)
             sys.exit(2)
-        cfg = yaml.safe_load(config_path.read_text())
         stage_draft(Path(args.input_path), Path(args.out), cfg)
     elif args.cmd == "preview":
         stage_preview(Path(args.input_path), interactive_send=not args.no_send)
@@ -1746,7 +1640,18 @@ def main() -> None:
             mode = "fill-only"
         else:
             mode = "interactive"
-        stage_send(Path(args.input_path), ids, mode=mode)
+        stage_send(Path(args.input_path), ids, mode=mode, heartbeat=args.heartbeat)
+    elif args.cmd == "resolve":
+        fields: dict[str, str] = {}
+        for item in args.field:
+            if "=" in item:
+                k, v = item.split("=", 1)
+                fields[k.strip()] = v.strip()
+        try:
+            cfg = load_merged_config(SKILL_DIR)
+        except FileNotFoundError:
+            cfg = {}
+        stage_resolve(args.target_id, fields, cfg)
     elif args.cmd == "mark-sent":
         ids = {int(x) for x in args.ids.split(",") if x.strip()}
         stage_mark_sent(Path(args.input_path), ids)
