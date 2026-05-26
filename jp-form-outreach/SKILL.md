@@ -35,12 +35,42 @@ description: |
 | brief 一覧 / 人格教えて | `brief list` |
 | `<id> で` | セッション brief 確定（`_active.txt` は変えない） |
 | `<id> を既定に` | `brief set-active <id>` |
-| 今どの brief？ | active + セッション選択を返す |
+| 今どの brief？ | `brief list` + このチャンネルの `data/channel_state/<id>.json` |
+| brief を `<id>` に変えて | `brief bind --channel-id $CH --brief <id>` |
+| 進捗どう？ | § Stateless context reconstruction（ファイルから再構築） |
+| 品質ポイント教えて | `../report draft-quality --since 7d` |
+| 送信ファネル見せて | `../report send-funnel --since 7d` |
+| needs_attention まとめて | `../report needs-attention` |
+| 全部止めて | `active_run.lock` の pid を停止 |
+
+**Slack 経由**: チャンネルが `data/channel_state/<channel_id>.json` にバインド済みなら、毎スレッドの brief 確認は省略し、一行「`torana-line-crm` × jp_form で進めます」と明示してから実行。未バインドチャンネルは §14-N onboarding wizard。
+
+**環境変数**（OpenClaw が `run.py` 起動時に設定）:
+- `DOORMAN_SLACK_CHANNEL_ID` — brief 自動解決
+- `DOORMAN_SLACK_THREAD_TS` — ハートビートを同スレッドに連投
 
 ```bash
-# 例
+# 例（CLI 直叩き）
 .venv/bin/python run.py campaign --brief torana-line-crm --clean
+# または
+python3 ../brief bind --channel-id C09... --brief torana-line-crm
 ```
+
+## Stateless context reconstruction
+
+新スレッドで命令を受けたら、会話履歴に頼らず **必ず file から** 状況を再構築してから応答する:
+
+1. `data/channel_state/<channel_id>.json` — brief と channels
+2. `data/briefs/<id>/active_run.lock` — 進行中 run（pid / stage / thread_ts）
+3. `data/briefs/<id>/current_task.jsonl` 末尾 — heartbeat 進捗
+4. `data/briefs/<id>/events.jsonl` 直近 — draft/send イベント
+5. `data/briefs/<id>/needs_attention.jsonl` の open — 判断待ち
+
+未読のまま「何をしましょうか？」だけ返さない。
+
+## Slack-native onboarding wizard
+
+「新しい brief を作って」「セットアップして」→ Slack で 10〜15 問（sender / product / pitch / target / channels）。完了後 `briefs/<slug>.yaml` と `brief bind` で channel_state を作成。詳細は `CURSOR_INSTRUCTIONS.md` §14-N。
 
 This skill drives a full Japanese B2B inquiry-form outreach pipeline using
 the OpenClaw browser plugin (Chrome with the openclaw profile) and the

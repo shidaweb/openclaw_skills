@@ -896,6 +896,12 @@ def stage_lookup_urls(csv_path: Path, output_path: Path | None,
 #
 # Phases 4-6 happen inside the preview interactive flow.
 
+def _slack_env() -> tuple[str | None, str | None]:
+    ch = os.environ.get("DOORMAN_SLACK_CHANNEL_ID", "").strip() or None
+    ts = os.environ.get("DOORMAN_SLACK_THREAD_TS", "").strip() or None
+    return ch, ts
+
+
 def stage_campaign(
     csv_input: Path | None,
     search_url: str | None,
@@ -906,83 +912,105 @@ def stage_campaign(
     heartbeat: str | None = None,
 ) -> None:
     """Run the canonical outreach pipeline end-to-end."""
+    from _outreach_core import events as ev
+    from _outreach_core.active_run import ActiveRunError, campaign_run_lock
+    from _outreach_core.channel_state import touch_last_used
     from _outreach_core.infer import browser_headless_preference, oc_browser_start
 
     if browser_headless_preference():
         oc_browser_start(headless=True)
 
+    slack_ch, slack_ts = _slack_env()
+    run_id = ev.configure(skill="linkedin-outreach", data_dir=DATA_DIR)
+    print(f"[campaign] brief={BRIEF_ID} · skill=linkedin-outreach · run_id={run_id}")
+
+    try:
+        lock_ctx = campaign_run_lock(
+            DATA_DIR,
+            run_id=run_id,
+            brief_id=BRIEF_ID,
+            skill="linkedin-outreach",
+            total_targets=limit,
+            slack_channel_id=slack_ch,
+            slack_thread_ts=slack_ts,
+        )
+    except ActiveRunError as exc:
+        print(f"[campaign] {exc}", file=sys.stderr)
+        sys.exit(3)
+
     bar = "=" * 70
 
-    if clean:
-        for f in ("leads.jsonl", "enriched.jsonl", "drafts.jsonl"):
-            (DATA_DIR / f).unlink(missing_ok=True)
-        print(f"[campaign] cleared previous run state")
+    with lock_ctx:
+        if clean:
+            for f in ("leads.jsonl", "enriched.jsonl", "drafts.jsonl"):
+                (DATA_DIR / f).unlink(missing_ok=True)
+            print(f"[campaign] cleared previous run state")
 
-    # --- Phase 1: Pull ---
-    print(f"\n{bar}\n[1/6] PULL — gather leads\n{bar}")
-    if csv_input:
-        # Auto-resolve missing URLs from CSV before fetching
-        if not skip_lookup:
-            print(f"\n[campaign] (1a) lookup-urls — auto-fill missing linkedin_url from name+company")
-            stage_lookup_urls(csv_input, output_path=None, limit=limit,
-                               overwrite=False, dry_run=False)
-        print(f"\n[campaign] (1b) fetch-from-csv")
-        stage_fetch_from_csv(csv_input, DATA_DIR / "leads.jsonl",
-                              ignore_skip_history=False)
-    elif search_url:
-        print(f"\n[campaign] (1) fetch-leads from Sales Nav saved search")
-        stage_fetch_leads(
-            search_url,
-            limit,
-            DATA_DIR / "leads.jsonl",
-            ignore_skip_history=False,
-            heartbeat=heartbeat,
+        # --- Phase 1: Pull ---
+        print(f"\n{bar}\n[1/6] PULL — gather leads\n{bar}")
+        if csv_input:
+            if not skip_lookup:
+                print(f"\n[campaign] (1a) lookup-urls — auto-fill missing linkedin_url from name+company")
+                stage_lookup_urls(
+                    csv_input, output_path=None, limit=limit, overwrite=False, dry_run=False
+                )
+            print(f"\n[campaign] (1b) fetch-from-csv")
+            stage_fetch_from_csv(csv_input, DATA_DIR / "leads.jsonl", ignore_skip_history=False)
+        elif search_url:
+            print(f"\n[campaign] (1) fetch-leads from Sales Nav saved search")
+            stage_fetch_leads(
+                search_url,
+                limit,
+                DATA_DIR / "leads.jsonl",
+                ignore_skip_history=False,
+                heartbeat=heartbeat,
+            )
+        else:
+            print("[campaign] need --input <csv> or --search-url <url>", file=sys.stderr)
+            return
+
+        leads_n = sum(1 for line in (DATA_DIR / "leads.jsonl").open() if line.strip())
+        if leads_n == 0:
+            print(f"\n[campaign] no leads after pull — aborting")
+            return
+        print(f"\n[campaign] → {leads_n} leads pulled")
+
+        print(f"\n{bar}\n[2/6] ENRICH — profile detail + recent activity\n{bar}")
+        stage_enrich(DATA_DIR / "leads.jsonl", DATA_DIR / "enriched.jsonl", heartbeat=heartbeat)
+
+        enriched_n = sum(1 for line in (DATA_DIR / "enriched.jsonl").open() if line.strip())
+        if enriched_n == 0:
+            print(f"\n[campaign] no enriched profiles — aborting")
+            return
+        print(f"\n[campaign] → {enriched_n} profiles enriched")
+
+        print(f"\n{bar}\n[3/6] PERSONALIZE — Sonnet draft (cached system prompt)\n{bar}")
+        try:
+            cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
+        except FileNotFoundError as e:
+            print(f"[campaign] {e}", file=sys.stderr)
+            return
+        stage_draft(DATA_DIR / "enriched.jsonl", DATA_DIR / "drafts.jsonl", cfg, heartbeat=heartbeat)
+
+        drafts = [json.loads(l) for l in (DATA_DIR / "drafts.jsonl").open() if l.strip()]
+        sendable = [d for d in drafts if (d.get("draft") or {}).get("subject") != "SKIP"]
+        skipped = len(drafts) - len(sendable)
+        print(
+            f"\n[campaign] → {len(sendable)} sendable, {skipped} SKIP "
+            + f"(send rate {len(sendable) * 100 // len(drafts) if drafts else 0}%)"
         )
-    else:
-        print("[campaign] need --input <csv> or --search-url <url>", file=sys.stderr)
-        return
 
-    leads_n = sum(1 for line in (DATA_DIR / "leads.jsonl").open() if line.strip())
-    if leads_n == 0:
-        print(f"\n[campaign] no leads after pull — aborting")
-        return
-    print(f"\n[campaign] → {leads_n} leads pulled")
+        if skip_send:
+            print(f"\n{bar}\n[4/6] PREVIEW — display only (send skipped)\n{bar}")
+            stage_preview(DATA_DIR / "drafts.jsonl", interactive_send=False)
+            print(f"\n[campaign] stopped at preview. To send later: python run.py send --ids ...")
+            return
 
-    # --- Phase 2: Enrich ---
-    print(f"\n{bar}\n[2/6] ENRICH — profile detail + recent activity\n{bar}")
-    stage_enrich(DATA_DIR / "leads.jsonl", DATA_DIR / "enriched.jsonl", heartbeat=heartbeat)
+        print(f"\n{bar}\n[4-6/6] APPROVE → SEND → LOG (interactive)\n{bar}")
+        stage_preview(DATA_DIR / "drafts.jsonl", interactive_send=True)
 
-    enriched_n = sum(1 for line in (DATA_DIR / "enriched.jsonl").open() if line.strip())
-    if enriched_n == 0:
-        print(f"\n[campaign] no enriched profiles — aborting")
-        return
-    print(f"\n[campaign] → {enriched_n} profiles enriched")
-
-    # --- Phase 3: Personalize ---
-    print(f"\n{bar}\n[3/6] PERSONALIZE — Sonnet draft (cached system prompt)\n{bar}")
-    try:
-        cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
-    except FileNotFoundError as e:
-        print(f"[campaign] {e}", file=sys.stderr)
-        return
-    stage_draft(DATA_DIR / "enriched.jsonl", DATA_DIR / "drafts.jsonl", cfg, heartbeat=heartbeat)
-
-    # Quick stats
-    drafts = [json.loads(l) for l in (DATA_DIR / "drafts.jsonl").open() if l.strip()]
-    sendable = [d for d in drafts if (d.get("draft") or {}).get("subject") != "SKIP"]
-    skipped = len(drafts) - len(sendable)
-    print(f"\n[campaign] → {len(sendable)} sendable, {skipped} SKIP "
-          + f"(send rate {len(sendable) * 100 // len(drafts) if drafts else 0}%)")
-
-    # --- Phases 4-6: Approve → Send → Log (inside preview's interactive flow) ---
-    if skip_send:
-        print(f"\n{bar}\n[4/6] PREVIEW — display only (send skipped)\n{bar}")
-        stage_preview(DATA_DIR / "drafts.jsonl", interactive_send=False)
-        print(f"\n[campaign] stopped at preview. To send later: python run.py send --ids ...")
-        return
-
-    print(f"\n{bar}\n[4-6/6] APPROVE → SEND → LOG (interactive)\n{bar}")
-    stage_preview(DATA_DIR / "drafts.jsonl", interactive_send=True)
+        if slack_ch:
+            touch_last_used(slack_ch)
 
 
 # ============================================================================
@@ -1582,6 +1610,8 @@ def main() -> None:
     brief_parent = argparse.ArgumentParser(add_help=False)
     brief_parent.add_argument("--brief", default=None, help="Brief id (default: briefs/_active.txt)")
     ap.add_argument("--brief", default=None, help="Brief id (default: briefs/_active.txt)")
+    ap.add_argument("--slack-channel-id", default=None, help="Sets DOORMAN_SLACK_CHANNEL_ID")
+    ap.add_argument("--slack-thread-ts", default=None, help="Sets DOORMAN_SLACK_THREAD_TS")
     ap.add_argument(
         "--heartbeat",
         choices=["auto", "slack", "off"],
@@ -1666,6 +1696,10 @@ def main() -> None:
     p.add_argument("--ids", required=True, help="Comma-separated SENDABLE draft indices to mark as sent")
 
     args = ap.parse_args()
+    if getattr(args, "slack_channel_id", None):
+        os.environ["DOORMAN_SLACK_CHANNEL_ID"] = args.slack_channel_id
+    if getattr(args, "slack_thread_ts", None):
+        os.environ["DOORMAN_SLACK_THREAD_TS"] = args.slack_thread_ts
     try:
         configure_brief(getattr(args, "brief", None), cmd=args.cmd)
     except BriefError as exc:

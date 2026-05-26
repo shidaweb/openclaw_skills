@@ -26,7 +26,11 @@ description: |
 .venv/bin/python run.py campaign --brief torana-line-crm --input targets/torana-line-crm.csv --limit 5
 ```
 
-進捗・`history`・`brief list` のみ確認省略可。詳細は `jp-form-outreach/SKILL.md` の Session start 表を参照。
+進捗・`history`・`brief list` のみ確認省略可。
+
+**Slack バインド済みチャンネル**では brief 確認を省略（`data/channel_state/<channel_id>.json`）。環境変数 `DOORMAN_SLACK_CHANNEL_ID` / `DOORMAN_SLACK_THREAD_TS` を `run.py` に渡す。
+
+詳細（Stateless context reconstruction / onboarding / report トリガー）は `jp-form-outreach/SKILL.md` の Session start 表を参照。
 
 This skill drives a full LinkedIn InMail outreach pipeline using the OpenClaw
 browser plugin (Chrome with the user's signed-in profile) and the OpenClaw

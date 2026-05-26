@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -51,13 +52,26 @@ def resolve_brief_id(brief_id: str | None) -> str:
     """Resolve brief slug; raises BriefError if missing/invalid."""
     if brief_id and brief_id.strip():
         bid = brief_id.strip()
-    elif ACTIVE_BRIEF_FILE.is_file():
-        bid = ACTIVE_BRIEF_FILE.read_text(encoding="utf-8").strip().splitlines()[0].strip()
     else:
-        raise BriefError(
-            "No brief selected. Create briefs/_active.txt or pass --brief <id>.\n"
-            "  python3 -m _outreach_core.helpers.brief list"
-        )
+        ch = os.environ.get("DOORMAN_SLACK_CHANNEL_ID", "").strip()
+        if ch:
+            from _outreach_core.channel_state import resolve_brief_for_channel
+
+            resolved, _channels, is_new = resolve_brief_for_channel(ch)
+            if is_new or not resolved:
+                raise BriefError(
+                    f"Slack channel {ch} is not bound to a brief.\n"
+                    f"  ~/.openclaw/skills/brief bind --channel-id {ch} --brief <id>\n"
+                    "  Or complete Slack onboarding (§14-N in SKILL.md)."
+                )
+            bid = resolved
+        elif ACTIVE_BRIEF_FILE.is_file():
+            bid = ACTIVE_BRIEF_FILE.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+        else:
+            raise BriefError(
+                "No brief selected. Pass --brief <id>, bind a Slack channel, or set briefs/_active.txt.\n"
+                "  ~/.openclaw/skills/brief list"
+            )
     if not bid:
         raise BriefError("briefs/_active.txt is empty")
     path = BRIEFS_DIR / f"{bid}.yaml"
@@ -79,7 +93,7 @@ def load_brief(brief_id: str | None = None) -> dict[str, Any]:
 
 def load_merged_config(skill_dir: Path, brief_id: str | None = None) -> dict[str, Any]:
     """
-    Merge: briefs/<id>.yaml < skill_dir/config.yaml (skill wins on overlap).
+    Merge: skill_dir/config.yaml then briefs/<id>.yaml (brief wins on overlap).
     """
     _require_yaml()
     bid = resolve_brief_id(brief_id)

@@ -105,9 +105,13 @@ def slack_channel_id_from_sessions(agent_id: str = "main") -> str:
 
 def resolve_slack_channel_id() -> str:
     """
-    Priority: brief yaml slack.channel_id → OpenClaw slack session →
-    channels.slack.defaultChannelId in openclaw.json.
+    Priority: DOORMAN_SLACK_CHANNEL_ID → brief yaml slack.channel_id →
+    OpenClaw slack session → channels.slack.defaultChannelId in openclaw.json.
     """
+    env_ch = os.environ.get("DOORMAN_SLACK_CHANNEL_ID", "").strip()
+    if env_ch:
+        return env_ch.upper() if env_ch.startswith("C") else env_ch
+
     brief = load_runtime_config()
     slack = brief.get("slack") or {}
     explicit = str(slack.get("channel_id") or "").strip()

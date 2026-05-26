@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from datetime import datetime
@@ -79,12 +80,14 @@ class HeartbeatSession:
         heartbeat: str | None = None,
         data_dir: Path | None = None,
         brief_id: str | None = None,
+        slack_thread_ts: str | None = None,
     ) -> None:
         self.skill_dir = skill_dir
         self.task = task
         self.total = total
         self.heartbeat_mode = heartbeat
         self.data_dir = data_dir or (skill_dir / "data")
+        self._thread_ts = slack_thread_ts or os.environ.get("DOORMAN_SLACK_THREAD_TS", "").strip() or None
         self._started_at: float | None = None
         self._current = 0
         self._last_action = ""
@@ -106,7 +109,7 @@ class HeartbeatSession:
         if self.heartbeat_mode == "slack":
             from _outreach_core.notify import post
 
-            post(f"[{self.task}] 開始 (全 {self.total} 件)", level="info")
+            post(f"[{self.task}] 開始 (全 {self.total} 件)", level="info", thread_ts=self._thread_ts)
             self._thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
             self._thread.start()
 
@@ -159,7 +162,7 @@ class HeartbeatSession:
         if self.heartbeat_mode == "slack":
             from _outreach_core.notify import post
 
-            post(summary, level="info")
+            post(summary, level="info", thread_ts=None)
 
     def _refresh_from_log(self) -> None:
         """Pick up child-stage ticks written to current_task.jsonl by subprocesses."""
@@ -199,6 +202,7 @@ class HeartbeatSession:
             post(
                 f"[{self.task}] {self._current}/{self.total} 件目 · 経過 {mins} 分 · {self._last_action}",
                 level="info",
+                thread_ts=self._thread_ts,
             )
             try:
                 from _outreach_core import events as ev

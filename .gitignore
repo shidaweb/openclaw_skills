@@ -29,6 +29,9 @@ targets.yaml
 targets.csv
 targets.csv.bak
 
+# Slack channel ↔ brief bindings (per workspace)
+data/channel_state/C*.json
+
 # Shared core runtime data
 _outreach_core/data/
 

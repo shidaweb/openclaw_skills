@@ -5,29 +5,42 @@ Each YAML file defines one sender persona / product / target ICP. Runtime state 
 
 ## Quick start
 
+`python3 -m _outreach_core.helpers.brief` は **skills ルート**（`~/.openclaw/skills`）でしか動きません。
+`jp-form-outreach` などサブディレクトリからはルートのランチャーを使ってください。
+
 ```bash
+# どの cwd からでも OK
+~/.openclaw/skills/brief list
+cd jp-form-outreach && python3 ../brief migrate-data --brief torana-line-crm
+
+# または skills ルートで PYTHONPATH 付き -m
 cd ~/.openclaw/skills
-python3 -m _outreach_core.helpers.brief list
+PYTHONPATH=. python3 -m _outreach_core.helpers.brief list
 echo "torana-line-crm" > briefs/_active.txt   # if not already set
 
 # First-time migration from sender_brief.yaml
-python3 -m _outreach_core.helpers.brief migrate \
+./brief migrate \
   --from-legacy sender_brief.yaml \
   --from-config jp-form-outreach/config.yaml \
   --from-config linkedin-outreach/config.yaml \
   --to torana-line-crm \
   --display-name "トラーナ LINE×CRM"
 
-python3 -m _outreach_core.helpers.brief migrate-data --brief torana-line-crm
+./brief migrate-data --brief torana-line-crm
 ```
 
 ## CLI
 
 - `brief list` — all brief ids
 - `brief show <id>` — YAML summary
-- `brief set-active <id>` — write `briefs/_active.txt`
+- `brief bind --channel-id C... --brief <id>` — Slack channel binding (main path)
+- `brief unbind --channel-id C...` — remove binding
+- `brief set-active <id>` — CLI fallback only (`briefs/_active.txt`)
 - `brief new <id> --display-name "..."` — copy `_template.yaml`
 - `brief migrate` / `migrate-data` — one-time setup
-- `brief archive <id>` — rename to `.yaml.archived`
+- `brief archive <id>` — move to `briefs/archived/<id>.yaml`
+- `brief status [--brief <id>] [--channel-id C...]` — §14-G file-based progress summary
+- `brief stop-run [--brief <id>]` — stop campaign via active_run.lock pid
+- `brief write-from-json <id> --answers answers.json [--bind-channel C...]` — onboarding output
 
 All `run.py` subcommands accept `--brief <id>` (default: `_active.txt`).

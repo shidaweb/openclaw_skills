@@ -744,6 +744,14 @@ def stage_preview(input_path: Path, interactive_send: bool = True,
 #
 # Phases 4-6 happen inside the preview interactive flow.
 
+def _slack_env() -> tuple[str | None, str | None]:
+    import os
+
+    ch = os.environ.get("DOORMAN_SLACK_CHANNEL_ID", "").strip() or None
+    ts = os.environ.get("DOORMAN_SLACK_THREAD_TS", "").strip() or None
+    return ch, ts
+
+
 def stage_campaign(
     targets_path: Path,
     clean: bool,
@@ -759,68 +767,97 @@ def stage_campaign(
     bar = "=" * 70
 
     from _outreach_core import events as ev
+    from _outreach_core.active_run import ActiveRunError, campaign_run_lock
+    from _outreach_core.channel_state import touch_last_used
 
+    slack_ch, slack_ts = _slack_env()
     run_id = ev.configure(skill="jp-form-outreach", data_dir=DATA_DIR)
-    print(f"[campaign] run_id={run_id}")
+    print(f"[campaign] brief={BRIEF_ID} · skill=jp-form-outreach · run_id={run_id}")
 
-    if clean:
-        for f in ("leads.jsonl", "enriched.jsonl", "drafts.jsonl"):
-            (DATA_DIR / f).unlink(missing_ok=True)
-        print(f"[campaign] cleared previous run state")
-
-    # --- Phase 1: Pull ---
-    print(f"\n{bar}\n[1/6] PULL — bootstrap targets from {targets_path.name}\n{bar}")
-    stage_bootstrap(targets_path, DATA_DIR / "leads.jsonl",
-                    include_sent=include_sent,
-                    limit=limit,
-                    only_ids=only_ids)
-    leads_n = sum(1 for line in (DATA_DIR / "leads.jsonl").open() if line.strip())
-    if leads_n == 0:
-        print(f"\n[campaign] no targets after pull — aborting")
-        return
-    print(f"\n[campaign] → {leads_n} targets pulled")
-
-    # --- Phase 2: Enrich ---
-    if skip_enrich:
-        # Pass-through: just copy leads.jsonl to enriched.jsonl
-        print(f"\n{bar}\n[2/6] ENRICH — SKIPPED (using --skip-enrich, leads passed through)\n{bar}")
-        import shutil
-        shutil.copy(DATA_DIR / "leads.jsonl", DATA_DIR / "enriched.jsonl")
-    else:
-        print(f"\n{bar}\n[2/6] ENRICH — form structure detection\n{bar}")
-        stage_enrich(DATA_DIR / "leads.jsonl", DATA_DIR / "enriched.jsonl")
-
-    enriched_n = sum(1 for line in (DATA_DIR / "enriched.jsonl").open() if line.strip())
-    if enriched_n == 0:
-        print(f"\n[campaign] no enriched targets — aborting")
-        return
-    print(f"\n[campaign] → {enriched_n} targets enriched")
-
-    # --- Phase 3: Personalize ---
-    print(f"\n{bar}\n[3/6] PERSONALIZE — Opus draft (cached system prompt)\n{bar}")
     try:
-        cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
-    except FileNotFoundError as e:
-        print(f"[campaign] {e}", file=sys.stderr)
-        print(f"           cp {SKILL_DIR / 'config.example.yaml'} {SKILL_DIR / 'config.yaml'}", file=sys.stderr)
-        return
-    stage_draft(DATA_DIR / "enriched.jsonl", DATA_DIR / "drafts.jsonl", cfg, refine=refine)
+        lock_ctx = campaign_run_lock(
+            DATA_DIR,
+            run_id=run_id,
+            brief_id=BRIEF_ID,
+            skill="jp-form-outreach",
+            total_targets=limit or 0,
+            slack_channel_id=slack_ch,
+            slack_thread_ts=slack_ts,
+        )
+    except ActiveRunError as exc:
+        print(f"[campaign] {exc}", file=sys.stderr)
+        sys.exit(3)
 
-    drafts = [json.loads(l) for l in (DATA_DIR / "drafts.jsonl").open() if l.strip()]
-    sendable = [d for d in drafts if (d.get("draft") or {}).get("subject") != "SKIP"]
-    skipped = len(drafts) - len(sendable)
-    print(f"\n[campaign] → {len(sendable)} sendable, {skipped} SKIP "
-          + f"(send rate {len(sendable) * 100 // len(drafts) if drafts else 0}%)")
+    with lock_ctx:
+        if clean:
+            for f in ("leads.jsonl", "enriched.jsonl", "drafts.jsonl"):
+                (DATA_DIR / f).unlink(missing_ok=True)
+            print(f"[campaign] cleared previous run state")
 
-    # --- Phases 4-6: Approve → Send → Log (inside preview's interactive flow) ---
-    if skip_send:
-        print(f"\n{bar}\n[4/6] PREVIEW — display only (send skipped)\n{bar}")
-        stage_preview(DATA_DIR / "drafts.jsonl", interactive_send=False, config=cfg)
-        print(f"\n[campaign] stopped at preview. To send later: python run.py send --ids ...")
-        return
+        # --- Phase 1: Pull ---
+        print(f"\n{bar}\n[1/6] PULL — bootstrap targets from {targets_path.name}\n{bar}")
+        stage_bootstrap(
+            targets_path,
+            DATA_DIR / "leads.jsonl",
+            include_sent=include_sent,
+            limit=limit,
+            only_ids=only_ids,
+        )
+        leads_n = sum(1 for line in (DATA_DIR / "leads.jsonl").open() if line.strip())
+        if leads_n == 0:
+            print(f"\n[campaign] no targets after pull — aborting")
+            return
+        print(f"\n[campaign] → {leads_n} targets pulled")
 
-    print(f"\n{bar}\n[4-6/6] APPROVE → SEND → LOG (interactive)\n{bar}")
-    stage_preview(DATA_DIR / "drafts.jsonl", interactive_send=True, config=cfg)
+        # --- Phase 2: Enrich ---
+        if skip_enrich:
+            print(f"\n{bar}\n[2/6] ENRICH — SKIPPED (using --skip-enrich, leads passed through)\n{bar}")
+            import shutil
+
+            shutil.copy(DATA_DIR / "leads.jsonl", DATA_DIR / "enriched.jsonl")
+        else:
+            print(f"\n{bar}\n[2/6] ENRICH — form structure detection\n{bar}")
+            stage_enrich(DATA_DIR / "leads.jsonl", DATA_DIR / "enriched.jsonl")
+
+        enriched_n = sum(1 for line in (DATA_DIR / "enriched.jsonl").open() if line.strip())
+        if enriched_n == 0:
+            print(f"\n[campaign] no enriched targets — aborting")
+            return
+        print(f"\n[campaign] → {enriched_n} targets enriched")
+
+        # --- Phase 3: Personalize ---
+        print(f"\n{bar}\n[3/6] PERSONALIZE — Opus draft (cached system prompt)\n{bar}")
+        try:
+            cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
+        except FileNotFoundError as e:
+            print(f"[campaign] {e}", file=sys.stderr)
+            print(
+                f"           cp {SKILL_DIR / 'config.example.yaml'} {SKILL_DIR / 'config.yaml'}",
+                file=sys.stderr,
+            )
+            return
+        stage_draft(DATA_DIR / "enriched.jsonl", DATA_DIR / "drafts.jsonl", cfg, refine=refine)
+
+        drafts = [json.loads(l) for l in (DATA_DIR / "drafts.jsonl").open() if l.strip()]
+        sendable = [d for d in drafts if (d.get("draft") or {}).get("subject") != "SKIP"]
+        skipped = len(drafts) - len(sendable)
+        print(
+            f"\n[campaign] → {len(sendable)} sendable, {skipped} SKIP "
+            + f"(send rate {len(sendable) * 100 // len(drafts) if drafts else 0}%)"
+        )
+
+        # --- Phases 4-6: Approve → Send → Log (inside preview's interactive flow) ---
+        if skip_send:
+            print(f"\n{bar}\n[4/6] PREVIEW — display only (send skipped)\n{bar}")
+            stage_preview(DATA_DIR / "drafts.jsonl", interactive_send=False, config=cfg)
+            print(f"\n[campaign] stopped at preview. To send later: python run.py send --ids ...")
+            return
+
+        print(f"\n{bar}\n[4-6/6] APPROVE → SEND → LOG (interactive)\n{bar}")
+        stage_preview(DATA_DIR / "drafts.jsonl", interactive_send=True, config=cfg)
+
+        if slack_ch:
+            touch_last_used(slack_ch)
 
 
 # ============================================================================
@@ -1761,7 +1798,7 @@ def stage_send(
         name = d.get("name", "?")
         body = d["draft"]["body"]
         form_url = d["form_url"]
-        flow = d.get("flow", "single")
+        flow = d.get("flow") or (d.get("_llm_plan") or {}).get("next_step") or "single"
         captcha = (d.get("form_fields") or {}).get("has_recaptcha_v2") or d.get("captcha") == "recaptcha_v2_visible"
 
         print(f"\n=== [{idx}] {name} ===")
@@ -1827,10 +1864,17 @@ def stage_send(
 
         # 4. Click first submit button (確認 for confirm-flow, 送信 for single)
         time.sleep(1.0)
+        plan = d.get("_llm_plan") or {}
+        plan_flow = plan.get("next_step")
+        if plan_flow and plan_flow != flow:
+            flow = plan_flow
         if flow == "confirm":
-            patterns = [r"入力内容を確認", r"内容(を|の)?確認", r"確認画面", r"確認$", r"内容の確認へ"]
+            patterns = [r"入力内容を確認", r"内容(を|の)?確認", r"確認画面", r"確認する", r"確認$", r"内容の確認へ"]
         else:
             patterns = [r"送信する", r"^送信$", r"submit", r"内容を送信", r"同意して.*送信"]
+        plan_first = plan.get("first_button_pattern")
+        if plan_first and plan_first not in patterns:
+            patterns = [plan_first] + patterns
 
         click_res = _click_button(patterns)
         if not click_res or not click_res.get("clicked"):
@@ -2215,7 +2259,17 @@ def main() -> None:
     ap.add_argument(
         "--brief",
         default=None,
-        help="Brief id (default: briefs/_active.txt)",
+        help="Brief id (default: briefs/_active.txt or DOORMAN_SLACK_CHANNEL_ID)",
+    )
+    ap.add_argument(
+        "--slack-channel-id",
+        default=None,
+        help="Slack channel id for brief resolution (sets DOORMAN_SLACK_CHANNEL_ID)",
+    )
+    ap.add_argument(
+        "--slack-thread-ts",
+        default=None,
+        help="Slack thread ts for heartbeat replies (sets DOORMAN_SLACK_THREAD_TS)",
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -2367,6 +2421,12 @@ def main() -> None:
     )
 
     args = ap.parse_args()
+    import os
+
+    if getattr(args, "slack_channel_id", None):
+        os.environ["DOORMAN_SLACK_CHANNEL_ID"] = args.slack_channel_id
+    if getattr(args, "slack_thread_ts", None):
+        os.environ["DOORMAN_SLACK_THREAD_TS"] = args.slack_thread_ts
     brief_id = getattr(args, "brief", None)
     try:
         configure_brief(brief_id, cmd=args.cmd)
