@@ -54,6 +54,7 @@ heartbeat:
 
 browser:
   headless: true
+  cookie_consent: "accept"   # accept | skip (reject: future)
 
 model:
   name: "claude-cli/claude-opus-4-7"

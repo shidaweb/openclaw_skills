@@ -17,24 +17,44 @@
 
 ---
 
-## 0. 全体像
+## 0. 全体像（v4: Slack-only / 外販前提）
+
+**エンドユーザーは Slack だけ使う**。Cowork デスクトップは「初期インストール時にオペレーターが OpenClaw / プラグインを立ち上げる」用途のみ。日常運用は Slack に完結する。OpenClaw は Slack の背後で動く頭脳。
 
 ```
-[ ユーザー ] ──Slack DM──▶ [ OpenClaw Slack channel plugin ]
-                              │
-                              ▼
-                  [ OpenClaw agent = Claude Opus 4.7 ]
-                              │ ← SKILL.md を読んで意思決定
-                              │ ← 既存の oc_infer / oc_browser ツールを使う
-                              ▼
-                ┌─────────────┴──────────────┐
-                ▼                            ▼
-   [ Python リーフツール群 ]        [ Slack incoming webhook ]
-   (run.py / _outreach_core)          ← 一方向の状況報告のみ
-        │
-        ▼
-   [ data/*.jsonl 状態 ]
+                        ┌─────────────────────────────┐
+                        │   エンドユーザー（Slack）   │  ← UI はこれだけ
+                        └──────────────┬──────────────┘
+                                       │ DM / メンション / スレッド返信
+                                       ▼
+                  [ OpenClaw Slack channel plugin (Socket Mode) ]
+                                       │
+                                       ▼
+                      [ OpenClaw agent = Claude Opus 4.7 ]
+                                       │ SKILL.md を読んで意思決定
+                                       │ Slack thread 単位で文脈リセット
+                                       │ → 永続状態は全てファイル経由
+                                       ▼
+              ┌────────────────────────┴────────────────────────┐
+              ▼                                                 ▼
+   [ Python リーフツール群 ]                       [ Slack incoming webhook ]
+   (run.py / _outreach_core)                       ← 一方向通知（heartbeat / 警告）
+              │
+              ▼
+   [ ローカルディスクの永続状態 ]
+   - briefs/<id>.yaml             ← 人格設定
+   - data/channel_state/*.json    ← Slack チャンネル ↔ brief 紐付け
+   - data/briefs/<id>/*.jsonl     ← 履歴・進捗・events
+   - data/briefs/<id>/active_run.lock  ← 進行中タスクの claim
 ```
+
+**3 種類の登場人物:**
+
+| 役割 | 何をするか | 触る UI |
+|---|---|---|
+| **エンドユーザー（顧客）** | アウトリーチ運用 | Slack のみ |
+| **オペレーター（顧客側 IT or 自分）** | 初期インストール、メンテ、ブラウザログイン | Cowork デスクトップ + Mac の Terminal |
+| **OpenClaw agent** | 命令の解釈、Python 起動、Slack 応答 | 不可視 |
 
 ---
 
@@ -60,31 +80,46 @@
 
 ## 1. ゴール（事業者視点）
 
-オーナーが Slack で会話的に Doorman を回す。1 リクエストの理想形:
+エンドユーザーが Slack だけで Doorman を回す。1 リクエストの理想形:
 
 ```
-User (Slack): "EdTech FCで売上50億〜200億の企業を10社リストして、
-              5社ずつフォームと LinkedIn に振り分けて送って"
+User (Slack, #doorman-line-crm チャンネル):
+  "EdTech FCで売上50億〜200億の企業を10社リストして、
+   5社ずつフォームと LinkedIn に振り分けて送って"
 
-OpenClaw agent (Opus 4.7):
-  1. sender_brief.yaml と global exclude set を読む
-  2. WebSearch で 10 社を抽出 → targets.yaml/csv に追記
-  3. 各社の最新ニュース・IR を WebSearch で集め、direct_signals を埋める (v4 新設)
-  4. run.py enrich → draft (Opus) を順に走らせる
-  5. ドラフトを 1 件ずつ Slack スレッドにプレビュー → yes/no/skip を待つ
-  6. yes → run.py send --ids N --auto-send
-     ├─ verify ok      → ✅ を Slack
-     ├─ verify uncertain → ⚠️ "送信完了画面が出ない。手動確認お願いします" + snapshot
-     └─ verify needs_attention → ⚠️ "想定外のプルダウン『業界』、何を選ぶ？"
-                                  → 回答受領 → run.py resolve
-  7. 長時間タスクなら 5 分毎に「今 X/10 件目、所要 Y 分」を Slack に投げる
-  8. 終わったら全件サマリ
+OpenClaw agent (Opus 4.7、Slack 経由で起動):
+  1. slack_channel_id を取得 → data/channel_state/<id>.json を読む
+     → このチャンネルは brief=torana-line-crm にバインド済 (確認スキップ)
+  2. briefs/torana-line-crm.yaml の sender / pitch / target を取得
+  3. data/briefs/torana-line-crm/{sent,skip}_history.jsonl で除外
+  4. WebSearch で 10 社を抽出 → targets/torana-line-crm.yaml に追記
+  5. 各社の最新ニュース・IR を WebSearch で集め、direct_signals を埋める
+  6. run.py enrich → draft (Opus) を順に走らせる
+  7. ドラフトを 1 件ずつ Slack スレッドにプレビュー → yes/no/skip を待つ
+  8. yes → run.py send --ids N --auto-send --brief torana-line-crm
+     ├─ verify ok      → ✅ を スレッド内に返信
+     ├─ verify uncertain → ⚠️ スレッドに「手動確認お願い」+ snapshot path
+     └─ verify needs_attention → ⚠️ スレッドに「想定外のプルダウン『業界』、何を選ぶ？」
+                                  → スレッド内回答受領 → run.py resolve
+  9. 長時間タスクなら 5 分毎に同じスレッドにハートビート返信
+ 10. 終わったら親階層に「✅ 完了 50/50 件」だけ要約投稿
 ```
+
+**「スレッドが切れて新規スレッドで再開」しても破綻しない:**
+
+ユーザーが翌朝、別スレッドで「進捗どう？」と聞くと、agent は会話履歴を持っていなくても:
+1. `data/channel_state/<id>.json` でこのチャンネルの brief を解決
+2. `data/briefs/<id>/current_task.jsonl` 末尾を読んで進行中タスクを把握
+3. `data/briefs/<id>/events.jsonl` 直近 1 時間で最近何があったかを再構築
+4. `data/briefs/<id>/needs_attention.jsonl` の open を確認
+
+を行って「現在 8/10 件目を送信中、2 件が判断待ちです」と返答できる。**スレッドリセット耐性は file-based state で担保。**
 
 **スコープ:**
-- チャネルは **form と linkedin の 2 つだけ**。Facebook / X は今回触らない
-- メッセージング受信は OpenClaw Slack plugin、出力は plugin（会話）+ webhook（状況報告）
+- チャネルは form と linkedin の 2 つだけ。Facebook / X は今回触らない
+- メッセージング受信は OpenClaw Slack plugin、出力は plugin（会話）+ webhook（一方向通知）
 - LINE は何も実装しない
+- **Cowork デスクトップ chat は エンドユーザーの一次 UI として使わない**（オペレーター用途のみ）
 
 ---
 
@@ -120,6 +155,9 @@ OpenClaw agent (Opus 4.7):
    - その他の Python 呼び出しは Sonnet を既定とする
 9. **`verify.py` 内で LLM を呼ばない**（純 Python）
 10. **既存 JSONL のカラム削除・リネーム禁止**（追加のみ可）
+11. **エンドユーザー UI は Slack のみ**。Cowork デスクトップ chat を一次 UI として依存するコードを書かない。CLI を直接叩く設計は「オペレーター向け補助手段」として明示
+12. **OpenClaw agent はステートレスを前提**。Slack スレッド単位で文脈リセットされても破綻しないこと（永続状態は全てファイル経由）
+13. **同じ Slack チャンネルへのリクエストは同じ brief で処理**。channel_state.json で紐付け、毎スレッドでの確認を強制しない
 
 ---
 
@@ -146,6 +184,9 @@ OpenClaw agent (Opus 4.7):
 2. **Enrich research flow (jp-form 専用)** — 「enrich の前に Opus エージェントが各社の PR TIMES / IR を WebSearch で集めて direct_signals を埋める手順」（§11-B-2）
 3. **Form scope rules（jp-form 専用）** — 「verify と form_fields は『textarea を含む最大の form』に限定する」（§11-A-2）
 4. **`run.py resolve --action proceed` の使い方** — 「reCAPTCHA / confirm 待ちで Slack エスカレーションされたら、ユーザーの『進めて』を受けてエージェントが resolve」（§11-A-6）
+5. **Stateless context reconstruction（§14-G）** — Slack スレッドリセット後、5 つの永続情報源から状況を再構築する手順
+6. **Slack-channel session resolution（§14-F）** — `data/channel_state/<ch>.json` に基づく brief 解決、未バインド時の onboarding wizard 起動
+7. **Slack-native onboarding wizard（§14-N）** — エンドユーザーが Slack 対話で brief を新規作成するフロー
 
 Slack トリガー表に追記:
 
@@ -376,6 +417,101 @@ plan["fields"] = sorted(plan["fields"], key=_postal_priority)
 | 「<会社名>進めて」/「<id>進めて」 | エージェントは needs_attention.jsonl で
   該当 target_id を特定 → `run.py resolve --target-id X --action proceed` を実行 |
 ```
+
+#### A-7. Cookie 同意バナーの自動 OK（1.5 時間）
+
+**現状**: JP コーポレートサイトの 4 割前後で Cookie 同意バナー（OneTrust / TrustArc / Cookiebot / 自前）が画面手前に出現し、`oc_browser` の click が banner にブロックされて enrich や send が失敗する。
+
+**修正**: 共通ヘルパー `_outreach_core/cookie_dismiss.py` を新設し、各 stage で page open 直後に呼ぶ。
+
+##### 設計
+
+```python
+# _outreach_core/cookie_dismiss.py
+
+DISMISS_COOKIE_BANNER_JS = r"""(JS は §11-A-7 のスニペット参照)"""
+
+def dismiss_cookie_banner(
+    evaluate_fn,
+    *,
+    mode: str = "accept",   # accept / reject / skip
+    retries: int = 2,
+    wait_sec: float = 1.5,
+) -> dict:
+    """Idempotent. Returns {dismissed: bool, method: str, ...}. Never raises."""
+```
+
+##### 検出戦略
+
+1. **ID/属性ベース（決め打ち）**:
+   - `#onetrust-accept-btn-handler`
+   - `#truste-consent-button`
+   - `#CybotCookiebotDialogBodyButtonAccept`
+   - `#cookie-accept` / `#js-cookie-accept`
+   - `[aria-label*="同意"][role="button"]`
+
+2. **テキスト + banner スコープのテキストマッチ**:
+   - 親要素 (`[id*="cookie" i], [class*="cookie" i], [id*="consent" i], [id*="gdpr" i]`) 配下の `button` / `[role="button"]` / `a` のうち、テキストが以下のいずれかに一致:
+   - `^同意する$` / `^すべて(の)?(クッキー|cookie)を?受け入れ` / `^受け入れる$`
+   - `^了解(しました)?$` / `^OK$` / `^同意して(進む|続行|閉じる)$`
+   - `^accept all$` / `^accept cookies$` / `^I agree$`
+
+3. **deny list**: 「同意しない」「拒否」「Reject all」を含むテキストは絶対にクリックしない
+
+##### 統合ポイント
+
+`run.py` の以下 2 箇所:
+
+```python
+# stage_enrich 内
+oc_browser("open", form_url)
+time.sleep(RATE_LIMIT_SECONDS)
+from _outreach_core.cookie_dismiss import dismiss_cookie_banner
+mode = config.get("browser", {}).get("cookie_consent", "accept")
+res = dismiss_cookie_banner(_evaluate, mode=mode)
+if res.get("dismissed"):
+    print(f"  [enrich] cookie banner dismissed: {res.get('method')}")
+    events.emit("cookie.dismissed", stage="enrich", target_id=t.get("id"),
+                payload={"method": res.get("method"), "selector": res.get("selector")})
+# 既存処理（entry_click_text → _FORM_FIELDS_JS）に続く
+
+# stage_send 内も同様
+```
+
+LinkedIn 側 `run.py` の `stage_fetch_leads` / `stage_enrich` でも同じパターンで挿入。
+
+##### Config (`sender_brief.yaml` または brief.yaml に追加)
+
+```yaml
+browser:
+  headless: false
+  cookie_consent: "accept"   # accept / reject / skip
+```
+
+- `accept`（既定）: 上記ロジック
+- `reject`: 「すべて拒否」「必要なものだけ許可」テキストパターンでマッチ（将来実装、v4 では accept のみ）
+- `skip`: 何もしない（テスト・トラブルシュート用）
+
+##### Events 追加（§13 と整合）
+
+| kind | payload |
+|---|---|
+| `cookie.dismissed` | `{method: "id"\|"text", selector?: str, text?: str}` |
+
+`cookie.no_banner` は **emit しない**（頻発するので noisy）。
+
+##### 受け入れ条件追加（§6 に 17 番として）
+
+17. **Cookie 同意 ID ベース検出テスト**: モック HTML に `#onetrust-accept-btn-handler` が visible で存在 → `dismiss_cookie_banner` が `{dismissed: true, method: "id"}` を返すこと
+18. **Cookie 同意テキスト検出テスト**: 親に `class="cookie-banner"` がある `button` のテキストが「すべて受け入れる」→ 検出されること
+19. **deny list テスト**: 親 banner に「同意しない」と「同意する」の両方がある場合、**「同意する」だけクリック**されること
+20. **無バナー時の no-op テスト**: 何も該当しない HTML を渡しても `{dismissed: false}` を返して例外を投げないこと
+21. **mode=skip テスト**: `mode="skip"` のときに何も評価せず即 return すること
+
+##### 作業順序（既存 §8 にステップ追加）
+
+- ステップ間に挟む: 「§11-A-7 cookie_dismiss 実装 + 統合 + テスト」(1.5 時間)
+- §11-A-1〜A-6 完了後に着手するのが自然
 
 ### 11-B. ドラフト品質を上げる
 
@@ -830,63 +966,117 @@ verify.completed:   12 → ok=8 / uncertain=2 / needs_attention=2
 
 ---
 
-## 14. v4 追加: マルチ brief（人格）対応
+## 14. v4 追加: マルチ brief（人格）対応 + Slack-only / 外販対応
 
-### 14-A. 目的
+### 14-A. 目的とスコープ
 
-1 つのリポジトリで **複数の送信者ブリーフ（人格）を切り替えて運用できる**ようにする:
+**3 つの目的を同時に達成する。**
 
-- Brief 1: 「トラーナ — LINE×CRM コンサル（志田相談役）」
-- Brief 2: 「CellCloud — 医療系 SaaS」
-- Brief 3: 「個人事業として副業案件」 など
+1. **マルチ brief（人格）対応**: 1 つのリポジトリで複数の人格（torana-line-crm / cellcloud-medical / 副業案件）を切り替えて運用できる
+2. **Slack-only UI**: エンドユーザーは Slack だけで操作する。Cowork デスクトップ chat はオペレーター（インストール / メンテ）専用
+3. **スレッドリセット耐性**: OpenClaw agent は Slack スレッド単位で文脈リセットされても、ファイル経由で状況を再構築できる
 
-**新規セッション開始時、Opus エージェントは必ず以下 2 つを確認**する:
-1. どの brief を使うか
-2. どのチャネル（form / linkedin）を使うか
+### 14-B. システム全体図
 
-確認が済むまで `run.py` のサブコマンドは叩かない。
+```
+┌────────────────────────────────────────────────┐
+│   エンドユーザー (営業担当 / マーケ / 経営)     │
+│   触る UI: Slack のみ                          │
+└────────────────────┬───────────────────────────┘
+                     │
+                     ▼
+┌────────────────────────────────────────────────┐
+│   Slack workspace                              │
+│   #doorman-line-crm  → brief: torana-line-crm  │
+│   #doorman-medical   → brief: cellcloud-medical│
+│   #doorman-sub       → brief: side-project     │
+└────────────────────┬───────────────────────────┘
+                     │ Socket Mode
+                     ▼
+┌────────────────────────────────────────────────┐
+│   OpenClaw Slack channel plugin                │
+└────────────────────┬───────────────────────────┘
+                     │
+                     ▼
+┌────────────────────────────────────────────────┐
+│   OpenClaw agent = Claude Opus 4.7             │
+│   ステートレス（スレッド毎に context リセット）  │
+│   → 永続状態は必ずファイル経由                  │
+└────────────────────┬───────────────────────────┘
+                     │ bash / file tools
+                     ▼
+┌────────────────────────────────────────────────┐
+│  ローカルディスク (~/.openclaw/skills/)        │
+│  ├─ briefs/<id>.yaml                           │
+│  ├─ data/channel_state/<slack_ch_id>.json      │
+│  └─ data/briefs/<id>/                          │
+│     ├─ active_run.lock                         │
+│     ├─ current_task.jsonl  (heartbeat)         │
+│     ├─ events.jsonl        (§13)               │
+│     ├─ sent_history.jsonl                      │
+│     ├─ needs_attention.jsonl                   │
+│     └─ traces/                                 │
+└────────────────────────────────────────────────┘
+```
 
-### 14-B. ファイル構成
+### 14-C. ファイル構成
 
 ```
 ~/.openclaw/skills/
 ├── briefs/
 │   ├── README.md
-│   ├── _active.txt                    # 既定 brief slug（1 行）
-│   ├── _template.yaml                 # 新規作成時の雛形（コミット可）
-│   ├── torana-line-crm.yaml           # 人格 1（移行後の旧 sender_brief 由来）
-│   └── cellcloud-medical.yaml         # 人格 2（将来用）
-├── sender_brief.yaml.deprecated       # ← 移行後はリネーム、参照禁止
+│   ├── _active.txt                          # フォールバック既定 brief（後述）
+│   ├── _template.yaml                       # 新規作成時の雛形
+│   ├── torana-line-crm.yaml                 # 人格 1
+│   ├── cellcloud-medical.yaml               # 人格 2
+│   └── archived/                            # アーカイブされた brief
+├── data/
+│   └── channel_state/
+│       ├── README.md
+│       └── C09D38UGJTC.json                 # Slack ch ↔ brief 紐付け
+├── sender_brief.yaml.deprecated             # 移行後リネーム
 ├── jp-form-outreach/
-│   ├── config.yaml                    # スキル固有設定（model, prompts, fill defaults）
+│   ├── SKILL.md
+│   ├── config.yaml                          # スキル固有: prompts/ パス、model、fill default のみ
 │   ├── targets/
-│   │   └── <brief_id>.yaml            # brief ごとに分割（既存 targets.yaml は torana-line-crm/ へ移行）
+│   │   └── <brief_id>.yaml                  # brief ごとに分割
+│   ├── prompts/                             # スキル既定プロンプト
+│   │   ├── system_persona.md
+│   │   ├── examples.md
+│   │   └── personas/                        # brief 固有オーバーライド（任意）
+│   │       └── torana-line-crm/
+│   │           ├── system_persona.md
+│   │           └── examples.md
 │   └── data/
 │       └── briefs/
-│           └── <brief_id>/
-│               ├── leads.jsonl
-│               ├── enriched.jsonl
-│               ├── drafts.jsonl
-│               ├── sent_history.jsonl
-│               ├── skip_history.jsonl
-│               ├── needs_attention.jsonl
-│               ├── current_task.jsonl
-│               ├── events.jsonl
-│               ├── verify_snapshot_*.txt
-│               ├── sample_form.txt
-│               └── traces/
-│                   └── <run_id>/<target_id>/...
+│           ├── torana-line-crm/
+│           │   ├── active_run.lock          # 進行中タスクの claim
+│           │   ├── leads.jsonl
+│           │   ├── enriched.jsonl
+│           │   ├── drafts.jsonl
+│           │   ├── sent_history.jsonl
+│           │   ├── skip_history.jsonl
+│           │   ├── needs_attention.jsonl
+│           │   ├── current_task.jsonl
+│           │   ├── events.jsonl
+│           │   ├── verify_snapshot_*.txt
+│           │   ├── sample_form.txt
+│           │   └── traces/
+│           │       └── <run_id>/<target_id>/...
+│           └── cellcloud-medical/
+│               └── ...
 └── linkedin-outreach/
     └── (同じ構造)
 ```
 
 **核となる変更:**
-- `sender_brief.yaml` は **廃止**、内容は `briefs/<id>.yaml` に統合
-- `data/` 直下は使わず、必ず `data/briefs/<brief_id>/` 配下に書く
-- `targets.yaml` は **brief 単位で分割**（人格が違えば狙う先も違う）
-- skill 側 `config.yaml` に残るのは「prompts のパス」「model 設定」「フォーム固有 fill defaults」など、人格に依存しない要素のみ
+- `sender_brief.yaml` は廃止 → `briefs/<id>.yaml` に統合
+- `data/` 直下は使わず必ず `data/briefs/<brief_id>/` 配下に書く
+- `targets.yaml` は brief 単位で分割
+- **新規: `data/channel_state/<slack_channel_id>.json`** が Slack ↔ brief の紐付けを永続化
+- **新規: `data/briefs/<id>/active_run.lock`** が進行中タスクを claim
 
-### 14-C. Brief YAML スキーマ
+### 14-D. Brief YAML スキーマ
 
 ```yaml
 # briefs/torana-line-crm.yaml
@@ -896,7 +1086,6 @@ brief:
   active_since: "2026-05-26"
   notes: |
     志田典道（相談役）のメイン業務。
-    日本中堅企業の LINE×CRM 運用設計コンサル。
 
 sender:
   name: "志田典道"
@@ -922,10 +1111,7 @@ sender:
 
 product:
   name: "LINE公式アカウント運用×CRMコンサル"
-  one_liner: "LINE公式アカウントを『売上ドライバー』として機能させるCRM運用設計支援"
-
-problems_solved:
-  - "..."
+  one_liner: "..."
 
 pitch:
   problem: |...
@@ -936,36 +1122,26 @@ pitch:
 target:
   industries: [...]
   size_band: "..."
-  founding_year_sweet_spot: "1995-2012"
   decision_makers: [...]
   geo: "JP"
   must_have_signals: [...]
   must_not_signals: [...]
 
-desired_channels:
-  - "linkedin"
-  - "jp_form"
+desired_channels: ["linkedin", "jp_form"]
 
 personalization:
   must_reference: "..."
   avoid: [...]
   tone: "..."
 
-# brief 固有の prompt override（任意。null は skill 既定を使う）
 prompts_overrides:
-  jp_form_system_persona: null    # 例: "prompts/personas/torana-line-crm/system_persona.md"
+  jp_form_system_persona: null       # null = skill 既定。文字列なら brief 配下のパス
   jp_form_examples: null
   linkedin_system_persona: null
 
-slack:
-  incoming_webhook_url: ""
-  channel_id: ""
-
 heartbeat:
   interval_sec: 300
-  enabled_for:
-    - "send"
-    - "enrich"
+  enabled_for: ["send", "enrich"]
 
 model:
   name: "claude-cli/claude-opus-4-7"
@@ -974,86 +1150,166 @@ model:
   language: "ja"
 ```
 
-### 14-D. マージ規則（更新）
+### 14-E. マージ規則
 
 ```
 briefs/<active>.yaml > skill_dir/config.yaml > defaults
 ```
 
 `_outreach_core/config.py:load_merged_config(skill_dir, brief_id=None)` の動作:
-1. `brief_id` が None なら `briefs/_active.txt` を読む
+1. `brief_id` が None なら **後述 §14-F の resolve_brief() の結果を使う**
 2. `briefs/<brief_id>.yaml` を読む
 3. `skill_dir/config.yaml` を読む
 4. deep merge: brief が勝つ
 5. 結果を返す
 
-**重要**: 既存の `sender_brief.yaml` を読む経路は **削除**。互換性のためのフォールバックも作らない（マイグレーションで一気に切り替える）。
+`sender_brief.yaml` 参照は **完全削除**。フォールバックも作らない。
 
-### 14-E. セッション開始時の確認フロー（SKILL.md 追記）
+### 14-F. Slack チャンネル単位の session 解決（新設・最重要）
 
-両方の SKILL.md 冒頭近くに **新セクション**:
+**目的**: スレッド単位リセットでも、同じチャンネル内では brief 確認を繰り返さない。
 
-```markdown
-## Session start: brief & channel confirmation (MANDATORY)
+#### channel_state.json スキーマ
 
-新規セッションで「アウトリーチ系」のリクエスト（list-build / campaign /
-draft / send / preview など）を受けたら、agent は **データ生成・送信を
-伴うアクション**を起動する前に、必ず以下 2 つを Slack で確認する:
-
-### Step 1: brief 確認
-
-  Slack 投稿例:
-  ```
-  📇 どの brief で進めますか？
-    [既定] torana-line-crm — トラーナ LINE×CRM コンサル
-    cellcloud-medical    — CellCloud 医療系 SaaS
-  「torana で」「LINE×CRM で」と返してください。
-  ```
-
-  確認の手段:
-  - `python3 -m _outreach_core.helpers.brief list` を bash で叩いて一覧取得
-  - 1 件しか無い場合も「既定の torana-line-crm で進めます。よろしいですか？」と確認
-
-### Step 2: channel 確認
-
-  brief の `desired_channels` を Slack に出して選ばせる:
-  ```
-  チャネルは:
-    [1] jp_form（フォーム送信）
-    [2] linkedin（InMail）
-    [両方] 並行で
-  ```
-
-### Step 3: 確定後の挙動
-
-  ユーザー回答を受け取ったら:
-  - `--brief <id>` を全ての run.py 呼び出しに付ける
-  - 該当 channel の skill だけ起動
-  - セッション中、再確認は不要（ユーザーが「brief 変えて」と明示しない限り）
-
-### 確認を省略する場合
-
-  以下の問い合わせ系コマンドは brief 確認なしで応答してよい:
-  - 「進捗どう？」「sent_history 見せて」「needs_attention 一覧」
-    → 全 brief の集計 or `_active.txt` の brief で応答
-  - 「brief 一覧」「今 どの brief が active？」
+```json
+{
+  "channel_id": "C09D38UGJTC",
+  "channel_name": "#doorman-line-crm",
+  "default_brief": "torana-line-crm",
+  "default_channels": ["jp_form", "linkedin"],
+  "associated_since": "2026-05-26T10:00:00Z",
+  "last_used_at": "2026-05-26T15:30:00Z",
+  "operator_user_id": "U01ABC23"
+}
 ```
 
-### 14-F. CLI
+#### resolve_brief() アルゴリズム
+
+`_outreach_core/channel_state.py` の新関数:
+
+```python
+def resolve_brief(slack_channel_id: str | None) -> tuple[str, list[str], bool]:
+    """
+    Returns: (brief_id, channels, is_new_channel)
+    """
+    if not slack_channel_id:
+        # 非 Slack 経由（CLI からの起動など）→ briefs/_active.txt にフォールバック
+        return load_active_brief(), [], False
+
+    state_path = SKILLS_ROOT / "data" / "channel_state" / f"{slack_channel_id}.json"
+    if state_path.exists():
+        state = json.loads(state_path.read_text())
+        return state["default_brief"], state["default_channels"], False
+
+    # 新規チャンネル → 初回フローへ
+    return None, [], True
+```
+
+#### Agent の起動時動作（SKILL.md に記述）
+
+```
+新スレッドで命令受信
+  ↓
+slack_channel_id を OpenClaw から取得
+  ↓
+resolve_brief(channel_id) を呼ぶ
+  ├── 既存 (is_new_channel=False)
+  │     → brief と channels を取得、即実行
+  │     → 「torana-line-crm × jp_form で進めます」と一行明示してから動く
+  │     → 完了時に last_used_at を更新
+  │
+  └── 新規 (is_new_channel=True)
+        → 14-N の onboarding wizard を起動
+        → 完了後 channel_state.json を書く
+```
+
+### 14-G. Stateless reconstruction（毎セッション開始時の文脈再構築）
+
+エージェントがスレッドリセット後でも状況を把握できるよう、**すべての永続情報源を毎回読み直す**。
+
+SKILL.md に新セクション（両 SKILL.md に同文）:
+
+```markdown
+## Stateless context reconstruction
+
+新スレッドで命令を受けたとき、agent は会話履歴を持たない。よって以下を
+必ず file から読んで context を作る:
+
+1. data/channel_state/<channel_id>.json
+   → このチャンネルの brief と desired channels を解決
+
+2. data/briefs/<id>/active_run.lock (任意)
+   → 進行中の run があれば、その run_id / stage / pid
+
+3. data/briefs/<id>/current_task.jsonl 末尾 N 行
+   → 直近の heartbeat。何件中何件目かが分かる
+
+4. data/briefs/<id>/events.jsonl 直近 1 時間
+   → 最後に起きたイベント（draft.emitted / send.verify.completed 等）
+
+5. data/briefs/<id>/needs_attention.jsonl の status=open
+   → 待たれている判断と必要な値
+
+これらから「現在 X/Y 件目を送信中、Z 件が判断待ち」と返答できる状態を
+作ってからユーザーに応答する。**未読のまま「何をしましょうか？」を返さない。**
+```
+
+### 14-H. Active run lock とスレッド連投ハートビート
+
+#### active_run.lock
+
+`data/briefs/<id>/active_run.lock` を campaign 開始時に作成:
+
+```json
+{
+  "run_id": "20260526-093320",
+  "pid": 12345,
+  "started_at": "2026-05-26T09:33:20Z",
+  "stage": "send",
+  "total_targets": 10,
+  "current_target_idx": 4,
+  "slack_channel_id": "C09D38UGJTC",
+  "slack_thread_ts": "1716714800.123456"
+}
+```
+
+- `run.py` の長時間 stage 開始時に作成 / 終了時に削除
+- pid が生きていなければ stale と判定（ヘルパー: `lock.is_alive()`）
+
+新規 campaign 開始前、agent は active_run.lock を見て:
+- 生きている → 「現在別 run が走っています。それを参照しますか？それとも止めて新規？」
+- stale → 「前回の run が異常終了しています。データは保全されています。新規で開始してよいですか？」
+
+#### スレッド連投ハートビート
+
+5 分毎ハートビートは、**同じ run_id 内なら同じスレッド**に返信する。
+
+実装:
+- `active_run.lock` の `slack_thread_ts` を `notify.post(thread_ts=...)` に渡す
+- run 完了時のみ親階層に要約投稿（`thread_ts=None`）
+- これにより `#doorman-line-crm` 親階層は run ごとに 1〜2 投稿しか流れない
+
+### 14-I. CLI（brief.py）
 
 新規モジュール `_outreach_core/helpers/brief.py`:
 
 ```bash
-# 全 brief 一覧（id / display_name / 最終 send 日時）
+# 全 brief 一覧（id / display_name / 最終 send 日時 / ひも付き channel 数）
 python3 -m _outreach_core.helpers.brief list
 
 # 1 件の詳細
 python3 -m _outreach_core.helpers.brief show torana-line-crm
 
-# 既定 brief を切替（briefs/_active.txt 上書き）
-python3 -m _outreach_core.helpers.brief set-active cellcloud-medical
+# Slack チャンネル ↔ brief 紐付け
+python3 -m _outreach_core.helpers.brief bind \
+  --channel-id C09D38UGJTC \
+  --brief torana-line-crm \
+  --default-channels jp_form,linkedin
 
-# 雛形からの新規作成（briefs/_template.yaml をコピーして開く）
+# 紐付け解除
+python3 -m _outreach_core.helpers.brief unbind --channel-id C09D38UGJTC
+
+# 雛形からの新規作成（briefs/_template.yaml をコピー）
 python3 -m _outreach_core.helpers.brief new cellcloud-medical \
   --display-name "CellCloud 医療系"
 
@@ -1065,40 +1321,39 @@ python3 -m _outreach_core.helpers.brief migrate \
   --to torana-line-crm \
   --display-name "トラーナ LINE×CRM"
 
-# data/ 直下の旧ファイルを data/briefs/<id>/ に移動
+# data/ 直下の旧ファイルを data/briefs/<id>/ へ
 python3 -m _outreach_core.helpers.brief migrate-data --brief torana-line-crm
 
-# brief 削除（アーカイブとしてリネーム）
+# アーカイブ
 python3 -m _outreach_core.helpers.brief archive cellcloud-medical
-# → briefs/cellcloud-medical.yaml.archived に rename
 ```
 
-### 14-G. run.py への `--brief` フラグ追加
+`brief set-active` / `briefs/_active.txt` は **CLI 直叩き時のフォールバック専用**として残す（Slack 経由では使わない）。
 
-すべての subcommand に `--brief <id>` を追加:
+### 14-J. run.py への `--brief` フラグ追加
+
+すべての subcommand に `--brief <id>` を追加（必須、既定は `briefs/_active.txt` or エラー）:
 
 ```bash
-# 既定 brief を使う（briefs/_active.txt）
-python run.py campaign --clean
-
-# 明示指定
 python run.py campaign --brief torana-line-crm --clean
-
-# 起動ログに brief を明示
-[campaign] brief=torana-line-crm · skill=jp-form-outreach
+python run.py preview  --brief torana-line-crm --no-send
+python run.py send     --brief torana-line-crm --ids 1,2,3 --auto-send --heartbeat slack
+python run.py resolve  --brief torana-line-crm --target-id X --action proceed
 ```
-
-`--brief` は **全 subcommand に必須**（既定値あり）:
-- `campaign`, `bootstrap`, `enrich`, `draft`, `preview`, `send`, `resolve`, `mark-sent`, `history`
 
 データパス解決:
 - 旧: `DATA_DIR = SKILL_DIR / "data"`
 - 新: `DATA_DIR = SKILL_DIR / "data" / "briefs" / brief_id`
 
-`targets.yaml` パス解決:
+`targets` パス解決:
 - 新: `TARGETS_PATH = SKILL_DIR / "targets" / f"{brief_id}.yaml"`
 
-### 14-H. 履歴の brief 単位独立（重要）
+起動ログヘッダに必ず brief を表示:
+```
+[campaign] brief=torana-line-crm · skill=jp-form-outreach · run_id=20260526-093320
+```
+
+### 14-K. 履歴の brief 単位独立
 
 `_outreach_core/history.py` の関数を全て `brief_id` で分離:
 
@@ -1116,27 +1371,12 @@ def load_global_exclude_set(brief_id: str) -> set[str]:
     return s
 ```
 
-→ 同じ company に brief A と brief B からそれぞれ outreach できる。dedup は brief 内のみ。
+同じ company に brief A と brief B からそれぞれ outreach できる。dedup は brief 内のみ。
 
-### 14-I. プロンプトの brief 単位 override（任意）
+### 14-L. プロンプトの brief 単位 override（任意）
 
-brief 固有のトーン・サインオフが欲しい場合、`prompts_overrides` で skill 既定をオーバーライド:
+brief.yaml の `prompts_overrides`:
 
-```
-~/.openclaw/skills/
-├── jp-form-outreach/
-│   ├── prompts/
-│   │   ├── system_persona.md             # スキル既定
-│   │   ├── examples.md
-│   │   └── personas/                     # brief 固有
-│   │       ├── torana-line-crm/
-│   │       │   ├── system_persona.md     # 既定を完全置換
-│   │       │   └── examples.md
-│   │       └── cellcloud-medical/
-│   │           └── system_persona.md
-```
-
-brief.yaml で:
 ```yaml
 prompts_overrides:
   jp_form_system_persona: "prompts/personas/torana-line-crm/system_persona.md"
@@ -1144,25 +1384,84 @@ prompts_overrides:
 
 null（既定）なら skill 直下の `prompts/system_persona.md` を使う。
 
-### 14-J. Slack トリガー追加
+**重要**: skill 既定の `prompts/system_persona.md` は **upstream 配布物として顧客が touch しない前提**。カスタマイズは必ず brief 配下に置く（upstream 更新時のマージ衝突を避ける）。
+
+### 14-M. Slack トリガー（Slack-only 前提で拡張）
 
 両 SKILL.md の Slack トリガー表に:
 
-| ユーザー発話 | エージェントの行動 |
+| ユーザー発話 (Slack) | エージェントの行動 |
 |---|---|
-| 「brief 一覧」/「人格教えて」 | `brief list` を bash で実行、結果を整形して投稿 |
-| 「<id> で」/「<display_name> で」 | このセッションでの brief を確定（_active.txt は変えない） |
-| 「<id> を既定に」 | `brief set-active <id>` |
-| 「<新id> 新規」 | `brief new <id>` を実行し、Slack で対話的にフィールドを埋める |
-| 「今 どの brief？」 | active brief と現セッション選択を返す |
+| 「brief 一覧」/「人格教えて」 | `brief list` 結果を整形投稿 |
+| 「今 どの brief？」 | 現在のチャンネルにバインドされた brief と直近 last_used を返答 |
+| 「brief を <id> に変えて」 | `brief bind --channel-id $CH --brief <id>` を実行、`channel_state.json` を更新 |
+| 「新しい brief を作って」 | §14-N の onboarding wizard を起動 |
 | 「<id> アーカイブ」 | `brief archive <id>` |
+| 「進捗どう？」 | §14-G の reconstruction 経由で進行中タスクを要約 |
+| 「<会社> 進めて」 | needs_attention の resolve を試みる |
+| 「全部止めて」 | active_run.lock の pid を SIGTERM、ハートビートに「中断しました」を返信 |
 
-### 14-K. マイグレーション手順
+**Slack トリガーで CLI を直接叩くのは agent の責務**。ユーザーは自然文だけで操作する。
 
-既存の単一 brief セットアップ（今の Shida-san のもの）を `torana-line-crm` brief に移行:
+### 14-N. Slack-native onboarding wizard
+
+エンドユーザー（マーケ職など）が YAML を書かずに brief を作れるよう、Slack 対話で brief を作成する。
+
+#### 起動
+
+ユーザー: 「新しい brief を作って」「セットアップして」「初めて使う」
+
+エージェント: 
+
+```
+Doorman の brief を作成します。10 問くらい聞きますね。
+
+1) あなたの会社名は？
+```
+
+ユーザー: 「株式会社トラーナ」
+
+エージェント:
+
+```
+2) あなたの肩書 / 役職は？
+```
+
+... 順次 sender / product / pitch / target を埋めていく。
+
+#### 質問項目（最低 10、推奨 15）
+
+1. 会社名 (`sender.company`)
+2. 氏名 (`sender.name`)
+3. 役職 (`sender.role`)
+4. 連絡先（メール、電話、フォーム住所） (`sender.email` / `sender.phone` / `sender.full_address`)
+5. カレンダー URL (`sender.calendar_url`)
+6. 売っているもの 1 行 (`product.one_liner`)
+7. 解決する問題 3 つ (`problems_solved`)
+8. ターゲット業界 (`target.industries`)
+9. ターゲット規模 (`target.size_band`)
+10. 想定 decision maker (`target.decision_makers`)
+11. proof points 3 つ (`pitch.proof_points`)
+12. CTA 文 (`pitch.call_to_action`)
+13. 使うチャネル (`desired_channels`: form / linkedin / 両方)
+14. **このチャンネル (`$SLACK_CHANNEL_ID`) をこの brief に紐付けますか？** (Yes → channel_state.json も作成)
+15. （任意）brief の slug を提案: `<company_short>-<one_liner_kw>` 形式
+
+#### 出力
+
+`briefs/<slug>.yaml` + `data/channel_state/<channel_id>.json` を生成。
+最後に「これで使えます。さっそく 5 社リスト化してみますか？」と問う。
+
+#### 実装メモ
+
+- LLM 対話なので Python ヘルパーは「最終的に YAML を書く」だけでよい
+- 質問ごとの validation（メール正規表現、URL、必須項目）は agent 側 prompt で
+- 既存 brief から複製したい場合: 「<id> をベースに新規」も対応
+
+### 14-O. マイグレーション手順（既存 → torana-line-crm）
 
 ```bash
-# 1. brief を作成
+# 1. brief 作成
 python3 -m _outreach_core.helpers.brief migrate \
   --from-sender-brief sender_brief.yaml \
   --from-config jp-form-outreach/config.yaml \
@@ -1170,57 +1469,83 @@ python3 -m _outreach_core.helpers.brief migrate \
   --to torana-line-crm \
   --display-name "トラーナ LINE×CRM"
 
-# 2. 既存 data/ を data/briefs/torana-line-crm/ に移動（両 skill とも）
+# 2. データ移動
 python3 -m _outreach_core.helpers.brief migrate-data --brief torana-line-crm
 
-# 3. targets.yaml / targets.csv を移動
+# 3. targets 移動
 mv jp-form-outreach/targets.yaml jp-form-outreach/targets/torana-line-crm.yaml
 mv linkedin-outreach/targets.csv linkedin-outreach/targets/torana-line-crm.csv
 
-# 4. 既定 brief を設定
+# 4. CLI フォールバック既定を設定
 echo "torana-line-crm" > briefs/_active.txt
 
-# 5. 旧ファイルを deprecated 化
+# 5. 旧ファイル deprecated 化
 mv sender_brief.yaml sender_brief.yaml.deprecated
 
-# 6. テスト
+# 6. Slack 経由でチャンネル紐付け（メイン運用 channel で初回起動するか手動）
+python3 -m _outreach_core.helpers.brief bind \
+  --channel-id <YOUR_DOORMAN_CHANNEL_ID> \
+  --brief torana-line-crm \
+  --default-channels jp_form,linkedin
+
+# 7. テスト
 python3 -m _outreach_core.helpers.brief list
 python3 jp-form-outreach/run.py preview --brief torana-line-crm --no-send
 ```
 
-**マイグレーションは Cursor が冪等な migrate スクリプトとして実装**。複数回実行しても壊れない設計。
+冪等性: 同じコマンドを 2 回実行しても壊れない。`migrate-data` は既存ファイルがあれば skip。
 
-### 14-L. 受け入れ条件
+### 14-P. 受け入れ条件
 
 23. `briefs/<id>.yaml` を作成・編集できる CLI（`brief new`, `brief show`, `brief list`）が動作する
-24. 既存単一 brief セットアップを `torana-line-crm` brief に移行後、`jp-form-outreach/run.py preview --brief torana-line-crm` が **マイグレーション前と同じ drafts** を表示できる
-25. 2 つめの brief（例: `test-brief`）を作って `campaign --brief test-brief` を回すと、`data/briefs/test-brief/` 配下に独立した sent_history / drafts が書かれる
-26. 同じ `target_id` が `torana-line-crm` で sent でも、`test-brief` から見ると pending として扱われる
-27. SKILL.md に Session start confirmation セクションがあり、新規セッションで Opus エージェントが必ず brief/channel を確認する流れになっている
-28. `run.py` の全 subcommand に `--brief` フラグがあり、未指定なら `_active.txt` を読む
-29. `_active.txt` が存在しないか、その内容が `briefs/` 配下に無い場合、明確なエラーメッセージで起動拒否
-30. `sender_brief.yaml` への参照が **コードから完全削除**（grep で 0 件、ドキュメント側の言及のみ残る）
+24. 既存単一 brief セットアップを `torana-line-crm` brief に移行後、`run.py preview --brief torana-line-crm` が **マイグレーション前と同じ drafts** を表示
+25. 2 つめの brief (`test-brief`) で campaign を回すと、`data/briefs/test-brief/` 配下に独立した sent_history が書かれる
+26. 同じ `target_id` が `torana-line-crm` で sent でも、`test-brief` から見ると pending
+27. SKILL.md に `Stateless context reconstruction` セクションがあり、agent が起動時に 5 つの永続情報源を必ず読む
+28. `run.py` の全 subcommand に `--brief` フラグがあり、必須化されている
+29. `_active.txt` も channel_state も解決できない場合、明確なエラーで起動拒否
+30. `sender_brief.yaml` への参照が **コードから完全削除**（grep で 0 件、ドキュメントの言及のみ残る）
+31. **`data/channel_state/<id>.json` が存在するチャンネルでは brief 確認が省略される**（テスト: モックチャンネルで campaign を 2 回回しても確認プロンプトは 1 回だけ）
+32. **未バインドのチャンネルで初回起動すると onboarding wizard が動く**（モック対話で 3 問だけ進めて brief 雛形が作られることを確認）
+33. **active_run.lock テスト**: campaign 中に別 run を開始しようとすると「進行中の run があります」を返して新規 run を作らない
+34. **stale lock テスト**: lock の pid が死んでいる場合、新規 run を作る前に自動回復メッセージを Slack に投げる
+35. **ハートビートのスレッド連投テスト**: 同じ run_id 内の heartbeat が同じ `thread_ts` で投稿される（モック notify でアサート）
 
-### 14-M. 作業順序（推奨）
+### 14-Q. 作業順序
 
-1. `_outreach_core/helpers/brief.py` の CLI 雛形を作る（list / show / new / set-active）— 1 時間
-2. `_outreach_core/config.py` を brief 対応に書き換え（`load_brief()`, `load_merged_config(skill_dir, brief_id)`）— 30 分
-3. `_outreach_core/history.py` の関数に `brief_id` 引数を追加 — 30 分
-4. `run.py`（両 skill）に `--brief` フラグ追加、データパス書き換え — 2 時間
-5. マイグレーション CLI（`brief migrate`, `brief migrate-data`）実装 — 1 時間
-6. SKILL.md に Session start confirmation 追記 — 30 分
-7. テスト追加（受け入れ条件 23-30） — 1 時間
-8. 実マイグレーション実行（torana-line-crm 移行）— 15 分
-9. 旧 `sender_brief.yaml` 参照を全削除 — 15 分
+1. `_outreach_core/channel_state.py`（resolve_brief / bind / unbind） — 1 時間
+2. `_outreach_core/helpers/brief.py` の CLI 雛形（list / show / new / bind / unbind / archive） — 1 時間
+3. `_outreach_core/config.py` を brief 対応に書き換え — 30 分
+4. `_outreach_core/history.py` の関数に `brief_id` 引数を追加 — 30 分
+5. `_outreach_core/progress.py` に active_run.lock 機構（create / is_alive / remove） — 1 時間
+6. `_outreach_core/notify.py` を thread_ts 渡し対応 — 30 分
+7. `run.py`（両 skill）に `--brief` フラグ追加、データパス書き換え、active_run.lock 統合 — 2 時間
+8. マイグレーション CLI（`brief migrate`, `migrate-data`） — 1 時間
+9. SKILL.md に `Stateless context reconstruction` + `Slack-native onboarding wizard` 追記 — 1 時間
+10. テスト追加（受け入れ条件 23-35） — 2 時間
+11. 実マイグレーション実行（torana-line-crm 移行） — 15 分
+12. 旧 `sender_brief.yaml` 参照を全削除 — 15 分
 
-**全体で 約 7 時間。** マイグレーション CLI を堅牢に作るのが肝。
+**全体で 約 11 時間。** チェックリスト形式で段階的にコミット分割。
 
-### 14-N. やらないこと（再確認）
+### 14-R. やらないこと / 将来フェーズ
 
-- **brief 間で履歴を共有しない**（独立運用が選定された決定事項）
-- **brief 切替を会話途中で勝手にしない**（必ずユーザー確認）
-- **brief を作る時に LLM で対話的に埋める機能は今回スコープ外**（テンプレ + 手動編集で十分）
-- **brief を Web UI で管理する機能は今回スコープ外**（CLI + YAML 編集で十分）
+**今回スコープ外（外販ロードマップ Phase 2 以降）**:
+
+- **opt-in テレメトリ送信機構** — 失敗パターンの匿名収集。設計だけ予約、実装は将来
+- **Plugin marketplace 登録** — 配布チャネル整備、CI/CD、署名
+- **multi-org SaaS 化** — 各顧客が自前 Mac でホストする前提を維持。マルチテナント不可
+- **Web UI で brief 管理** — Slack-only と CLI で十分
+- **Doorman bot を Anthropic 標準 plugin 化** — まず自分用に磨いてから検討
+- **LinkedIn TOS / 法令への自動チェック** — 初回 wizard で警告表示するに留める
+
+**v4 内でも触らない**:
+
+- brief 間の履歴共有（独立運用が決定）
+- brief 切替を会話途中で勝手にする（必ずユーザー確認 / channel_state.bind 経由）
+- `_llm_analyze_form` を Opus 化（Sonnet 維持）
+- `verify.py` 内の LLM 呼び出し
+- Cowork デスクトップ chat をエンドユーザー UI として使うフロー
 
 ---
 
@@ -1243,6 +1568,11 @@ python3 jp-form-outreach/run.py preview --brief torana-line-crm --no-send
 - ✅ refine フラグ + 品質ゲート（B-5, B-6）
 - ✅ ログ抽出・レポート（§13）
 - ✅ **マルチ brief（人格）対応（§14、新設）**
+- ✅ **Slack-only UI 前提（§14、外販対応）**
+- ✅ **channel_state.json による brief 自動解決（§14-F、スレッドリセット耐性）**
+- ✅ **Stateless context reconstruction（§14-G）**
+- ✅ **active_run.lock とスレッド連投ハートビート（§14-H）**
+- ✅ **Slack-native onboarding wizard（§14-N、エンドユーザー向け）**
 
 ### v4 で **増えてない**ことの確認
 - ❌ slack_bolt 自作（v2 で撤回済）
@@ -1251,6 +1581,10 @@ python3 jp-form-outreach/run.py preview --brief torana-line-crm --no-send
 - ❌ verify.py の LLM 化（純 Python 維持）
 - ❌ `_llm_analyze_form` の Opus 化（Sonnet 維持）
 - ❌ brief 間の履歴共有（独立運用が決定）
+- ❌ **Cowork デスクトップ chat をエンドユーザー UI として使うフロー**
+- ❌ opt-in テレメトリ（Phase 2 以降）
+- ❌ Plugin marketplace 登録（Phase 2 以降）
+- ❌ Web UI で brief 管理（Slack-only + CLI で十分）
 
 ---
 

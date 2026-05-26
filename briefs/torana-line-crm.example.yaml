@@ -42,6 +42,7 @@ slack:
 
 browser:
   headless: true
+  cookie_consent: "accept"
 
 heartbeat:
   interval_sec: 300

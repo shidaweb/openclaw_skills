@@ -38,12 +38,6 @@ def cmd_draft_quality(args: argparse.Namespace) -> int:
     data_dir = _skill_data_dir(args.skill, getattr(args, "brief", None))
     since = parse_since(args.since)
     events = load_events(data_dir, since=since, skill=args.skill)
-    draft_kinds = {
-        e
-        for e in events
-        if str(e.get("kind", "")).startswith("draft.")
-        or str(e.get("kind", "")).startswith("refine.")
-    }
     emitted = [e for e in events if e.get("kind") == "draft.emitted"]
     skipped = [e for e in events if e.get("kind") == "draft.skipped"]
     over = [e for e in events if e.get("kind") == "draft.over_limit"]

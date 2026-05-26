@@ -406,7 +406,7 @@ def _emit_event(kind: str, *, stage: str, target_id: str | None = None, **kwargs
     ev.emit(kind, stage=stage, target_id=target_id, **kwargs)
 
 
-def stage_enrich(input_path: Path, out_path: Path) -> None:
+def stage_enrich(input_path: Path, out_path: Path, config: dict[str, Any] | None = None) -> None:
     targets = [json.loads(l) for l in input_path.open()]
     print(f"[enrich] {len(targets)} targets to enrich")
 
@@ -426,6 +426,16 @@ def stage_enrich(input_path: Path, out_path: Path) -> None:
         print(f"[enrich] ({i}/{len(targets)}) {t.get('name')} -> {t['form_url']}")
         oc_browser("open", t["form_url"])
         time.sleep(RATE_LIMIT_SECONDS)
+
+        from _outreach_core.cookie_dismiss import apply_cookie_dismiss
+
+        apply_cookie_dismiss(
+            _evaluate,
+            config,
+            stage="enrich",
+            target_id=t.get("id"),
+            emit_event=lambda kind, **kw: _emit_event(kind, **kw),
+        )
 
         # Try clicking through any "法人" / "業務提携" entry-point links
         # if the target hints at it (e.g. carradanote routes via #bloc-7)
@@ -789,6 +799,16 @@ def stage_campaign(
         sys.exit(3)
 
     with lock_ctx:
+        try:
+            cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
+        except FileNotFoundError as e:
+            print(f"[campaign] {e}", file=sys.stderr)
+            print(
+                f"           cp {SKILL_DIR / 'config.example.yaml'} {SKILL_DIR / 'config.yaml'}",
+                file=sys.stderr,
+            )
+            return
+
         if clean:
             for f in ("leads.jsonl", "enriched.jsonl", "drafts.jsonl"):
                 (DATA_DIR / f).unlink(missing_ok=True)
@@ -817,7 +837,7 @@ def stage_campaign(
             shutil.copy(DATA_DIR / "leads.jsonl", DATA_DIR / "enriched.jsonl")
         else:
             print(f"\n{bar}\n[2/6] ENRICH — form structure detection\n{bar}")
-            stage_enrich(DATA_DIR / "leads.jsonl", DATA_DIR / "enriched.jsonl")
+            stage_enrich(DATA_DIR / "leads.jsonl", DATA_DIR / "enriched.jsonl", config=cfg)
 
         enriched_n = sum(1 for line in (DATA_DIR / "enriched.jsonl").open() if line.strip())
         if enriched_n == 0:
@@ -827,15 +847,6 @@ def stage_campaign(
 
         # --- Phase 3: Personalize ---
         print(f"\n{bar}\n[3/6] PERSONALIZE — Opus draft (cached system prompt)\n{bar}")
-        try:
-            cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
-        except FileNotFoundError as e:
-            print(f"[campaign] {e}", file=sys.stderr)
-            print(
-                f"           cp {SKILL_DIR / 'config.example.yaml'} {SKILL_DIR / 'config.yaml'}",
-                file=sys.stderr,
-            )
-            return
         stage_draft(DATA_DIR / "enriched.jsonl", DATA_DIR / "drafts.jsonl", cfg, refine=refine)
 
         drafts = [json.loads(l) for l in (DATA_DIR / "drafts.jsonl").open() if l.strip()]
@@ -1823,6 +1834,16 @@ def stage_send(
             payload={"url": form_url, "time_ms": int((time.time() - t0) * 1000)},
             trace_dir=trace,
         )
+        from _outreach_core.cookie_dismiss import apply_cookie_dismiss
+
+        apply_cookie_dismiss(
+            _evaluate,
+            config,
+            stage="send",
+            target_id=tid,
+            emit_event=lambda kind, **kw: _emit_event(kind, trace_dir=trace, **kw),
+        )
+
         pre_snap = oc_browser("snapshot")
         ev.dump_trace(trace, "form_snapshot_pre.txt", pre_snap or "")
 
@@ -2464,9 +2485,15 @@ def main() -> None:
             only_ids=only_ids,
         )
     elif args.cmd == "enrich":
+        try:
+            enrich_cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
+        except FileNotFoundError as e:
+            print(f"[enrich] {e}", file=sys.stderr)
+            sys.exit(2)
         stage_enrich(
             _data_path(args.input_path, "leads.jsonl"),
             _data_path(args.out, "enriched.jsonl"),
+            config=enrich_cfg,
         )
     elif args.cmd == "draft":
         try:

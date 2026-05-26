@@ -86,6 +86,35 @@ class TestActiveRun(unittest.TestCase):
             )
             self.assertEqual(read_lock(data)["run_id"], "new")
 
+    def test_stale_lock_notifies_slack(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            data = Path(td)
+            acquire_lock(
+                data,
+                run_id="old",
+                stage="campaign",
+                total_targets=1,
+                skill="jp-form-outreach",
+                brief_id="test",
+            )
+            lock = read_lock(data)
+            assert lock is not None
+            lock["pid"] = 999999999
+            from _outreach_core.active_run import write_lock
+
+            write_lock(data, lock)
+            with mock.patch("_outreach_core.notify.post") as post:
+                acquire_lock(
+                    data,
+                    run_id="new",
+                    stage="campaign",
+                    total_targets=1,
+                    skill="jp-form-outreach",
+                    brief_id="test",
+                )
+                post.assert_called_once()
+                self.assertIn("old", post.call_args[0][0])
+
     def test_campaign_context_manager(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             data = Path(td)

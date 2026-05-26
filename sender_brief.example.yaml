@@ -37,6 +37,7 @@ slack:
 # OpenClaw browser for fetch/enrich/send (profile: openclaw)
 browser:
   headless: true   # true = no Chrome window; false = visible; omit = OpenClaw default
+  cookie_consent: "accept"   # accept (default, click 同意/Accept) / reject (future) / skip (no-op)
 
 heartbeat:
   interval_sec: 300

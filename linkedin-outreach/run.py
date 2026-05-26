@@ -554,12 +554,20 @@ def _extract_leads_from_dom() -> list[dict[str, Any]]:
     return []
 
 
+def _load_runtime_config() -> dict[str, Any]:
+    try:
+        return load_merged_config(SKILL_DIR, BRIEF_ID)
+    except FileNotFoundError:
+        return {}
+
+
 def stage_fetch_leads(
     search_url: str,
     limit: int,
     out_path: Path,
     ignore_skip_history: bool = False,
     heartbeat: str | None = None,
+    config: dict[str, Any] | None = None,
 ) -> None:
     hb_mode = resolve_heartbeat_mode(heartbeat, task="fetch-leads")
     hb = HeartbeatSession(SKILL_DIR, "fetch-leads", limit, heartbeat=hb_mode, data_dir=DATA_DIR)
@@ -567,6 +575,10 @@ def stage_fetch_leads(
     print(f"[fetch-leads] navigating to {search_url}")
     oc_browser("open", search_url)
     time.sleep(RATE_LIMIT_SECONDS)
+    from _outreach_core.cookie_dismiss import apply_cookie_dismiss
+
+    cfg = config if config is not None else _load_runtime_config()
+    apply_cookie_dismiss(_evaluate, cfg, stage="fetch-leads")
 
     skip_ids = set() if ignore_skip_history else load_skip_set()
     sent_ids = load_sent_set()
@@ -618,6 +630,7 @@ def stage_fetch_leads(
         print(f"[fetch-leads] navigating to page {page}: {next_url}")
         oc_browser("open", next_url)
         time.sleep(RATE_LIMIT_SECONDS)
+        apply_cookie_dismiss(_evaluate, cfg, stage="fetch-leads")
 
     all_leads = all_leads[:limit]
     now = datetime.utcnow().isoformat() + "Z"
@@ -941,6 +954,12 @@ def stage_campaign(
     bar = "=" * 70
 
     with lock_ctx:
+        try:
+            cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
+        except FileNotFoundError as e:
+            print(f"[campaign] {e}", file=sys.stderr)
+            return
+
         if clean:
             for f in ("leads.jsonl", "enriched.jsonl", "drafts.jsonl"):
                 (DATA_DIR / f).unlink(missing_ok=True)
@@ -964,6 +983,7 @@ def stage_campaign(
                 DATA_DIR / "leads.jsonl",
                 ignore_skip_history=False,
                 heartbeat=heartbeat,
+                config=cfg,
             )
         else:
             print("[campaign] need --input <csv> or --search-url <url>", file=sys.stderr)
@@ -976,7 +996,12 @@ def stage_campaign(
         print(f"\n[campaign] → {leads_n} leads pulled")
 
         print(f"\n{bar}\n[2/6] ENRICH — profile detail + recent activity\n{bar}")
-        stage_enrich(DATA_DIR / "leads.jsonl", DATA_DIR / "enriched.jsonl", heartbeat=heartbeat)
+        stage_enrich(
+            DATA_DIR / "leads.jsonl",
+            DATA_DIR / "enriched.jsonl",
+            heartbeat=heartbeat,
+            config=cfg,
+        )
 
         enriched_n = sum(1 for line in (DATA_DIR / "enriched.jsonl").open() if line.strip())
         if enriched_n == 0:
@@ -985,11 +1010,6 @@ def stage_campaign(
         print(f"\n[campaign] → {enriched_n} profiles enriched")
 
         print(f"\n{bar}\n[3/6] PERSONALIZE — Sonnet draft (cached system prompt)\n{bar}")
-        try:
-            cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
-        except FileNotFoundError as e:
-            print(f"[campaign] {e}", file=sys.stderr)
-            return
         stage_draft(DATA_DIR / "enriched.jsonl", DATA_DIR / "drafts.jsonl", cfg, heartbeat=heartbeat)
 
         drafts = [json.loads(l) for l in (DATA_DIR / "drafts.jsonl").open() if l.strip()]
@@ -1017,18 +1037,27 @@ def stage_campaign(
 # Stage: enrich
 # ============================================================================
 
-def stage_enrich(input_path: Path, out_path: Path, heartbeat: str | None = None) -> None:
+def stage_enrich(
+    input_path: Path,
+    out_path: Path,
+    heartbeat: str | None = None,
+    config: dict[str, Any] | None = None,
+) -> None:
     leads = [json.loads(l) for l in input_path.open()]
     print(f"[enrich] {len(leads)} leads to enrich")
     hb_mode = resolve_heartbeat_mode(heartbeat, task="enrich")
     hb = HeartbeatSession(SKILL_DIR, "enrich", len(leads), heartbeat=hb_mode, data_dir=DATA_DIR)
     hb.start(f"{len(leads)} 件のプロフィールを開きます")
+    cfg = config if config is not None else _load_runtime_config()
+    from _outreach_core.cookie_dismiss import apply_cookie_dismiss
+
     enriched: list[dict[str, Any]] = []
     for i, lead in enumerate(leads, 1):
         label = lead.get("name") or lead["id"]
         print(f"[enrich] ({i}/{len(leads)}) {label}")
         oc_browser("open", lead["profile_url"])
         time.sleep(RATE_LIMIT_SECONDS)
+        apply_cookie_dismiss(_evaluate, cfg, stage="enrich", target_id=lead.get("id"))
         snap = oc_browser("snapshot")
         if snap is None:
             print(f"[enrich] failed snapshot for {lead['id']}, skipping")
@@ -1366,6 +1395,7 @@ def stage_send(
     ids: set[int],
     mode: str = "interactive",
     heartbeat: str | None = None,
+    config: dict[str, Any] | None = None,
 ) -> None:
     """
     Drive the Sales Nav InMail compose UI for the given draft IDs.
@@ -1423,6 +1453,10 @@ def stage_send(
     filled_only: list[dict[str, Any]] = []
     hb = HeartbeatSession(SKILL_DIR, "send", len(targets), heartbeat=heartbeat, data_dir=DATA_DIR)
     hb.start(f"send {len(targets)} InMails")
+    cfg = config if config is not None else _load_runtime_config()
+    from _outreach_core.cookie_dismiss import apply_cookie_dismiss
+    from _outreach_core.notify import post as slack_notify
+
     for di, d in enumerate(targets):
         is_last = di == len(targets) - 1
         idx = sendable.index(d) + 1
@@ -1438,6 +1472,7 @@ def stage_send(
         # 1. Navigate to profile
         oc_browser("open", profile_url)
         time.sleep(RATE_LIMIT_SECONDS)
+        apply_cookie_dismiss(_evaluate, cfg, stage="send", target_id=d.get("id"))
 
         # 2. Find and click Message button
         profile_snap = oc_browser("snapshot")
@@ -1486,9 +1521,12 @@ def stage_send(
             print(f"  Body:\n{body}")
             print(f"  ---------------------")
             if mode == "interactive":
-                ans = input("  [send] After manual paste & send, type 'y' to log: ").strip().lower()
-                if ans == "y":
-                    sent.append(d)
+                slack_notify(
+                    f"⚠️ [{name}] compose fields not found — manual paste required. "
+                    f"After sending, run: `python run.py mark-sent --ids {idx}`",
+                    level="warn",
+                )
+                print("  [send] Slack notified — skipping (no stdin prompt)")
             continue
 
         print(f"  [send] ✓ filled via JS · subject:{fill_res.get('subjectInfo')} · body:{fill_res.get('bodyInfo')}")
@@ -1501,13 +1539,16 @@ def stage_send(
             continue
 
         if mode == "interactive":
-            ans = input("  [send] Click Send now? (y/N): ").strip().lower()
-            if ans != "y":
-                print(f"  [send] aborted — modal left filled, will not log.")
-                filled_only.append(d)
-                continue
+            slack_notify(
+                f"📋 [{name}] InMail filled — confirm in Slack thread, then re-run with "
+                f"`python run.py send --ids {idx} --auto-send`",
+                level="info",
+            )
+            print("  [send] filled — awaiting Slack confirmation (use --auto-send to proceed)")
+            filled_only.append(d)
+            continue
 
-        # mode == "auto" OR interactive-yes → click Send via JS
+        # mode == "auto" → click Send via JS
         send_res = _click_send_via_js()
         if not send_res or not send_res.get("clicked"):
             print(f"  [send] ⚠ Send button not found via JS (dialog={send_res and send_res.get('dialogPresent')})")
@@ -1717,12 +1758,18 @@ def main() -> None:
             heartbeat=_cli_heartbeat(args, "campaign"),
         )
     elif args.cmd == "fetch-leads":
+        try:
+            fetch_cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
+        except FileNotFoundError as e:
+            print(f"[fetch-leads] {e}", file=sys.stderr)
+            sys.exit(2)
         stage_fetch_leads(
             args.search_url,
             args.limit,
             _data_path(args.out, "leads.jsonl"),
             ignore_skip_history=args.ignore_skip_history,
             heartbeat=_cli_heartbeat(args, "fetch-leads"),
+            config=fetch_cfg,
         )
     elif args.cmd == "fetch-from-csv":
         csv_in = Path(args.input) if args.input else _PATHS.targets_path
@@ -1742,10 +1789,16 @@ def main() -> None:
     elif args.cmd == "history":
         stage_history(args.action)
     elif args.cmd == "enrich":
+        try:
+            enrich_cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
+        except FileNotFoundError as e:
+            print(f"[enrich] {e}", file=sys.stderr)
+            sys.exit(2)
         stage_enrich(
             _data_path(args.input_path, "leads.jsonl"),
             _data_path(args.out, "enriched.jsonl"),
             heartbeat=_cli_heartbeat(args, "enrich"),
+            config=enrich_cfg,
         )
     elif args.cmd == "draft":
         try:
@@ -1772,11 +1825,16 @@ def main() -> None:
             mode = "fill-only"
         else:
             mode = "interactive"
+        try:
+            send_cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
+        except FileNotFoundError:
+            send_cfg = {}
         stage_send(
             _data_path(args.input_path, "drafts.jsonl"),
             ids,
             mode=mode,
             heartbeat=_cli_heartbeat(args, "send"),
+            config=send_cfg,
         )
     elif args.cmd == "resolve":
         fields: dict[str, str] = {}

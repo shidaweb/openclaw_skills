@@ -85,10 +85,19 @@ def acquire_lock(
             "完了を待つか、プロセスを停止してから再実行してください。"
         )
     if existing and not is_lock_alive(existing):
-        print(
-            f"[active_run] stale lock removed (run_id={existing.get('run_id')}, "
-            f"pid={existing.get('pid')})"
-        )
+        rid = existing.get("run_id", "?")
+        print(f"[active_run] stale lock removed (run_id={rid}, pid={existing.get('pid')})")
+        try:
+            from _outreach_core.notify import post
+
+            thread = slack_thread_ts or existing.get("slack_thread_ts") or None
+            post(
+                f"⚠️ 前回の run ({rid}) は異常終了していました。データは保全されています。新規 run を開始します。",
+                level="warn",
+                thread_ts=thread,
+            )
+        except Exception:
+            pass
         remove_lock(data_dir)
 
     payload: dict[str, Any] = {
