@@ -12,6 +12,17 @@ except ImportError:
     yaml = None  # type: ignore
 
 
+def resolve_prompts_dir(skill_dir: Path, config: dict[str, Any]) -> Path:
+    """Skill default prompts, or brief-specific override from prompts_overrides."""
+    overrides = config.get("prompts_overrides") or {}
+    rel = overrides.get("jp_form_system_persona") or overrides.get("linkedin_system_persona")
+    if rel:
+        path = skill_dir / str(rel)
+        if path.is_file():
+            return path.parent
+    return skill_dir / "prompts"
+
+
 def build_system_block(config: dict[str, Any], prompts_dir: Path) -> str:
     """
     Build the stable, cacheable system block. Byte sequence must NOT change
@@ -19,8 +30,16 @@ def build_system_block(config: dict[str, Any], prompts_dir: Path) -> str:
     """
     if yaml is None:
         raise RuntimeError("pyyaml required for build_system_block")
-    persona = (prompts_dir / "system_persona.md").read_text()
-    examples = (prompts_dir / "examples.md").read_text()
+    persona_path = prompts_dir / "system_persona.md"
+    examples_path = prompts_dir / "examples.md"
+    if not persona_path.is_file():
+        raise FileNotFoundError(persona_path)
+    persona = persona_path.read_text(encoding="utf-8")
+    examples = (
+        examples_path.read_text(encoding="utf-8")
+        if examples_path.is_file()
+        else ""
+    )
     config_str = yaml.safe_dump(config, allow_unicode=True, sort_keys=False)
     return (
         "<system>\n"

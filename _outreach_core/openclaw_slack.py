@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from _outreach_core.config import load_sender_brief
+from _outreach_core.config import load_runtime_config
 
 _log = logging.getLogger(__name__)
 
@@ -105,10 +105,10 @@ def slack_channel_id_from_sessions(agent_id: str = "main") -> str:
 
 def resolve_slack_channel_id() -> str:
     """
-    Priority: sender_brief slack.channel_id → OpenClaw slack session →
+    Priority: brief yaml slack.channel_id → OpenClaw slack session →
     channels.slack.defaultChannelId in openclaw.json.
     """
-    brief = load_sender_brief()
+    brief = load_runtime_config()
     slack = brief.get("slack") or {}
     explicit = str(slack.get("channel_id") or "").strip()
     if explicit:

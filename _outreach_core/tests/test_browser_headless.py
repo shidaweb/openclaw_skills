@@ -14,9 +14,9 @@ from _outreach_core.infer import browser_headless_preference
 
 
 class TestBrowserHeadless(unittest.TestCase):
-    def test_sender_brief(self) -> None:
+    def test_brief_yaml_headless(self) -> None:
         with mock.patch(
-            "_outreach_core.infer.load_sender_brief",
+            "_outreach_core.infer.load_runtime_config",
             return_value={"browser": {"headless": True}},
         ):
             self.assertTrue(browser_headless_preference())
@@ -24,7 +24,7 @@ class TestBrowserHeadless(unittest.TestCase):
     def test_env_override(self) -> None:
         with mock.patch.dict(os.environ, {"DOORMAN_BROWSER_HEADLESS": "0"}, clear=False):
             with mock.patch(
-                "_outreach_core.infer.load_sender_brief",
+                "_outreach_core.infer.load_runtime_config",
                 return_value={"browser": {"headless": True}},
             ):
                 self.assertFalse(browser_headless_preference())

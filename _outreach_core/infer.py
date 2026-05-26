@@ -13,7 +13,7 @@ import os
 import subprocess
 from typing import Any
 
-from _outreach_core.config import load_sender_brief
+from _outreach_core.config import load_runtime_config
 
 # Sonnet — pinned default for draft / form-analyzer (prompt-cache friendly, low cost).
 DEFAULT_MODEL = "claude-cli/claude-sonnet-4-6"
@@ -29,7 +29,7 @@ def browser_headless_preference() -> bool | None:
     """
     Whether Doorman should request a headless OpenClaw browser.
 
-    Priority: DOORMAN_BROWSER_HEADLESS → sender_brief browser.headless →
+    Priority: DOORMAN_BROWSER_HEADLESS → brief yaml browser.headless →
     OPENCLAW_BROWSER_HEADLESS (1/0) → None (OpenClaw default = visible).
     """
     env = os.environ.get("DOORMAN_BROWSER_HEADLESS", "").strip().lower()
@@ -37,7 +37,10 @@ def browser_headless_preference() -> bool | None:
         return True
     if env in ("0", "false", "no", "off"):
         return False
-    brief = load_sender_brief() or {}
+    try:
+        brief = load_runtime_config() or {}
+    except Exception:
+        brief = {}
     browser = brief.get("browser") or {}
     if "headless" in browser:
         return bool(browser.get("headless"))

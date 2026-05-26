@@ -16,6 +16,18 @@ description: |
 
 # linkedin-outreach
 
+## Session start: brief & channel confirmation (MANDATORY)
+
+新規セッションで fetch / campaign / draft / send など **データ生成・送信を伴う**
+リクエストの前に Slack で brief と channel（linkedin / jp_form / 両方）を確認する。
+`python3 -m _outreach_core.helpers.brief list` で一覧。確定後は `--brief <id>` を全 `run.py` に付与。
+
+```bash
+.venv/bin/python run.py campaign --brief torana-line-crm --input targets/torana-line-crm.csv --limit 5
+```
+
+進捗・`history`・`brief list` のみ確認省略可。詳細は `jp-form-outreach/SKILL.md` の Session start 表を参照。
+
 This skill drives a full LinkedIn InMail outreach pipeline using the OpenClaw
 browser plugin (Chrome with the user's signed-in profile) and the OpenClaw
 inference CLI (Sonnet for personalization, with prompt caching).

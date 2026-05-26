@@ -1,0 +1,69 @@
+# Example brief (copy to briefs/torana-line-crm.yaml or run `brief migrate`).
+# Merges with each skill's config.yaml; brief keys win on overlap.
+
+brief:
+  id: "torana-line-crm"
+  display_name: "トラーナ LINE×CRM"
+  active_since: "2026-05-26"
+  notes: ""
+
+sender:
+  name: "Your Name"
+  company: "Your Company"
+  role: "Founder"
+
+product:
+  name: "Product Name"
+  one_liner: "One sentence value proposition"
+
+problems_solved:
+  - "Problem 1 you solve"
+
+target:
+  industries:
+    - "SaaS"
+    - "EdTech"
+  size_band: "50-500 employees"
+  decision_makers:
+    - "CEO"
+  geo: "JP"
+  must_have_signals:
+    - "Recent PR TIMES announcement"
+  must_not_signals:
+    - "B2C-only with no B2B line"
+
+desired_channels:
+  - "linkedin"
+  - "jp_form"
+
+slack:
+  incoming_webhook_url: ""
+  channel_id: ""
+
+browser:
+  headless: true
+
+heartbeat:
+  interval_sec: 300
+  enabled_for:
+    - "all"
+
+pitch:
+  headline: "..."
+target_persona:
+  description: "..."
+
+prompts_overrides:
+  jp_form_system_persona: null
+  jp_form_examples: null
+  linkedin_system_persona: null
+
+model:
+  name: "claude-cli/claude-opus-4-7"
+  form_analyzer_name: "claude-cli/claude-sonnet-4-6"
+  max_chars: 400
+  max_chars_extended: 1800
+  language: "ja"
+
+draft:
+  refine_default: true

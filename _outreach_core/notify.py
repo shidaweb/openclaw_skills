@@ -8,7 +8,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from _outreach_core.config import load_sender_brief
+from _outreach_core.config import load_runtime_config
 from _outreach_core.openclaw_slack import (
     openclaw_slack_ready,
     resolve_slack_channel_id,
@@ -25,7 +25,7 @@ _LEVEL_PREFIX = {
 
 
 def _webhook_url() -> str:
-    brief = load_sender_brief()
+    brief = load_runtime_config()
     slack = brief.get("slack") or {}
     return str(slack.get("incoming_webhook_url") or "").strip()
 
@@ -96,7 +96,7 @@ def post(text: str, *, level: str = "info", thread_ts: str | None = None) -> boo
     Post a one-way status line to Slack. Never raises.
 
     Delivery order:
-    1. sender_brief.yaml incoming_webhook_url (if set)
+    1. briefs/<id>.yaml slack.incoming_webhook_url (if set)
     2. OpenClaw channels.slack.botToken + channel from sessions/config
     """
     body_text = _format_text(text, level=level)

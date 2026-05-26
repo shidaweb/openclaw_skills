@@ -1,0 +1,66 @@
+# Copy to briefs/<your-brief-id>.yaml and fill in.
+
+brief:
+  id: "your-brief-id"
+  display_name: "Display Name"
+  active_since: "2026-05-26"
+  notes: ""
+
+sender:
+  name: ""
+  company: ""
+  role: ""
+  email: ""
+  phone: ""
+  calendar_url: ""
+
+product:
+  name: ""
+  one_liner: ""
+
+pitch:
+  problem: |
+  solution: |
+  proof_points: []
+  call_to_action: ""
+
+target:
+  industries: []
+  decision_makers: []
+  geo: "JP"
+
+desired_channels:
+  - "jp_form"
+  - "linkedin"
+
+personalization:
+  must_reference: ""
+  avoid: []
+  tone: "敬語"
+
+prompts_overrides:
+  jp_form_system_persona: null
+  jp_form_examples: null
+  linkedin_system_persona: null
+
+slack:
+  incoming_webhook_url: ""
+  channel_id: ""
+
+heartbeat:
+  interval_sec: 300
+  enabled_for:
+    - "all"
+
+browser:
+  headless: true
+
+model:
+  name: "claude-cli/claude-opus-4-7"
+  form_analyzer_name: "claude-cli/claude-sonnet-4-6"
+  max_chars: 400
+  max_chars_extended: 1800
+  language: "ja"
+
+draft:
+  refine_default: true

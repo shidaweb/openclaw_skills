@@ -9,11 +9,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-SKILLS_ROOT = Path.home() / ".openclaw" / "skills"
-SKILL_DIRS = [
-    SKILLS_ROOT / "linkedin-outreach",
-    SKILLS_ROOT / "jp-form-outreach",
-]
+SKILLS_ROOT = Path(__file__).resolve().parent.parent
+
+
+def skill_dirs() -> list[Path]:
+    return [
+        SKILLS_ROOT / "linkedin-outreach",
+        SKILLS_ROOT / "jp-form-outreach",
+    ]
 
 _ID_FIELDS = ("id", "canonical_id")
 
@@ -65,13 +68,23 @@ def load_sent_set(data_dir: Path) -> set[str]:
     return _load_id_set(sent_history_path(data_dir))
 
 
-def load_global_exclude_set() -> set[str]:
+def load_global_exclude_set(brief_id: str | None = None) -> set[str]:
+    """Exclude sent/skip ids for one brief only (§14-H: briefs do not share history)."""
+    from _outreach_core.config import resolve_brief_id
+
+    bid = resolve_brief_id(brief_id)
     s: set[str] = set()
-    for d in SKILL_DIRS:
-        data = d / "data"
+    for d in skill_dirs():
+        data = d / "data" / "briefs" / bid
         if data.is_dir():
             s |= load_sent_set(data)
             s |= load_skip_set(data)
+        # Legacy flat data/ (pre-migration): only include if no brief subdir yet
+        legacy = d / "data"
+        brief_root = d / "data" / "briefs"
+        if legacy.is_dir() and not brief_root.is_dir():
+            s |= load_sent_set(legacy)
+            s |= load_skip_set(legacy)
     return s
 
 

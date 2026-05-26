@@ -14,25 +14,28 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from _outreach_core import history
+from _outreach_core.config import resolve_brief_id
 from _outreach_core.events import load_events, parse_since, prune_data
+from _outreach_core.paths import brief_data_dir
 
 SKILLS_ROOT = history.SKILLS_ROOT
 
 
-def _skill_data_dir(skill: str) -> Path:
+def _skill_data_dir(skill: str, brief_id: str | None = None) -> Path:
+    bid = resolve_brief_id(brief_id)
     if skill == "jp-form-outreach":
-        return SKILLS_ROOT / "jp-form-outreach" / "data"
+        return brief_data_dir(SKILLS_ROOT / "jp-form-outreach", bid)
     if skill == "linkedin-outreach":
-        return SKILLS_ROOT / "linkedin-outreach" / "data"
+        return brief_data_dir(SKILLS_ROOT / "linkedin-outreach", bid)
     raise SystemExit(f"unknown skill: {skill}")
 
 
-def _needs_path(skill: str) -> Path:
-    return _skill_data_dir(skill) / "needs_attention.jsonl"
+def _needs_path(skill: str, brief_id: str | None = None) -> Path:
+    return _skill_data_dir(skill, brief_id) / "needs_attention.jsonl"
 
 
 def cmd_draft_quality(args: argparse.Namespace) -> int:
-    data_dir = _skill_data_dir(args.skill)
+    data_dir = _skill_data_dir(args.skill, getattr(args, "brief", None))
     since = parse_since(args.since)
     events = load_events(data_dir, since=since, skill=args.skill)
     draft_kinds = {
@@ -84,7 +87,7 @@ def cmd_draft_quality(args: argparse.Namespace) -> int:
 
 
 def cmd_send_funnel(args: argparse.Namespace) -> int:
-    data_dir = _skill_data_dir(args.skill)
+    data_dir = _skill_data_dir(args.skill, getattr(args, "brief", None))
     since = parse_since(args.since)
     events = load_events(data_dir, since=since, skill=args.skill)
     kinds = Counter(e.get("kind") for e in events if str(e.get("kind", "")).startswith("send."))
@@ -121,7 +124,7 @@ def cmd_send_funnel(args: argparse.Namespace) -> int:
 
 
 def cmd_needs_attention(args: argparse.Namespace) -> int:
-    path = _needs_path(args.skill)
+    path = _needs_path(args.skill, getattr(args, "brief", None))
     if not path.is_file():
         print(f"# needs_attention Report\n\nNo file: {path}")
         return 0
@@ -150,7 +153,7 @@ def cmd_needs_attention(args: argparse.Namespace) -> int:
 
 
 def cmd_inspect(args: argparse.Namespace) -> int:
-    data_dir = _skill_data_dir(args.skill)
+    data_dir = _skill_data_dir(args.skill, getattr(args, "brief", None))
     traces_root = data_dir / "traces"
     if not traces_root.is_dir():
         print(f"No traces dir: {traces_root}")
@@ -191,7 +194,7 @@ def cmd_inspect(args: argparse.Namespace) -> int:
 
 
 def cmd_prune(args: argparse.Namespace) -> int:
-    data_dir = _skill_data_dir(args.skill)
+    data_dir = _skill_data_dir(args.skill, getattr(args, "brief", None))
     stats = prune_data(data_dir, keep_days=args.keep, dry_run=args.dry_run)
     prefix = "[dry-run] " if args.dry_run else ""
     print(f"# prune {args.skill} (keep {args.keep}d)\n")
@@ -214,33 +217,43 @@ def cmd_improvements(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_brief_arg(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--brief", default=None, help="Brief id (default: briefs/_active.txt)")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Doorman events report (v4 §13)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("draft-quality")
+    _add_brief_arg(p)
     p.add_argument("--since", default="7d")
     p.add_argument("--skill", default="jp-form-outreach")
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("send-funnel")
+    _add_brief_arg(p)
     p.add_argument("--since", default="7d")
     p.add_argument("--skill", default="jp-form-outreach")
 
     p = sub.add_parser("needs-attention")
+    _add_brief_arg(p)
     p.add_argument("--skill", default="jp-form-outreach")
 
     p = sub.add_parser("inspect")
+    _add_brief_arg(p)
     p.add_argument("--target-id", required=True)
     p.add_argument("--run-id", default=None)
     p.add_argument("--skill", default="jp-form-outreach")
 
     p = sub.add_parser("prune", help="Delete events/traces older than --keep days")
+    _add_brief_arg(p)
     p.add_argument("--keep", type=int, default=90)
     p.add_argument("--skill", default="jp-form-outreach")
     p.add_argument("--dry-run", action="store_true")
 
     p = sub.add_parser("improvements", help="draft-quality + send-funnel + needs-attention")
+    _add_brief_arg(p)
     p.add_argument("--since", default="7d")
     p.add_argument("--skill", default="jp-form-outreach")
 

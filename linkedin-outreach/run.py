@@ -32,7 +32,8 @@ from _outreach_core import history as core_history
 from _outreach_core import infer as core_infer
 from _outreach_core import preview as core_preview
 from _outreach_core import prompt as core_prompt
-from _outreach_core.config import load_merged_config
+from _outreach_core.config import BriefError, load_merged_config
+from _outreach_core.paths import SkillPaths, resolve_skill_paths
 from _outreach_core.progress import HeartbeatSession, resolve_heartbeat_mode
 from _outreach_core.verify import (
     close_needs_attention,
@@ -48,9 +49,10 @@ except ImportError:
     sys.exit(1)
 
 SKILL_DIR = Path(__file__).resolve().parent
+_PATHS: SkillPaths | None = None
+BRIEF_ID = ""
 DATA_DIR = SKILL_DIR / "data"
 PROMPTS_DIR = SKILL_DIR / "prompts"
-DATA_DIR.mkdir(exist_ok=True)
 
 DEFAULT_MODEL = core_infer.DEFAULT_MODEL
 BROWSER_PROFILE = core_infer.BROWSER_PROFILE
@@ -58,6 +60,27 @@ RATE_LIMIT_SECONDS = 4  # between page loads, to look human
 
 SKIP_HISTORY_PATH = DATA_DIR / "skip_history.jsonl"
 SENT_HISTORY_PATH = DATA_DIR / "sent_history.jsonl"
+
+
+def configure_brief(brief_id: str | None, *, cmd: str = "") -> SkillPaths:
+    global _PATHS, BRIEF_ID, DATA_DIR, PROMPTS_DIR, SKIP_HISTORY_PATH, SENT_HISTORY_PATH
+    _PATHS = resolve_skill_paths(SKILL_DIR, brief_id, channel="linkedin")
+    BRIEF_ID = _PATHS.brief_id
+    DATA_DIR = _PATHS.data_dir
+    SKIP_HISTORY_PATH = DATA_DIR / "skip_history.jsonl"
+    SENT_HISTORY_PATH = DATA_DIR / "sent_history.jsonl"
+    try:
+        cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
+        PROMPTS_DIR = core_prompt.resolve_prompts_dir(SKILL_DIR, cfg)
+    except (FileNotFoundError, BriefError):
+        PROMPTS_DIR = SKILL_DIR / "prompts"
+    if cmd in ("campaign", "fetch-leads", "fetch-from-csv", "send", "draft", "enrich"):
+        print(f"[{cmd}] brief={BRIEF_ID} · skill=linkedin-outreach")
+    return _PATHS
+
+
+def _data_path(arg: str | None, name: str) -> Path:
+    return Path(arg) if arg else DATA_DIR / name
 
 
 # ============================================================================
@@ -938,7 +961,7 @@ def stage_campaign(
     # --- Phase 3: Personalize ---
     print(f"\n{bar}\n[3/6] PERSONALIZE — Sonnet draft (cached system prompt)\n{bar}")
     try:
-        cfg = load_merged_config(SKILL_DIR)
+        cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
     except FileNotFoundError as e:
         print(f"[campaign] {e}", file=sys.stderr)
         return
@@ -1556,28 +1579,35 @@ def _cli_heartbeat(args: argparse.Namespace, task: str) -> str | None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(prog="linkedin-outreach", description=__doc__)
+    brief_parent = argparse.ArgumentParser(add_help=False)
+    brief_parent.add_argument("--brief", default=None, help="Brief id (default: briefs/_active.txt)")
+    ap.add_argument("--brief", default=None, help="Brief id (default: briefs/_active.txt)")
     ap.add_argument(
         "--heartbeat",
         choices=["auto", "slack", "off"],
         default="auto",
-        help="Slack progress (auto=webhook+enabled_for in sender_brief.yaml; off=disable)",
+        help="Slack progress (auto=brief heartbeat.enabled_for; off=disable)",
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("fetch-leads", help="Scrape Sales Nav saved search")
+    p = sub.add_parser("fetch-leads", parents=[brief_parent], help="Scrape Sales Nav saved search")
     p.add_argument("--search-url", required=True, help="Sales Nav saved search URL")
     p.add_argument("--limit", type=int, default=10)
-    p.add_argument("--out", default=str(DATA_DIR / "leads.jsonl"))
+    p.add_argument("--out", default=None)
     p.add_argument("--ignore-skip-history", action="store_true",
                    help="Don't filter out leads in data/skip_history.jsonl")
 
-    p = sub.add_parser("fetch-from-csv", help="Read curated leads from a CSV file")
+    p = sub.add_parser("fetch-from-csv", parents=[brief_parent], help="Read curated leads from a CSV file")
     p.add_argument("--input", required=True, help="CSV file with at minimum a linkedin_url column")
-    p.add_argument("--out", default=str(DATA_DIR / "leads.jsonl"))
+    p.add_argument("--out", default=None)
     p.add_argument("--ignore-skip-history", action="store_true",
                    help="Don't filter out leads in data/skip_history.jsonl")
 
-    p = sub.add_parser("campaign", help="Run the full 6-phase outreach pipeline (pull→enrich→draft→preview+send)")
+    p = sub.add_parser(
+        "campaign",
+        parents=[brief_parent],
+        help="Run the full 6-phase outreach pipeline (pull→enrich→draft→preview+send)",
+    )
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--input", help="CSV file (Pull phase: fetch-from-csv with optional lookup-urls)")
     src.add_argument("--search-url", help="Sales Nav saved search URL (Pull phase: fetch-leads)")
@@ -1588,7 +1618,7 @@ def main() -> None:
     p.add_argument("--skip-send", action="store_true",
                    help="Stop at preview without sending (display only)")
 
-    p = sub.add_parser("lookup-urls", help="Auto-fill linkedin_url in CSV by searching Sales Nav")
+    p = sub.add_parser("lookup-urls", parents=[brief_parent], help="Auto-fill linkedin_url in CSV by searching Sales Nav")
     p.add_argument("--input", required=True, help="CSV with name + company columns")
     p.add_argument("--out", default=None, help="Output CSV (default: overwrite input)")
     p.add_argument("--limit", type=int, default=None, help="Only process first N rows")
@@ -1596,7 +1626,7 @@ def main() -> None:
                    help="Re-resolve rows that already have linkedin_url")
     p.add_argument("--dry-run", action="store_true", help="Show targets without searching")
 
-    p = sub.add_parser("history", help="View / manage skip and sent history")
+    p = sub.add_parser("history", parents=[brief_parent], help="View / manage skip and sent history")
     p.add_argument(
         "action",
         choices=["show", "needs-attention", "bootstrap", "purge-skip", "purge-sent", "purge-all"],
@@ -1605,37 +1635,42 @@ def main() -> None:
         ),
     )
 
-    p = sub.add_parser("enrich", help="Open each profile and capture detail")
-    p.add_argument("--in", dest="input_path", default=str(DATA_DIR / "leads.jsonl"))
-    p.add_argument("--out", default=str(DATA_DIR / "enriched.jsonl"))
+    p = sub.add_parser("enrich", parents=[brief_parent], help="Open each profile and capture detail")
+    p.add_argument("--in", dest="input_path", default=None)
+    p.add_argument("--out", default=None)
 
-    p = sub.add_parser("draft", help="Generate personalized InMails")
-    p.add_argument("--in", dest="input_path", default=str(DATA_DIR / "enriched.jsonl"))
-    p.add_argument("--out", default=str(DATA_DIR / "drafts.jsonl"))
+    p = sub.add_parser("draft", parents=[brief_parent], help="Generate personalized InMails")
+    p.add_argument("--in", dest="input_path", default=None)
+    p.add_argument("--out", default=None)
     p.add_argument("--config", default=str(SKILL_DIR / "config.yaml"))
 
-    p = sub.add_parser("preview", help="Show all drafts in terminal for review (then prompt to send)")
-    p.add_argument("--in", dest="input_path", default=str(DATA_DIR / "drafts.jsonl"))
+    p = sub.add_parser("preview", parents=[brief_parent], help="Show all drafts in terminal for review (then prompt to send)")
+    p.add_argument("--in", dest="input_path", default=None)
     p.add_argument("--no-send", action="store_true",
                    help="Skip the interactive send prompt at the end")
 
-    p = sub.add_parser("send", help="Drive Sales Nav to fill compose modal and send InMail")
-    p.add_argument("--in", dest="input_path", default=str(DATA_DIR / "drafts.jsonl"))
+    p = sub.add_parser("send", parents=[brief_parent], help="Drive Sales Nav to fill compose modal and send InMail")
+    p.add_argument("--in", dest="input_path", default=None)
     p.add_argument("--ids", required=True, help="Comma-separated SENDABLE draft indices (1-based, SKIPs not counted)")
     mode_group = p.add_mutually_exclusive_group()
     mode_group.add_argument("--auto-send", action="store_true",
                              help="Fill and click Send without prompting. Used by Slack agent AFTER user has confirmed.")
     mode_group.add_argument("--no-confirm", action="store_true",
                              help="Fill the compose modal and stop — human clicks Send manually.")
-    p = sub.add_parser("resolve", help="Close needs_attention and retry send")
+    p = sub.add_parser("resolve", parents=[brief_parent], help="Close needs_attention and retry send")
     p.add_argument("--target-id", required=True)
     p.add_argument("--field", action="append", default=[], help="key=value (jp_form overrides)")
 
-    p = sub.add_parser("mark-sent", help="Log specific drafts to sent_history.jsonl")
-    p.add_argument("--in", dest="input_path", default=str(DATA_DIR / "drafts.jsonl"))
+    p = sub.add_parser("mark-sent", parents=[brief_parent], help="Log specific drafts to sent_history.jsonl")
+    p.add_argument("--in", dest="input_path", default=None)
     p.add_argument("--ids", required=True, help="Comma-separated SENDABLE draft indices to mark as sent")
 
     args = ap.parse_args()
+    try:
+        configure_brief(getattr(args, "brief", None), cmd=args.cmd)
+    except BriefError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(2)
 
     if args.cmd == "campaign":
         stage_campaign(
@@ -1651,13 +1686,17 @@ def main() -> None:
         stage_fetch_leads(
             args.search_url,
             args.limit,
-            Path(args.out),
+            _data_path(args.out, "leads.jsonl"),
             ignore_skip_history=args.ignore_skip_history,
             heartbeat=_cli_heartbeat(args, "fetch-leads"),
         )
     elif args.cmd == "fetch-from-csv":
-        stage_fetch_from_csv(Path(args.input), Path(args.out),
-                             ignore_skip_history=args.ignore_skip_history)
+        csv_in = Path(args.input) if args.input else _PATHS.targets_path
+        stage_fetch_from_csv(
+            csv_in,
+            _data_path(args.out, "leads.jsonl"),
+            ignore_skip_history=args.ignore_skip_history,
+        )
     elif args.cmd == "lookup-urls":
         stage_lookup_urls(
             Path(args.input),
@@ -1670,24 +1709,27 @@ def main() -> None:
         stage_history(args.action)
     elif args.cmd == "enrich":
         stage_enrich(
-            Path(args.input_path),
-            Path(args.out),
+            _data_path(args.input_path, "leads.jsonl"),
+            _data_path(args.out, "enriched.jsonl"),
             heartbeat=_cli_heartbeat(args, "enrich"),
         )
     elif args.cmd == "draft":
         try:
-            cfg = load_merged_config(SKILL_DIR)
+            cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
         except FileNotFoundError as e:
             print(f"[draft] {e}", file=sys.stderr)
             sys.exit(2)
         stage_draft(
-            Path(args.input_path),
-            Path(args.out),
+            _data_path(args.input_path, "enriched.jsonl"),
+            _data_path(args.out, "drafts.jsonl"),
             cfg,
             heartbeat=_cli_heartbeat(args, "draft"),
         )
     elif args.cmd == "preview":
-        stage_preview(Path(args.input_path), interactive_send=not args.no_send)
+        stage_preview(
+            _data_path(args.input_path, "drafts.jsonl"),
+            interactive_send=not args.no_send,
+        )
     elif args.cmd == "send":
         ids = {int(x) for x in args.ids.split(",") if x.strip()}
         if args.auto_send:
@@ -1696,7 +1738,12 @@ def main() -> None:
             mode = "fill-only"
         else:
             mode = "interactive"
-        stage_send(Path(args.input_path), ids, mode=mode, heartbeat=_cli_heartbeat(args, "send"))
+        stage_send(
+            _data_path(args.input_path, "drafts.jsonl"),
+            ids,
+            mode=mode,
+            heartbeat=_cli_heartbeat(args, "send"),
+        )
     elif args.cmd == "resolve":
         fields: dict[str, str] = {}
         for item in args.field:
@@ -1704,13 +1751,13 @@ def main() -> None:
                 k, v = item.split("=", 1)
                 fields[k.strip()] = v.strip()
         try:
-            cfg = load_merged_config(SKILL_DIR)
+            cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
         except FileNotFoundError:
             cfg = {}
         stage_resolve(args.target_id, fields, cfg)
     elif args.cmd == "mark-sent":
         ids = {int(x) for x in args.ids.split(",") if x.strip()}
-        stage_mark_sent(Path(args.input_path), ids)
+        stage_mark_sent(_data_path(args.input_path, "drafts.jsonl"), ids)
 
 
 if __name__ == "__main__":

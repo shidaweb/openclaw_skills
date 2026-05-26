@@ -554,34 +554,6 @@ Python 側に追加実装は不要（エージェントの判断のみ）。
 
 ---
 
-## 12. v4 まとめ・チェックポイント
-
-### v4 で増えたモデル料金
-- draft: Sonnet → **Opus 4.7** に切替（~8 倍のコスト、月数十ドル）
-- `_llm_analyze_form`: Sonnet 維持
-- refine（オプション）: Opus（手動 ON 時のみ）
-
-### v4 で増えた機能
-- ✅ verify の誤検知撲滅（A-1, A-2）
-- ✅ char_limit ハード強制（B-1）
-- ✅ `input()` 撲滅 + Slack エスカレーション統一（A-6）
-- ✅ enrich-research フロー（B-2, SKILL.md のみ）
-- ✅ ユニーク CSS セレクタ（A-4）
-- ✅ 動的フィールド対応 軽量版（A-3）
-- ✅ 郵便番号順序対策（A-5）
-- ✅ 冒頭型 / 自己紹介バリエーション（B-3, B-4）
-- ✅ refine フラグ + 品質ゲート（B-5, B-6）
-- ✅ ログ抽出・レポート（§13、新設）
-
-### v4 で **増えてない**ことの確認
-- ❌ slack_bolt 自作（v2 で撤回済）
-- ❌ list_builder CLI（v3 で撤回済）
-- ❌ Facebook / X チャネル（スコープ外）
-- ❌ verify.py の LLM 化（純 Python 維持）
-- ❌ `_llm_analyze_form` の Opus 化（Sonnet 維持）
-
----
-
 ## 13. v4 追加: ログ抽出と品質改善レポート
 
 **目的**: ドラフト品質とフォーム送信のスムーズさを継続的に磨き上げるため、各段階の事実を構造化ログとして残し、Slack 経由で Opus エージェントが要約できるようにする。
@@ -855,6 +827,430 @@ verify.completed:   12 → ok=8 / uncertain=2 / needs_attention=2
 7. `.gitignore` 更新 — 5 分
 
 **全体で 約 5 時間。** 最初のサンプルが events.jsonl に貯まったら、Slack で「品質ポイント教えて」と Opus に聞いて初回レポートを確認 → 必要なら kind を追加するイテレーション。
+
+---
+
+## 14. v4 追加: マルチ brief（人格）対応
+
+### 14-A. 目的
+
+1 つのリポジトリで **複数の送信者ブリーフ（人格）を切り替えて運用できる**ようにする:
+
+- Brief 1: 「トラーナ — LINE×CRM コンサル（志田相談役）」
+- Brief 2: 「CellCloud — 医療系 SaaS」
+- Brief 3: 「個人事業として副業案件」 など
+
+**新規セッション開始時、Opus エージェントは必ず以下 2 つを確認**する:
+1. どの brief を使うか
+2. どのチャネル（form / linkedin）を使うか
+
+確認が済むまで `run.py` のサブコマンドは叩かない。
+
+### 14-B. ファイル構成
+
+```
+~/.openclaw/skills/
+├── briefs/
+│   ├── README.md
+│   ├── _active.txt                    # 既定 brief slug（1 行）
+│   ├── _template.yaml                 # 新規作成時の雛形（コミット可）
+│   ├── torana-line-crm.yaml           # 人格 1（移行後の旧 sender_brief 由来）
+│   └── cellcloud-medical.yaml         # 人格 2（将来用）
+├── sender_brief.yaml.deprecated       # ← 移行後はリネーム、参照禁止
+├── jp-form-outreach/
+│   ├── config.yaml                    # スキル固有設定（model, prompts, fill defaults）
+│   ├── targets/
+│   │   └── <brief_id>.yaml            # brief ごとに分割（既存 targets.yaml は torana-line-crm/ へ移行）
+│   └── data/
+│       └── briefs/
+│           └── <brief_id>/
+│               ├── leads.jsonl
+│               ├── enriched.jsonl
+│               ├── drafts.jsonl
+│               ├── sent_history.jsonl
+│               ├── skip_history.jsonl
+│               ├── needs_attention.jsonl
+│               ├── current_task.jsonl
+│               ├── events.jsonl
+│               ├── verify_snapshot_*.txt
+│               ├── sample_form.txt
+│               └── traces/
+│                   └── <run_id>/<target_id>/...
+└── linkedin-outreach/
+    └── (同じ構造)
+```
+
+**核となる変更:**
+- `sender_brief.yaml` は **廃止**、内容は `briefs/<id>.yaml` に統合
+- `data/` 直下は使わず、必ず `data/briefs/<brief_id>/` 配下に書く
+- `targets.yaml` は **brief 単位で分割**（人格が違えば狙う先も違う）
+- skill 側 `config.yaml` に残るのは「prompts のパス」「model 設定」「フォーム固有 fill defaults」など、人格に依存しない要素のみ
+
+### 14-C. Brief YAML スキーマ
+
+```yaml
+# briefs/torana-line-crm.yaml
+brief:
+  id: "torana-line-crm"
+  display_name: "トラーナ — LINE×CRM コンサル"
+  active_since: "2026-05-26"
+  notes: |
+    志田典道（相談役）のメイン業務。
+    日本中堅企業の LINE×CRM 運用設計コンサル。
+
+sender:
+  name: "志田典道"
+  name_kana: "シダノリミツ"
+  name_furigana: "しだのりみつ"
+  role: "相談役"
+  company: "株式会社トラーナ"
+  company_short: "トラーナ"
+  email: "shida@torana.co.jp"
+  phone: "09016501629"
+  phone_hyphenated: "090-1650-1629"
+  postal_code: "260-0003"
+  postal_code_no_hyphen: "2600003"
+  prefecture: "千葉県"
+  city: "千葉市中央区"
+  address_line: "鶴沢町20-16"
+  building: "ユニバース千葉ビル1階"
+  full_address: "千葉県千葉市中央区鶴沢町20-16 ユニバース千葉ビル1階"
+  calendar_url: "https://tenbin.link/book/u-1302066f5d4f/torana-norimitsu-shida"
+  founded_year_month: "2015年3月"
+  annual_revenue_band: "5億円"
+  employee_count_band: "10名"
+
+product:
+  name: "LINE公式アカウント運用×CRMコンサル"
+  one_liner: "LINE公式アカウントを『売上ドライバー』として機能させるCRM運用設計支援"
+
+problems_solved:
+  - "..."
+
+pitch:
+  problem: |...
+  solution: |...
+  proof_points: [...]
+  call_to_action: |...
+
+target:
+  industries: [...]
+  size_band: "..."
+  founding_year_sweet_spot: "1995-2012"
+  decision_makers: [...]
+  geo: "JP"
+  must_have_signals: [...]
+  must_not_signals: [...]
+
+desired_channels:
+  - "linkedin"
+  - "jp_form"
+
+personalization:
+  must_reference: "..."
+  avoid: [...]
+  tone: "..."
+
+# brief 固有の prompt override（任意。null は skill 既定を使う）
+prompts_overrides:
+  jp_form_system_persona: null    # 例: "prompts/personas/torana-line-crm/system_persona.md"
+  jp_form_examples: null
+  linkedin_system_persona: null
+
+slack:
+  incoming_webhook_url: ""
+  channel_id: ""
+
+heartbeat:
+  interval_sec: 300
+  enabled_for:
+    - "send"
+    - "enrich"
+
+model:
+  name: "claude-cli/claude-opus-4-7"
+  form_analyzer_name: "claude-cli/claude-sonnet-4-6"
+  max_chars: 400
+  language: "ja"
+```
+
+### 14-D. マージ規則（更新）
+
+```
+briefs/<active>.yaml > skill_dir/config.yaml > defaults
+```
+
+`_outreach_core/config.py:load_merged_config(skill_dir, brief_id=None)` の動作:
+1. `brief_id` が None なら `briefs/_active.txt` を読む
+2. `briefs/<brief_id>.yaml` を読む
+3. `skill_dir/config.yaml` を読む
+4. deep merge: brief が勝つ
+5. 結果を返す
+
+**重要**: 既存の `sender_brief.yaml` を読む経路は **削除**。互換性のためのフォールバックも作らない（マイグレーションで一気に切り替える）。
+
+### 14-E. セッション開始時の確認フロー（SKILL.md 追記）
+
+両方の SKILL.md 冒頭近くに **新セクション**:
+
+```markdown
+## Session start: brief & channel confirmation (MANDATORY)
+
+新規セッションで「アウトリーチ系」のリクエスト（list-build / campaign /
+draft / send / preview など）を受けたら、agent は **データ生成・送信を
+伴うアクション**を起動する前に、必ず以下 2 つを Slack で確認する:
+
+### Step 1: brief 確認
+
+  Slack 投稿例:
+  ```
+  📇 どの brief で進めますか？
+    [既定] torana-line-crm — トラーナ LINE×CRM コンサル
+    cellcloud-medical    — CellCloud 医療系 SaaS
+  「torana で」「LINE×CRM で」と返してください。
+  ```
+
+  確認の手段:
+  - `python3 -m _outreach_core.helpers.brief list` を bash で叩いて一覧取得
+  - 1 件しか無い場合も「既定の torana-line-crm で進めます。よろしいですか？」と確認
+
+### Step 2: channel 確認
+
+  brief の `desired_channels` を Slack に出して選ばせる:
+  ```
+  チャネルは:
+    [1] jp_form（フォーム送信）
+    [2] linkedin（InMail）
+    [両方] 並行で
+  ```
+
+### Step 3: 確定後の挙動
+
+  ユーザー回答を受け取ったら:
+  - `--brief <id>` を全ての run.py 呼び出しに付ける
+  - 該当 channel の skill だけ起動
+  - セッション中、再確認は不要（ユーザーが「brief 変えて」と明示しない限り）
+
+### 確認を省略する場合
+
+  以下の問い合わせ系コマンドは brief 確認なしで応答してよい:
+  - 「進捗どう？」「sent_history 見せて」「needs_attention 一覧」
+    → 全 brief の集計 or `_active.txt` の brief で応答
+  - 「brief 一覧」「今 どの brief が active？」
+```
+
+### 14-F. CLI
+
+新規モジュール `_outreach_core/helpers/brief.py`:
+
+```bash
+# 全 brief 一覧（id / display_name / 最終 send 日時）
+python3 -m _outreach_core.helpers.brief list
+
+# 1 件の詳細
+python3 -m _outreach_core.helpers.brief show torana-line-crm
+
+# 既定 brief を切替（briefs/_active.txt 上書き）
+python3 -m _outreach_core.helpers.brief set-active cellcloud-medical
+
+# 雛形からの新規作成（briefs/_template.yaml をコピーして開く）
+python3 -m _outreach_core.helpers.brief new cellcloud-medical \
+  --display-name "CellCloud 医療系"
+
+# 既存単一 brief セットアップを brief 化（マイグレーション）
+python3 -m _outreach_core.helpers.brief migrate \
+  --from-sender-brief sender_brief.yaml \
+  --from-config jp-form-outreach/config.yaml \
+  --from-config linkedin-outreach/config.yaml \
+  --to torana-line-crm \
+  --display-name "トラーナ LINE×CRM"
+
+# data/ 直下の旧ファイルを data/briefs/<id>/ に移動
+python3 -m _outreach_core.helpers.brief migrate-data --brief torana-line-crm
+
+# brief 削除（アーカイブとしてリネーム）
+python3 -m _outreach_core.helpers.brief archive cellcloud-medical
+# → briefs/cellcloud-medical.yaml.archived に rename
+```
+
+### 14-G. run.py への `--brief` フラグ追加
+
+すべての subcommand に `--brief <id>` を追加:
+
+```bash
+# 既定 brief を使う（briefs/_active.txt）
+python run.py campaign --clean
+
+# 明示指定
+python run.py campaign --brief torana-line-crm --clean
+
+# 起動ログに brief を明示
+[campaign] brief=torana-line-crm · skill=jp-form-outreach
+```
+
+`--brief` は **全 subcommand に必須**（既定値あり）:
+- `campaign`, `bootstrap`, `enrich`, `draft`, `preview`, `send`, `resolve`, `mark-sent`, `history`
+
+データパス解決:
+- 旧: `DATA_DIR = SKILL_DIR / "data"`
+- 新: `DATA_DIR = SKILL_DIR / "data" / "briefs" / brief_id`
+
+`targets.yaml` パス解決:
+- 新: `TARGETS_PATH = SKILL_DIR / "targets" / f"{brief_id}.yaml"`
+
+### 14-H. 履歴の brief 単位独立（重要）
+
+`_outreach_core/history.py` の関数を全て `brief_id` で分離:
+
+```python
+def sent_history_path(skill_dir: Path, brief_id: str) -> Path:
+    return skill_dir / "data" / "briefs" / brief_id / "sent_history.jsonl"
+
+def load_global_exclude_set(brief_id: str) -> set[str]:
+    """この brief の send/skip 履歴を全 skill 横断で集める。
+    他 brief の履歴は含めない（独立運用のため）。"""
+    s = set()
+    for skill_dir in SKILL_DIRS:
+        s |= load_sent_set(sent_history_path(skill_dir, brief_id))
+        s |= load_skip_set(skip_history_path(skill_dir, brief_id))
+    return s
+```
+
+→ 同じ company に brief A と brief B からそれぞれ outreach できる。dedup は brief 内のみ。
+
+### 14-I. プロンプトの brief 単位 override（任意）
+
+brief 固有のトーン・サインオフが欲しい場合、`prompts_overrides` で skill 既定をオーバーライド:
+
+```
+~/.openclaw/skills/
+├── jp-form-outreach/
+│   ├── prompts/
+│   │   ├── system_persona.md             # スキル既定
+│   │   ├── examples.md
+│   │   └── personas/                     # brief 固有
+│   │       ├── torana-line-crm/
+│   │       │   ├── system_persona.md     # 既定を完全置換
+│   │       │   └── examples.md
+│   │       └── cellcloud-medical/
+│   │           └── system_persona.md
+```
+
+brief.yaml で:
+```yaml
+prompts_overrides:
+  jp_form_system_persona: "prompts/personas/torana-line-crm/system_persona.md"
+```
+
+null（既定）なら skill 直下の `prompts/system_persona.md` を使う。
+
+### 14-J. Slack トリガー追加
+
+両 SKILL.md の Slack トリガー表に:
+
+| ユーザー発話 | エージェントの行動 |
+|---|---|
+| 「brief 一覧」/「人格教えて」 | `brief list` を bash で実行、結果を整形して投稿 |
+| 「<id> で」/「<display_name> で」 | このセッションでの brief を確定（_active.txt は変えない） |
+| 「<id> を既定に」 | `brief set-active <id>` |
+| 「<新id> 新規」 | `brief new <id>` を実行し、Slack で対話的にフィールドを埋める |
+| 「今 どの brief？」 | active brief と現セッション選択を返す |
+| 「<id> アーカイブ」 | `brief archive <id>` |
+
+### 14-K. マイグレーション手順
+
+既存の単一 brief セットアップ（今の Shida-san のもの）を `torana-line-crm` brief に移行:
+
+```bash
+# 1. brief を作成
+python3 -m _outreach_core.helpers.brief migrate \
+  --from-sender-brief sender_brief.yaml \
+  --from-config jp-form-outreach/config.yaml \
+  --from-config linkedin-outreach/config.yaml \
+  --to torana-line-crm \
+  --display-name "トラーナ LINE×CRM"
+
+# 2. 既存 data/ を data/briefs/torana-line-crm/ に移動（両 skill とも）
+python3 -m _outreach_core.helpers.brief migrate-data --brief torana-line-crm
+
+# 3. targets.yaml / targets.csv を移動
+mv jp-form-outreach/targets.yaml jp-form-outreach/targets/torana-line-crm.yaml
+mv linkedin-outreach/targets.csv linkedin-outreach/targets/torana-line-crm.csv
+
+# 4. 既定 brief を設定
+echo "torana-line-crm" > briefs/_active.txt
+
+# 5. 旧ファイルを deprecated 化
+mv sender_brief.yaml sender_brief.yaml.deprecated
+
+# 6. テスト
+python3 -m _outreach_core.helpers.brief list
+python3 jp-form-outreach/run.py preview --brief torana-line-crm --no-send
+```
+
+**マイグレーションは Cursor が冪等な migrate スクリプトとして実装**。複数回実行しても壊れない設計。
+
+### 14-L. 受け入れ条件
+
+23. `briefs/<id>.yaml` を作成・編集できる CLI（`brief new`, `brief show`, `brief list`）が動作する
+24. 既存単一 brief セットアップを `torana-line-crm` brief に移行後、`jp-form-outreach/run.py preview --brief torana-line-crm` が **マイグレーション前と同じ drafts** を表示できる
+25. 2 つめの brief（例: `test-brief`）を作って `campaign --brief test-brief` を回すと、`data/briefs/test-brief/` 配下に独立した sent_history / drafts が書かれる
+26. 同じ `target_id` が `torana-line-crm` で sent でも、`test-brief` から見ると pending として扱われる
+27. SKILL.md に Session start confirmation セクションがあり、新規セッションで Opus エージェントが必ず brief/channel を確認する流れになっている
+28. `run.py` の全 subcommand に `--brief` フラグがあり、未指定なら `_active.txt` を読む
+29. `_active.txt` が存在しないか、その内容が `briefs/` 配下に無い場合、明確なエラーメッセージで起動拒否
+30. `sender_brief.yaml` への参照が **コードから完全削除**（grep で 0 件、ドキュメント側の言及のみ残る）
+
+### 14-M. 作業順序（推奨）
+
+1. `_outreach_core/helpers/brief.py` の CLI 雛形を作る（list / show / new / set-active）— 1 時間
+2. `_outreach_core/config.py` を brief 対応に書き換え（`load_brief()`, `load_merged_config(skill_dir, brief_id)`）— 30 分
+3. `_outreach_core/history.py` の関数に `brief_id` 引数を追加 — 30 分
+4. `run.py`（両 skill）に `--brief` フラグ追加、データパス書き換え — 2 時間
+5. マイグレーション CLI（`brief migrate`, `brief migrate-data`）実装 — 1 時間
+6. SKILL.md に Session start confirmation 追記 — 30 分
+7. テスト追加（受け入れ条件 23-30） — 1 時間
+8. 実マイグレーション実行（torana-line-crm 移行）— 15 分
+9. 旧 `sender_brief.yaml` 参照を全削除 — 15 分
+
+**全体で 約 7 時間。** マイグレーション CLI を堅牢に作るのが肝。
+
+### 14-N. やらないこと（再確認）
+
+- **brief 間で履歴を共有しない**（独立運用が選定された決定事項）
+- **brief 切替を会話途中で勝手にしない**（必ずユーザー確認）
+- **brief を作る時に LLM で対話的に埋める機能は今回スコープ外**（テンプレ + 手動編集で十分）
+- **brief を Web UI で管理する機能は今回スコープ外**（CLI + YAML 編集で十分）
+
+---
+
+## 15. v4 まとめ・チェックポイント（v3 §12 を統合）
+
+### v4 で増えたモデル料金
+- draft: Sonnet → **Opus 4.7** に切替（~8 倍のコスト、月数十ドル）
+- `_llm_analyze_form`: Sonnet 維持
+- refine（オプション）: Opus（手動 ON 時のみ）
+
+### v4 で増えた機能
+- ✅ verify の誤検知撲滅（A-1, A-2）
+- ✅ char_limit ハード強制（B-1）
+- ✅ `input()` 撲滅 + Slack エスカレーション統一（A-6）
+- ✅ enrich-research フロー（B-2, SKILL.md のみ）
+- ✅ ユニーク CSS セレクタ（A-4）
+- ✅ 動的フィールド対応 軽量版（A-3）
+- ✅ 郵便番号順序対策（A-5）
+- ✅ 冒頭型 / 自己紹介バリエーション（B-3, B-4）
+- ✅ refine フラグ + 品質ゲート（B-5, B-6）
+- ✅ ログ抽出・レポート（§13）
+- ✅ **マルチ brief（人格）対応（§14、新設）**
+
+### v4 で **増えてない**ことの確認
+- ❌ slack_bolt 自作（v2 で撤回済）
+- ❌ list_builder CLI（v3 で撤回済）
+- ❌ Facebook / X チャネル（スコープ外）
+- ❌ verify.py の LLM 化（純 Python 維持）
+- ❌ `_llm_analyze_form` の Opus 化（Sonnet 維持）
+- ❌ brief 間の履歴共有（独立運用が決定）
 
 ---
 

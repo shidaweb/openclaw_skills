@@ -38,7 +38,7 @@ def backfill_file(path: Path) -> int:
 
 def main() -> int:
     total = 0
-    for skill_dir in history.SKILL_DIRS:
+    for skill_dir in history.skill_dirs():
         data = skill_dir / "data"
         for fname in HISTORY_FILES:
             p = data / fname

@@ -18,6 +18,30 @@ description: |
 
 # jp-form-outreach
 
+## Session start: brief & channel confirmation (MANDATORY)
+
+新規セッションで list-build / campaign / draft / send / preview など
+**データ生成・送信を伴う**リクエストを受けたら、起動前に Slack で次を確認する:
+
+1. **brief** — `python3 -m _outreach_core.helpers.brief list` で一覧。例:
+   「📇 どの brief で進めますか？ [既定] torana-line-crm — トラーナ LINE×CRM …」
+2. **channel** — brief の `desired_channels` から jp_form / linkedin / 両方を選ばせる。
+
+確定後は全 `run.py` 呼び出しに `--brief <id>` を付ける（省略時は `briefs/_active.txt`）。
+進捗照会・`brief list`・`history show` だけは確認省略可。
+
+| ユーザー発話 | 行動 |
+|---|---|
+| brief 一覧 / 人格教えて | `brief list` |
+| `<id> で` | セッション brief 確定（`_active.txt` は変えない） |
+| `<id> を既定に` | `brief set-active <id>` |
+| 今どの brief？ | active + セッション選択を返す |
+
+```bash
+# 例
+.venv/bin/python run.py campaign --brief torana-line-crm --clean
+```
+
 This skill drives a full Japanese B2B inquiry-form outreach pipeline using
 the OpenClaw browser plugin (Chrome with the openclaw profile) and the
 OpenClaw inference CLI (Sonnet for personalization, with prompt caching).
@@ -313,7 +337,7 @@ cd ~/.openclaw/skills/jp-form-outreach
 .venv/bin/python run.py resolve --target-id <id> --field 業界=その他 --field 紹介者=なし
 ```
 
-Webhook 通知（`sender_brief.yaml` の `slack.incoming_webhook_url`）:
+Webhook 通知（`briefs/<id>.yaml` の `slack.incoming_webhook_url`）:
 - ✅ 送信完了
 - ⚠️ 完了画面未確認 / 想定外フィールド
 

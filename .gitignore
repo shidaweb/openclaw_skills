@@ -22,6 +22,9 @@ data/sample_*.txt
 # Always commit config.example.yaml — never the filled-in config.yaml
 config.yaml
 sender_brief.yaml
+briefs/*.yaml
+!briefs/_template.yaml
+!briefs/*.example.yaml
 targets.yaml
 targets.csv
 targets.csv.bak

@@ -48,7 +48,7 @@ class TestProgress(unittest.TestCase):
             "slack": {"incoming_webhook_url": "https://hooks.slack.com/test"},
             "heartbeat": {"enabled_for": ["enrich"]},
         }
-        with mock.patch("_outreach_core.progress.load_sender_brief", return_value=brief):
+        with mock.patch("_outreach_core.progress.load_runtime_config", return_value=brief):
             with mock.patch("_outreach_core.progress.webhook_configured", return_value=True):
                 self.assertEqual(resolve_heartbeat_mode(None, task="enrich"), "slack")
                 self.assertIsNone(resolve_heartbeat_mode(None, task="draft"))

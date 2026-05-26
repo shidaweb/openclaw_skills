@@ -34,14 +34,14 @@ class TestOpenclawSlack(unittest.TestCase):
             sess_path.parent.mkdir(parents=True)
             sess_path.write_text(json.dumps(sessions))
             with mock.patch.object(openclaw_slack, "openclaw_home", return_value=base):
-                with mock.patch.object(openclaw_slack, "load_sender_brief", return_value={}):
+                with mock.patch.object(openclaw_slack, "load_runtime_config", return_value={}):
                     cid = openclaw_slack.slack_channel_id_from_sessions()
             self.assertEqual(cid, "C09D38UGJTC")
 
-    def test_resolve_prefers_sender_brief_channel_id(self) -> None:
+    def test_resolve_prefers_brief_channel_id(self) -> None:
         with mock.patch.object(
             openclaw_slack,
-            "load_sender_brief",
+            "load_runtime_config",
             return_value={"slack": {"channel_id": "C11111111"}},
         ):
             self.assertEqual(openclaw_slack.resolve_slack_channel_id(), "C11111111")

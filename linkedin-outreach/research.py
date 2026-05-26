@@ -9,7 +9,7 @@ Runs:
   4. preview all drafts (TTY only; otherwise --no-send)
 
 Progress: data/current_task.jsonl always; Slack every ~5 min when
-sender_brief webhook (optional) or OpenClaw Slack bot + session channel; heartbeat.enabled_for allows research/*.
+brief yaml webhook (optional) or OpenClaw Slack bot + session channel; heartbeat.enabled_for allows research/*.
 
 Usage:
   cd ~/.openclaw/skills/linkedin-outreach
@@ -120,7 +120,7 @@ def main() -> None:
         "--heartbeat",
         choices=["auto", "slack", "off"],
         default="auto",
-        help="Slack progress pings (auto=webhook + sender_brief heartbeat.enabled_for)",
+        help="Slack progress pings (auto=webhook + brief heartbeat.enabled_for)",
     )
     args = ap.parse_args()
 

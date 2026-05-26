@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from _outreach_core.config import heartbeat_interval_sec, load_merged_config, load_sender_brief
+from _outreach_core.config import heartbeat_interval_sec, load_merged_config, load_runtime_config
 from _outreach_core.notify import webhook_configured
 
 _log = logging.getLogger(__name__)
@@ -33,7 +33,7 @@ def resolve_heartbeat_mode(explicit: str | None, *, task: str) -> str | None:
     """
     Resolve heartbeat for a stage.
 
-    explicit: None or \"auto\" → use sender_brief (webhook + heartbeat.enabled_for).
+    explicit: None or \"auto\" → use brief yaml (webhook + heartbeat.enabled_for).
     \"slack\" → force on (notify no-ops if webhook empty).
     \"off\" → force off.
     """
@@ -43,7 +43,7 @@ def resolve_heartbeat_mode(explicit: str | None, *, task: str) -> str | None:
         return "slack"
     if not webhook_configured():
         return None
-    brief = load_sender_brief()
+    brief = load_runtime_config()
     hb = brief.get("heartbeat") or {}
     enabled = hb.get("enabled_for")
     if enabled is not None:
@@ -78,6 +78,7 @@ class HeartbeatSession:
         *,
         heartbeat: str | None = None,
         data_dir: Path | None = None,
+        brief_id: str | None = None,
     ) -> None:
         self.skill_dir = skill_dir
         self.task = task
@@ -90,9 +91,9 @@ class HeartbeatSession:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         try:
-            cfg = load_merged_config(skill_dir)
+            cfg = load_merged_config(skill_dir, brief_id)
         except FileNotFoundError:
-            cfg = load_sender_brief()
+            cfg = load_runtime_config(brief_id)
         self._interval = heartbeat_interval_sec(cfg)
 
     def start(self, message: str = "") -> None:

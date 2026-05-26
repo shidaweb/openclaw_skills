@@ -26,7 +26,7 @@ REPO = Path(__file__).resolve().parent.parent.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from _outreach_core.config import heartbeat_interval_sec, load_sender_brief  # noqa: E402
+from _outreach_core.config import heartbeat_interval_sec, load_runtime_config  # noqa: E402
 from _outreach_core.notify import post, webhook_configured  # noqa: E402
 from _outreach_core.progress import current_task_path  # noqa: E402
 
@@ -141,7 +141,7 @@ def main() -> None:
         "--interval",
         type=int,
         default=None,
-        help="Seconds between Slack posts (default: sender_brief heartbeat.interval_sec)",
+        help="Seconds between Slack posts (default: brief heartbeat.interval_sec)",
     )
     ap.add_argument(
         "--once",
@@ -155,7 +155,7 @@ def main() -> None:
         help="How often to read current_task.jsonl (default: 30)",
     )
     args = ap.parse_args()
-    interval = args.interval or heartbeat_interval_sec(load_sender_brief())
+    interval = args.interval or heartbeat_interval_sec(load_runtime_config())
     sys.exit(
         run_watch(
             args.skill,

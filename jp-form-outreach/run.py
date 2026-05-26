@@ -30,7 +30,8 @@ from _outreach_core import history as core_history
 from _outreach_core import infer as core_infer
 from _outreach_core import preview as core_preview
 from _outreach_core import prompt as core_prompt
-from _outreach_core.config import load_merged_config
+from _outreach_core.config import BriefError, load_merged_config
+from _outreach_core.paths import SkillPaths, resolve_skill_paths
 from _outreach_core.progress import HeartbeatSession
 from _outreach_core.verify import (
     append_needs_attention,
@@ -47,9 +48,10 @@ except ImportError:
     sys.exit(1)
 
 SKILL_DIR = Path(__file__).resolve().parent
+_PATHS: SkillPaths | None = None
+BRIEF_ID = ""
 DATA_DIR = SKILL_DIR / "data"
 PROMPTS_DIR = SKILL_DIR / "prompts"
-DATA_DIR.mkdir(exist_ok=True)
 
 DEFAULT_MODEL = core_infer.DEFAULT_MODEL
 BROWSER_PROFILE = core_infer.BROWSER_PROFILE
@@ -57,6 +59,28 @@ RATE_LIMIT_SECONDS = 4
 
 SKIP_HISTORY_PATH = DATA_DIR / "skip_history.jsonl"
 SENT_HISTORY_PATH = DATA_DIR / "sent_history.jsonl"
+
+
+def configure_brief(brief_id: str | None, *, cmd: str = "") -> SkillPaths:
+    """Resolve brief, data/briefs/<id>/, targets/<id>.yaml, and prompt overrides."""
+    global _PATHS, BRIEF_ID, DATA_DIR, PROMPTS_DIR, SKIP_HISTORY_PATH, SENT_HISTORY_PATH
+    _PATHS = resolve_skill_paths(SKILL_DIR, brief_id, channel="jp_form")
+    BRIEF_ID = _PATHS.brief_id
+    DATA_DIR = _PATHS.data_dir
+    SKIP_HISTORY_PATH = DATA_DIR / "skip_history.jsonl"
+    SENT_HISTORY_PATH = DATA_DIR / "sent_history.jsonl"
+    try:
+        cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
+        PROMPTS_DIR = core_prompt.resolve_prompts_dir(SKILL_DIR, cfg)
+    except (FileNotFoundError, BriefError):
+        PROMPTS_DIR = SKILL_DIR / "prompts"
+    if cmd in ("campaign", "bootstrap", "send", "draft", "enrich", "preview"):
+        print(f"[{cmd}] brief={BRIEF_ID} · skill=jp-form-outreach")
+    return _PATHS
+
+
+def _data_path(arg: str | None, name: str) -> Path:
+    return Path(arg) if arg else DATA_DIR / name
 
 
 # ============================================================================
@@ -694,7 +718,7 @@ def stage_preview(input_path: Path, interactive_send: bool = True,
 
     if config is None:
         try:
-            config = load_merged_config(SKILL_DIR)
+            config = load_merged_config(SKILL_DIR, BRIEF_ID)
         except FileNotFoundError as e:
             print(f"[preview] {e}; cannot send", file=sys.stderr)
             return
@@ -775,7 +799,7 @@ def stage_campaign(
     # --- Phase 3: Personalize ---
     print(f"\n{bar}\n[3/6] PERSONALIZE — Opus draft (cached system prompt)\n{bar}")
     try:
-        cfg = load_merged_config(SKILL_DIR)
+        cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
     except FileNotFoundError as e:
         print(f"[campaign] {e}", file=sys.stderr)
         print(f"           cp {SKILL_DIR / 'config.example.yaml'} {SKILL_DIR / 'config.yaml'}", file=sys.stderr)
@@ -2182,11 +2206,26 @@ def stage_mark_sent(input_path: Path, ids: set[int]) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(prog="jp-form-outreach", description=__doc__)
+    brief_parent = argparse.ArgumentParser(add_help=False)
+    brief_parent.add_argument(
+        "--brief",
+        default=None,
+        help="Brief id (default: briefs/_active.txt)",
+    )
+    ap.add_argument(
+        "--brief",
+        default=None,
+        help="Brief id (default: briefs/_active.txt)",
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("bootstrap", help="(Pull) Load curated targets.yaml -> data/leads.jsonl")
-    p.add_argument("--targets", default=str(SKILL_DIR / "targets.yaml"))
-    p.add_argument("--out", default=str(DATA_DIR / "leads.jsonl"))
+    p = sub.add_parser(
+        "bootstrap",
+        parents=[brief_parent],
+        help="(Pull) Load curated targets/<brief>.yaml -> data/briefs/<brief>/leads.jsonl",
+    )
+    p.add_argument("--targets", default=None, help="Targets YAML (default: targets/<brief>.yaml)")
+    p.add_argument("--out", default=None, help="Output leads.jsonl (default: data/briefs/<brief>/)")
     p.add_argument("--include-sent", action="store_true",
                    help="Also include companies marked status: sent")
     p.add_argument("--include-dropped", action="store_true",
@@ -2196,9 +2235,12 @@ def main() -> None:
     p.add_argument("--only", default=None,
                    help="Comma-separated target ids to restrict to (e.g. 'ikkholdings,pharmafoods')")
 
-    p = sub.add_parser("campaign",
-                        help="Run the full 6-phase outreach pipeline (pull→enrich→draft→preview+send)")
-    p.add_argument("--targets", default=str(SKILL_DIR / "targets.yaml"))
+    p = sub.add_parser(
+        "campaign",
+        parents=[brief_parent],
+        help="Run the full 6-phase outreach pipeline (pull→enrich→draft→preview+send)",
+    )
+    p.add_argument("--targets", default=None)
     p.add_argument("--clean", action="store_true",
                    help="Wipe leads/enriched/drafts before running")
     p.add_argument("--skip-enrich", action="store_true",
@@ -2225,13 +2267,13 @@ def main() -> None:
     p.add_argument("--only", default=None,
                    help="Comma-separated target ids to restrict to")
 
-    p = sub.add_parser("enrich", help="Visit each form URL, capture field structure")
-    p.add_argument("--in", dest="input_path", default=str(DATA_DIR / "leads.jsonl"))
-    p.add_argument("--out", default=str(DATA_DIR / "enriched.jsonl"))
+    p = sub.add_parser("enrich", parents=[brief_parent], help="Visit each form URL, capture field structure")
+    p.add_argument("--in", dest="input_path", default=None)
+    p.add_argument("--out", default=None)
 
-    p = sub.add_parser("draft", help="Generate personalized form messages")
-    p.add_argument("--in", dest="input_path", default=str(DATA_DIR / "enriched.jsonl"))
-    p.add_argument("--out", default=str(DATA_DIR / "drafts.jsonl"))
+    p = sub.add_parser("draft", parents=[brief_parent], help="Generate personalized form messages")
+    p.add_argument("--in", dest="input_path", default=None)
+    p.add_argument("--out", default=None)
     p.add_argument("--config", default=str(SKILL_DIR / "config.yaml"))
     p.add_argument("--from-targets", action="store_true",
                    help="Skip enrich; draft directly from data/leads.jsonl")
@@ -2249,14 +2291,17 @@ def main() -> None:
         help="Single-pass draft; agent re-runs --refine for low-rated ids (SKILL.md)",
     )
 
-    p = sub.add_parser("preview",
-                        help="(Approve) Show all drafts in terminal, then prompt to send")
-    p.add_argument("--in", dest="input_path", default=str(DATA_DIR / "drafts.jsonl"))
+    p = sub.add_parser(
+        "preview",
+        parents=[brief_parent],
+        help="(Approve) Show all drafts in terminal, then prompt to send",
+    )
+    p.add_argument("--in", dest="input_path", default=None)
     p.add_argument("--no-send", action="store_true",
                    help="Skip the interactive send prompt at the end")
 
-    p = sub.add_parser("send", help="Drive form fill + submit")
-    p.add_argument("--in", dest="input_path", default=str(DATA_DIR / "drafts.jsonl"))
+    p = sub.add_parser("send", parents=[brief_parent], help="Drive form fill + submit")
+    p.add_argument("--in", dest="input_path", default=None)
     p.add_argument("--ids", help="Comma-separated SENDABLE indices (1-based), or 'all' for every not-yet-sent draft. Required unless --all is set.")
     p.add_argument("--all", action="store_true",
                    help="Send every SENDABLE draft that's not already in sent_history (skips SKIPPED automatically)")
@@ -2284,7 +2329,11 @@ def main() -> None:
         help="On fill errors, refresh DOM and run a second LLM fill plan",
     )
 
-    p = sub.add_parser("resolve", help="Resolve needs_attention with field overrides or resume send")
+    p = sub.add_parser(
+        "resolve",
+        parents=[brief_parent],
+        help="Resolve needs_attention with field overrides or resume send",
+    )
     p.add_argument("--target-id", required=True)
     p.add_argument(
         "--action",
@@ -2295,30 +2344,41 @@ def main() -> None:
     p.add_argument("--field", action="append", default=[], help="key=value (repeatable)")
     p.add_argument("--config", default=str(SKILL_DIR / "config.yaml"))
 
-    p = sub.add_parser("walk",
-                        help="Walkthrough: review each SENDABLE draft one-by-one and choose send/skip/fill/quit")
-    p.add_argument("--in", dest="input_path", default=str(DATA_DIR / "drafts.jsonl"))
+    p = sub.add_parser(
+        "walk",
+        parents=[brief_parent],
+        help="Walkthrough: review each SENDABLE draft one-by-one and choose send/skip/fill/quit",
+    )
+    p.add_argument("--in", dest="input_path", default=None)
     p.add_argument("--config", default=str(SKILL_DIR / "config.yaml"))
     p.add_argument("--default", default="send",
                    choices=["send", "skip", "fill", "quit"],
                    help="Action when user just presses Enter (default: send)")
 
-    p = sub.add_parser("mark-sent", help="Log specific drafts to sent_history.jsonl")
-    p.add_argument("--in", dest="input_path", default=str(DATA_DIR / "drafts.jsonl"))
+    p = sub.add_parser("mark-sent", parents=[brief_parent], help="Log specific drafts to sent_history.jsonl")
+    p.add_argument("--in", dest="input_path", default=None)
     p.add_argument("--ids", help="Comma-separated SENDABLE indices, or 'all'")
     p.add_argument("--all", action="store_true", help="Mark every not-yet-sent SENDABLE draft as sent")
 
-    p = sub.add_parser("history", help="View / manage skip and sent history")
+    p = sub.add_parser("history", parents=[brief_parent], help="View / manage skip and sent history")
     p.add_argument(
         "action",
         choices=["show", "needs-attention", "purge-skip", "purge-sent", "purge-all"],
     )
 
     args = ap.parse_args()
+    brief_id = getattr(args, "brief", None)
+    try:
+        configure_brief(brief_id, cmd=args.cmd)
+    except BriefError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(2)
 
     if args.cmd == "bootstrap":
         only_ids = [x.strip() for x in args.only.split(",")] if args.only else None
-        stage_bootstrap(Path(args.targets), Path(args.out),
+        stage_bootstrap(
+            Path(args.targets) if args.targets else _PATHS.targets_path,
+            _data_path(args.out, "leads.jsonl"),
                         include_sent=args.include_sent,
                         include_dropped=args.include_dropped,
                         limit=args.limit,
@@ -2326,7 +2386,7 @@ def main() -> None:
     elif args.cmd == "campaign":
         only_ids = [x.strip() for x in args.only.split(",")] if args.only else None
         try:
-            cfg = load_merged_config(SKILL_DIR)
+            cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
         except FileNotFoundError:
             cfg = {}
         refine = _cli_refine_enabled(cfg, args)
@@ -2334,7 +2394,7 @@ def main() -> None:
             print("[campaign] --refine-only-if-low-quality: pass-1 draft only; "
                   "agent scores drafts then run.py draft --refine for low ids")
         stage_campaign(
-            targets_path=Path(args.targets),
+            targets_path=Path(args.targets) if args.targets else _PATHS.targets_path,
             clean=args.clean,
             skip_enrich=args.skip_enrich,
             skip_send=args.skip_send,
@@ -2344,39 +2404,44 @@ def main() -> None:
             only_ids=only_ids,
         )
     elif args.cmd == "enrich":
-        stage_enrich(Path(args.input_path), Path(args.out))
+        stage_enrich(
+            _data_path(args.input_path, "leads.jsonl"),
+            _data_path(args.out, "enriched.jsonl"),
+        )
     elif args.cmd == "draft":
         try:
-            cfg = load_merged_config(SKILL_DIR)
+            cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
         except FileNotFoundError as e:
             print(f"[draft] {e}", file=sys.stderr)
             sys.exit(2)
-        # Default: read from enriched.jsonl. With --from-targets, read leads.jsonl instead
-        in_path = Path(args.input_path)
+        in_path = _data_path(args.input_path, "enriched.jsonl")
         if args.from_targets and not in_path.exists():
             in_path = DATA_DIR / "leads.jsonl"
         refine = _cli_refine_enabled(cfg, args)
         if getattr(args, "refine_only_if_low_quality", False):
             print("[draft] pass-1 only (--refine-only-if-low-quality). "
                   "Re-run with --refine for low-rated target ids after agent review.")
-        stage_draft(in_path, Path(args.out), cfg, refine=refine)
+        stage_draft(in_path, _data_path(args.out, "drafts.jsonl"), cfg, refine=refine)
     elif args.cmd == "preview":
         cfg = None
         if not args.no_send:
             try:
-                cfg = load_merged_config(SKILL_DIR)
+                cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
             except FileNotFoundError:
                 cfg = None
-        stage_preview(Path(args.input_path),
-                      interactive_send=(not args.no_send),
-                      config=cfg)
+        stage_preview(
+            _data_path(args.input_path, "drafts.jsonl"),
+            interactive_send=(not args.no_send),
+            config=cfg,
+        )
     elif args.cmd == "send":
         try:
-            cfg = load_merged_config(SKILL_DIR)
+            cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
         except FileNotFoundError as e:
             print(f"[send] {e}", file=sys.stderr)
             sys.exit(2)
-        ids = _resolve_ids_arg(args.ids, args.all, Path(args.input_path), cmd_name="send")
+        drafts_path = _data_path(args.input_path, "drafts.jsonl")
+        ids = _resolve_ids_arg(args.ids, args.all, drafts_path, cmd_name="send")
         if ids is None:
             sys.exit(2)
         if args.auto_send:
@@ -2390,7 +2455,7 @@ def main() -> None:
         if not ev.get_context().data_dir:
             ev.configure(skill="jp-form-outreach", data_dir=DATA_DIR)
         stage_send(
-            Path(args.input_path),
+            drafts_path,
             ids,
             mode=mode,
             config=cfg,
@@ -2400,7 +2465,7 @@ def main() -> None:
         )
     elif args.cmd == "resolve":
         try:
-            cfg = load_merged_config(SKILL_DIR)
+            cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
         except FileNotFoundError as e:
             print(f"[resolve] {e}", file=sys.stderr)
             sys.exit(2)
@@ -2424,12 +2489,13 @@ def main() -> None:
             print(f"[walk] config not found: {config_path}", file=sys.stderr)
             sys.exit(2)
         cfg = yaml.safe_load(config_path.read_text())
-        stage_walkthrough(Path(args.input_path), cfg, default_action=args.default)
+        stage_walkthrough(_data_path(args.input_path, "drafts.jsonl"), cfg, default_action=args.default)
     elif args.cmd == "mark-sent":
-        ids = _resolve_ids_arg(args.ids, args.all, Path(args.input_path), cmd_name="mark-sent")
+        drafts_path = _data_path(args.input_path, "drafts.jsonl")
+        ids = _resolve_ids_arg(args.ids, args.all, drafts_path, cmd_name="mark-sent")
         if ids is None:
             sys.exit(2)
-        stage_mark_sent(Path(args.input_path), ids)
+        stage_mark_sent(drafts_path, ids)
     elif args.cmd == "history":
         stage_history(args.action)
 
