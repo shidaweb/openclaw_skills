@@ -264,6 +264,7 @@ def stage_draft(
                     "body_chars": len(body),
                     "subject": draft.get("subject"),
                     "opener_type": ev.guess_opener_type(body),
+                    "self_intro_variant": ev.guess_self_intro_variant(body),
                 },
                 trace_dir=trace,
             )

@@ -298,3 +298,20 @@ def guess_opener_type(body: str) -> int | None:
     if len(first) > 20 and not first.startswith("お世話"):
         return 2
     return 1
+
+
+def guess_self_intro_variant(body: str) -> str | None:
+    """Heuristic V1–V5 tag for draft.emitted (§11-B-4 / §13-C)."""
+    if not body:
+        return None
+    if "MDOnline" in body and ("医療" in body or "患者" in body or "家族" in body):
+        return "V1"
+    if "ソニー" in body or "こども" in body or "サブスク" in body:
+        return "V2"
+    if "FC" in body or "本部" in body or "中堅" in body:
+        return "V3"
+    if "小さな組織" in body or "失礼" in body[:120]:
+        return "V4"
+    if "私自身も" in body or "運営側" in body:
+        return "V5"
+    return None

@@ -20,9 +20,23 @@ description: |
 
 新規セッションで fetch / campaign / draft / send など **データ生成・送信を伴う**
 リクエストの前に Slack で brief と channel（linkedin / jp_form / 両方）を確認する。
-`python3 -m _outreach_core.helpers.brief list` で一覧。確定後は `--brief <id>` を全 `run.py` に付与。
+`python3 -m _outreach_core.helpers.brief list` で一覧。確定後は **全 `run.py` に `--brief <id>`** を付与。
+
+| ユーザー発話 | 行動 |
+|---|---|
+| brief 一覧 / 人格教えて | `brief list` |
+| `<id> で` | セッション brief 確定 |
+| 今どの brief？ | `brief list` + `data/channel_state/<channel_id>.json` |
+| brief を `<id>` に変えて | `brief bind --channel-id $CH --brief <id>` |
+| 進捗どう？ | § Stateless context reconstruction（`brief status` / `events.jsonl`） |
+| 品質ポイント教えて | `../report draft-quality --since 7d` |
+| 送信ファネル見せて | `../report send-funnel --since 7d` |
+| needs_attention まとめて | `../report needs-attention` |
+| 新しい brief を作って | §14-N onboarding → `brief write-from-json` |
+| 全部止めて | `brief stop-run --brief <id>` |
 
 ```bash
+cd ~/.openclaw/skills/linkedin-outreach
 .venv/bin/python run.py campaign --brief torana-line-crm --input targets/torana-line-crm.csv --limit 5
 ```
 
@@ -30,7 +44,21 @@ description: |
 
 **Slack バインド済みチャンネル**では brief 確認を省略（`data/channel_state/<channel_id>.json`）。環境変数 `DOORMAN_SLACK_CHANNEL_ID` / `DOORMAN_SLACK_THREAD_TS` を `run.py` に渡す。
 
-詳細（Stateless context reconstruction / onboarding / report トリガー）は `jp-form-outreach/SKILL.md` の Session start 表を参照。
+## Stateless context reconstruction
+
+新スレッドでも file から再構築（`jp-form-outreach/SKILL.md` と同手順）:
+
+1. `data/channel_state/<channel_id>.json`
+2. `data/briefs/<id>/active_run.lock`
+3. `data/briefs/<id>/current_task.jsonl` 末尾
+4. `data/briefs/<id>/events.jsonl` 直近
+5. `data/briefs/<id>/needs_attention.jsonl` の open
+
+```bash
+python3 -m _outreach_core.helpers.brief status --brief torana-line-crm --skill linkedin-outreach
+```
+
+Cookie 同意バナーは page open 直後に自動 dismiss（`browser.cookie_consent` in brief YAML）。InMail 送信は Slack 確認後 `--auto-send`（`stage_send` は stdin 不使用）。
 
 This skill drives a full LinkedIn InMail outreach pipeline using the OpenClaw
 browser plugin (Chrome with the user's signed-in profile) and the OpenClaw

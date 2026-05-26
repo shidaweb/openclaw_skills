@@ -70,7 +70,17 @@ python3 ../brief bind --channel-id C09... --brief torana-line-crm
 
 ## Slack-native onboarding wizard
 
-「新しい brief を作って」「セットアップして」→ Slack で 10〜15 問（sender / product / pitch / target / channels）。完了後 `briefs/<slug>.yaml` と `brief bind` で channel_state を作成。詳細は `CURSOR_INSTRUCTIONS.md` §14-N。
+「新しい brief を作って」「セットアップして」→ Slack で 10〜15 問（sender / product / pitch / target / channels）。完了後:
+
+```bash
+# エージェントが answers JSON を組み立てたあと（例: briefs/onboarding_answers.example.json）
+python3 -m _outreach_core.helpers.brief write-from-json <slug> \
+  --answers /path/to/answers.json \
+  --display-name "表示名" \
+  --bind-channel $DOORMAN_SLACK_CHANNEL_ID
+```
+
+詳細は `CURSOR_INSTRUCTIONS.md` §14-N。
 
 This skill drives a full Japanese B2B inquiry-form outreach pipeline using
 the OpenClaw browser plugin (Chrome with the openclaw profile) and the

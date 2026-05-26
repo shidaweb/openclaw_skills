@@ -1395,6 +1395,16 @@ def _escalate_dynamic_required(
         },
     )
     notify_post(f"{name} 想定外の必須項目（動的）: {labels}", level="warn")
+    _emit_event(
+        "send.escalated",
+        stage="send",
+        target_id=str(tid),
+        payload={
+            "field_count_unresolved": len(fields),
+            "slack_posted": True,
+            "reason": "dynamic_required",
+        },
+    )
 
 
 def _apply_plan_entry(
@@ -1756,6 +1766,12 @@ def _escalate_await_proceed(target: dict[str, Any], reason: str) -> None:
     notify_post(
         f"⚠️ {name} で reCAPTCHA / 確認待ちです。Slack で「{tid} 進めて」と返してください",
         level="warn",
+    )
+    _emit_event(
+        "send.escalated",
+        stage="send",
+        target_id=str(tid),
+        payload={"field_count_unresolved": 0, "slack_posted": True, "reason": reason[:120]},
     )
 
 

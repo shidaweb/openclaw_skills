@@ -120,6 +120,14 @@ class TestCookieDismiss(unittest.TestCase):
         self.assertEqual(cookie_consent_mode({"browser": {"cookie_consent": "skip"}}), "skip")
         self.assertEqual(cookie_consent_mode({}), "accept")
 
+    def test_deny_patterns_do_not_include_accept_phrases(self) -> None:
+        """§11-A-7 #19: deny list must not block legitimate accept labels."""
+        for accept in ("同意する", "すべて受け入れる", "受け入れる"):
+            for pat in ("同意しない", "拒否", "reject", "decline"):
+                self.assertIn(pat, DISMISS_COOKIE_BANNER_JS)
+            # accept strings are checked separately in ACCEPT_TEXT_PATTERNS
+            self.assertIn("ACCEPT_TEXT_PATTERNS", DISMISS_COOKIE_BANNER_JS)
+
     def test_apply_cookie_dismiss_calls_emit_on_success(self) -> None:
         events: list[str] = []
 

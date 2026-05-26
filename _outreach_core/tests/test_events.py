@@ -38,6 +38,10 @@ class TestEvents(unittest.TestCase):
         self.assertEqual(row["stage"], "draft")
         self.assertEqual(row["run_id"], "20260526-120000")
 
+    def test_guess_self_intro_variant(self) -> None:
+        body = "MDOnline を立ち上げ、患者と家族の二重顧客への接点設計をしてまいりました者として"
+        self.assertEqual(ev.guess_self_intro_variant(body), "V1")
+
     def test_redact_sender_strips_pii(self) -> None:
         sender = {"email": "secret@example.com", "company": "Torana"}
         obj = {"email": "secret@example.com", "note": "contact secret@example.com"}

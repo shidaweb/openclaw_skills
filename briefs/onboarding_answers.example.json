@@ -1,0 +1,36 @@
+{
+  "brief": {
+    "display_name": "Example Corp LINE CRM"
+  },
+  "sender": {
+    "company": "株式会社サンプル",
+    "name": "山田 太郎",
+    "role": "代表取締役",
+    "email": "taro@example.co.jp",
+    "phone": "03-0000-0000",
+    "full_address": "東京都千代田区1-1-1",
+    "calendar_url": "https://example.com/book"
+  },
+  "product": {
+    "one_liner": "LINE公式アカウント×CRMコンサル"
+  },
+  "problems_solved": [
+    "継続率の改善",
+    "休眠顧客の掘り起こし",
+    "本部主導の配信設計"
+  ],
+  "target": {
+    "industries": ["EdTech", "D2C"],
+    "size_band": "売上50億〜200億",
+    "decision_makers": ["マーケ責任者", "CRM担当"]
+  },
+  "pitch": {
+    "proof_points": ["事例A", "事例B", "事例C"],
+    "call_to_action": "30分の論点整理にお時間を頂戴できますと幸いに存じます"
+  },
+  "desired_channels": ["jp_form", "linkedin"],
+  "browser": {
+    "headless": true,
+    "cookie_consent": "accept"
+  }
+}
