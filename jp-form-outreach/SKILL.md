@@ -22,15 +22,81 @@ This skill drives a full Japanese B2B inquiry-form outreach pipeline using
 the OpenClaw browser plugin (Chrome with the openclaw profile) and the
 OpenClaw inference CLI (Sonnet for personalization, with prompt caching).
 
-## Model assumption (v3)
+## Model assumption (v4)
 
 | Layer | Model | Where configured |
 |---|---|---|
 | Slack で会話する OpenClaw エージェント | **Opus 4.7（固定）** | OpenClaw gateway（本リポジトリ外） |
-| `run.py draft` / `_llm_analyze_form` | **Sonnet 4.6** | `config.yaml` → `model.name` |
+| `run.py draft` / `_refine_draft` | **Opus 4.7** | `config.yaml` → `model.name` |
+| `_llm_analyze_form` | **Sonnet 4.6** | `config.yaml` → `model.form_analyzer_name` |
 | `verify.py` / webhook / heartbeat | **LLM なし** | `_outreach_core` |
 
-リスト生成・承認・needs_attention への質問は Opus エージェントが担当。
+リスト生成・enrich-research・承認・needs_attention への質問は Opus エージェントが担当。
+
+### Enrich research（v4）
+
+`enrich` の前に、エージェントが各社の PR TIMES / IR / プレスリリースを WebSearch で集め、`targets.yaml` または `enriched.jsonl` の `direct_signals` / `hook_context` を埋める。薄いまま draft すると `INSUFFICIENT_DATA` で SKIP されやすい。
+
+### Form scope（v4）
+
+`_FORM_FIELDS_JS` と `SCAN_REQUIRED_JS` は **textarea を含む最大の `<form>`** に限定。サンクスページのログインフォーム required は verify で無視（success 判定を先に行う）。
+
+### resolve --action proceed
+
+reCAPTCHA / 確認画面待ちで `needs_attention` になったら、ユーザーがブラウザ操作を終えたあと:
+
+```bash
+.venv/bin/python run.py resolve --target-id <id> --action proceed
+```
+
+### Draft quality gate（v4 B-6、エージェント主導）
+
+`run.py draft` 完了後、**preview の前**に Opus エージェントが `data/drafts.jsonl` を読み、各 draft を high / mid / low で評価:
+
+1. 冒頭が型 1–4 のどれか、直近2件と被っていないか
+2. 自己紹介が直前3件とコピペになっていないか
+3. 数字・固有事実が相手の業界構造に接続されているか
+4. `char_limit` / `max_chars_used` 以内か
+5. `INSUFFICIENT_DATA` でないか
+
+**low** だけ再生成:
+
+```bash
+.venv/bin/python run.py draft --refine --from-targets   # または enriched から対象 id のみ
+```
+
+一括でコストを抑える場合は初回を `--refine-only-if-low-quality` にし、low 評価分だけ `--refine` を回す。
+
+### 動的 required（v4 A-3）
+
+ラジオ選択後に出る必須項目は `fill_form_with_plan` が検知する。plan にあれば自動入力、なければ `needs_attention` + Slack → `resolve --field key=value` で再送。
+
+## OpenClaw エージェント: 進捗通知（必須）
+
+長時間タスクでは **約5分ごとに Slack へ状況を投稿**。詳細は [`docs/OPENCLAW_AGENT.md`](../docs/OPENCLAW_AGENT.md)。
+
+```bash
+cd ~/.openclaw/skills/jp-form-outreach
+nohup .venv/bin/python heartbeat_watch.py >> /tmp/doorman-hb.log 2>&1 &   # 手動段階実行時
+.venv/bin/python run.py campaign --limit 5 --clean   # または campaign（各 stage --heartbeat auto 推奨）
+.venv/bin/python heartbeat_watch.py --once           # 進捗どう？ / 5分ごとのフォロー
+```
+
+`run.py send` には `--heartbeat auto` を付ける（webhook または OpenClaw `botToken` 経由で約5分ごとに投稿）。
+
+### 構造化ログ（v4 §13）
+
+長時間キャンペーンでは `data/events.jsonl` と `data/traces/<run_id>/<target_id>/` にフルトレースが溜まる（Git 対象外）。`stage_campaign` 開始時に `run_id` が表示される。
+
+```bash
+cd ~/.openclaw/skills
+PYTHONPATH=. jp-form-outreach/.venv/bin/python -m _outreach_core.helpers.report draft-quality --since 7d
+PYTHONPATH=. jp-form-outreach/.venv/bin/python -m _outreach_core.helpers.report send-funnel --since 7d
+PYTHONPATH=. jp-form-outreach/.venv/bin/python -m _outreach_core.helpers.report inspect --target-id <id>
+PYTHONPATH=. jp-form-outreach/.venv/bin/python -m _outreach_core.helpers.report improvements --since 7d
+PYTHONPATH=. jp-form-outreach/.venv/bin/python -m _outreach_core.helpers.report prune --keep 90 --dry-run
+PYTHONPATH=. jp-form-outreach/.venv/bin/python -m _outreach_core.helpers.record_enrich_research --from-jsonl jp-form-outreach/data/enriched.jsonl
+```
 
 ## The Outreach Pattern (canonical 6-phase contract)
 
@@ -51,7 +117,7 @@ skip/sent history files.
 |---|---|---|---|---|---|
 | 1 | **Pull** | Source companies | targets.yaml (curated list) | `data/leads.jsonl` (id, name, form_url, industry, hook_context) | none |
 | 2 | **Enrich** | Per-company form structure | leads.jsonl + browser | `data/enriched.jsonl` (+ form_fields, char_limit, captcha, flow) | none |
-| 3 | **Personalize** | Compose | enriched.jsonl + config.yaml | `data/drafts.jsonl` (+ draft.subject/body OR SKIP) | Sonnet, cached system prompt |
+| 3 | **Personalize** | Compose | enriched.jsonl + config.yaml | `data/drafts.jsonl` (+ draft.subject/body OR SKIP) | Opus (`model.name`), cached system prompt |
 | 4 | **Approve** | Human review | drafts.jsonl | selected ids | none |
 | 5 | **Send** | Dispatch | form_url, body, field_map | (browser action: fill → 確認 → 送信) | none |
 | 6 | **Log** | Audit trail | sent companies | `data/sent_history.jsonl` | none |
@@ -123,7 +189,20 @@ Do NOT use for:
 | **"Build target list" / "リスト作って"** | List build flow（§下記） |
 | **"進捗どう？"** | `tail -n 20 data/current_task.jsonl` を要約 |
 | **needs_attention への回答** | `… run.py resolve --target-id <id> --field 業界=その他` |
+| **「<id>進めて」**（reCAPTCHA/確認待ち） | `… run.py resolve --target-id <id> --action proceed` |
+| **「丁寧モードで draft」/「refine ありで」** | `… run.py draft --refine`（既定でも refine ON — `draft.refine_default`） |
+| **「refine なしで」** | `… run.py draft --no-refine` |
+| **コスト抑えて refine** | `… run.py draft --refine-only-if-low-quality` → 品質ゲート後に low だけ `--refine` |
 | **"全部止めて"** | `pkill -f "run.py send"` |
+| **「品質ポイント教えて」/「draft 品質どう？」** | `python3 -m _outreach_core.helpers.report draft-quality --since 7d` |
+| **「送信ファネル見せて」** | `python3 -m _outreach_core.helpers.report send-funnel --since 7d` |
+| **「needs_attention まとめて」** | `python3 -m _outreach_core.helpers.report needs-attention` |
+| **「<会社>のトレース見たい」** | `python3 -m _outreach_core.helpers.report inspect --target-id <id>` |
+| **「verify 緩め」** | `run.py send --ids N --verify-strict false` |
+| **「今週の改善ポイント 3 つ」** | `report improvements --since 7d` を要約して Slack 返信 |
+| **enrich-research 完了後** | `record_enrich_research --from-jsonl data/enriched.jsonl` |
+| **ログ掃除（90日）** | `report prune --keep 90` |
+| **特殊フォーム（再 plan）** | `run.py send --ids N --iterative-fill --auto-send` |
 
 ## Send flow (with Slack confirmation)
 

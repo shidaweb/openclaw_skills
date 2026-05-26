@@ -21,7 +21,8 @@ Python utilities shared by `linkedin-outreach` and `jp-form-outreach`.
 | `prompt.py` | cache-stable `build_system_block`, `extract_first_json` |
 | `draft.py` / `preview.py` | Personalize / Approve helpers |
 | `verify.py` | post-send verification, `needs_attention.jsonl` |
-| `notify.py` | Slack **incoming webhook** one-way posts |
+| `notify.py` | Slack one-way posts (webhook or OpenClaw `botToken` + session channel) |
+| `openclaw_slack.py` | Read `~/.openclaw/openclaw.json` + sessions for bot/channel |
 | `progress.py` | `current_task.jsonl` + optional heartbeat |
 | `config.py` | `load_merged_config`, `sender_brief.yaml` merge |
 | `helpers/dump_exclude_set.py` | JSON exclude sets for agent |

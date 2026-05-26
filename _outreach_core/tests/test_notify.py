@@ -15,7 +15,15 @@ from _outreach_core import notify
 class TestNotify(unittest.TestCase):
     def test_no_webhook_returns_false(self) -> None:
         with mock.patch.object(notify, "_webhook_url", return_value=""):
-            self.assertFalse(notify.post("hello"))
+            with mock.patch.object(notify, "openclaw_slack_ready", return_value=False):
+                self.assertFalse(notify.post("hello"))
+
+    def test_openclaw_bot_api_path(self) -> None:
+        with mock.patch.object(notify, "_webhook_url", return_value=""):
+            with mock.patch.object(notify, "openclaw_slack_ready", return_value=True):
+                with mock.patch.object(notify, "_post_slack_api", return_value=True) as api:
+                    self.assertTrue(notify.post("pipeline ok"))
+                    api.assert_called_once()
 
     def test_never_raises_on_failure(self) -> None:
         with mock.patch.object(notify, "_webhook_url", return_value="http://127.0.0.1:9/"):

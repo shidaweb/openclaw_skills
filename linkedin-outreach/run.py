@@ -33,7 +33,7 @@ from _outreach_core import infer as core_infer
 from _outreach_core import preview as core_preview
 from _outreach_core import prompt as core_prompt
 from _outreach_core.config import load_merged_config
-from _outreach_core.progress import HeartbeatSession
+from _outreach_core.progress import HeartbeatSession, resolve_heartbeat_mode
 from _outreach_core.verify import (
     close_needs_attention,
     handle_verify_result,
@@ -531,8 +531,16 @@ def _extract_leads_from_dom() -> list[dict[str, Any]]:
     return []
 
 
-def stage_fetch_leads(search_url: str, limit: int, out_path: Path,
-                       ignore_skip_history: bool = False) -> None:
+def stage_fetch_leads(
+    search_url: str,
+    limit: int,
+    out_path: Path,
+    ignore_skip_history: bool = False,
+    heartbeat: str | None = None,
+) -> None:
+    hb_mode = resolve_heartbeat_mode(heartbeat, task="fetch-leads")
+    hb = HeartbeatSession(SKILL_DIR, "fetch-leads", limit, heartbeat=hb_mode, data_dir=DATA_DIR)
+    hb.start("Sales Nav 検索を開いています")
     print(f"[fetch-leads] navigating to {search_url}")
     oc_browser("open", search_url)
     time.sleep(RATE_LIMIT_SECONDS)
@@ -547,17 +555,21 @@ def stage_fetch_leads(search_url: str, limit: int, out_path: Path,
 
     page = 1
     while len(all_leads) < limit and page <= 8:
-        # Make sure all lead cards on this page are loaded into the DOM
         _scroll_page(steps=10)
 
         page_leads = _extract_leads_from_dom()
-        new = [l for l in page_leads
-               if l["id"] not in seen_ids
-               and l["id"] not in skip_ids
-               and l["id"] not in sent_ids]
-        skipped_by_history = len([l for l in page_leads
-                                   if l["id"] not in seen_ids
-                                   and (l["id"] in skip_ids or l["id"] in sent_ids)])
+        new = [
+            l
+            for l in page_leads
+            if l["id"] not in seen_ids and l["id"] not in skip_ids and l["id"] not in sent_ids
+        ]
+        skipped_by_history = len(
+            [
+                l
+                for l in page_leads
+                if l["id"] not in seen_ids and (l["id"] in skip_ids or l["id"] in sent_ids)
+            ]
+        )
         for l in new:
             seen_ids.add(l["id"])
         msg = f"[fetch-leads] page {page}: extracted {len(page_leads)} from DOM, {len(new)} new"
@@ -566,6 +578,7 @@ def stage_fetch_leads(search_url: str, limit: int, out_path: Path,
         msg += f" (total {len(all_leads) + len(new)})"
         print(msg)
         all_leads.extend(new)
+        hb.tick(min(len(all_leads), limit), f"page {page}: {len(all_leads)} leads collected")
 
         if len(all_leads) >= limit:
             break
@@ -573,9 +586,12 @@ def stage_fetch_leads(search_url: str, limit: int, out_path: Path,
             print("[fetch-leads] no new leads on this page; stopping")
             break
 
-        # Advance to next page via URL parameter (Sales Nav supports &page=N)
         page += 1
-        next_url = search_url + f"&page={page}" if "&page=" not in search_url else re.sub(r"&page=\d+", f"&page={page}", search_url)
+        next_url = (
+            search_url + f"&page={page}"
+            if "&page=" not in search_url
+            else re.sub(r"&page=\d+", f"&page={page}", search_url)
+        )
         print(f"[fetch-leads] navigating to page {page}: {next_url}")
         oc_browser("open", next_url)
         time.sleep(RATE_LIMIT_SECONDS)
@@ -597,6 +613,7 @@ def stage_fetch_leads(search_url: str, limit: int, out_path: Path,
         sample_path.write_text(last_snap)
 
     print(f"[fetch-leads] wrote {len(all_leads)} leads -> {out_path}")
+    hb.end(f"fetch-leads 完了: {len(all_leads)} 件 → {out_path.name}")
 
 
 # ============================================================================
@@ -863,8 +880,14 @@ def stage_campaign(
     clean: bool,
     skip_lookup: bool,
     skip_send: bool,
+    heartbeat: str | None = None,
 ) -> None:
     """Run the canonical outreach pipeline end-to-end."""
+    from _outreach_core.infer import browser_headless_preference, oc_browser_start
+
+    if browser_headless_preference():
+        oc_browser_start(headless=True)
+
     bar = "=" * 70
 
     if clean:
@@ -885,8 +908,13 @@ def stage_campaign(
                               ignore_skip_history=False)
     elif search_url:
         print(f"\n[campaign] (1) fetch-leads from Sales Nav saved search")
-        stage_fetch_leads(search_url, limit, DATA_DIR / "leads.jsonl",
-                           ignore_skip_history=False)
+        stage_fetch_leads(
+            search_url,
+            limit,
+            DATA_DIR / "leads.jsonl",
+            ignore_skip_history=False,
+            heartbeat=heartbeat,
+        )
     else:
         print("[campaign] need --input <csv> or --search-url <url>", file=sys.stderr)
         return
@@ -899,7 +927,7 @@ def stage_campaign(
 
     # --- Phase 2: Enrich ---
     print(f"\n{bar}\n[2/6] ENRICH — profile detail + recent activity\n{bar}")
-    stage_enrich(DATA_DIR / "leads.jsonl", DATA_DIR / "enriched.jsonl")
+    stage_enrich(DATA_DIR / "leads.jsonl", DATA_DIR / "enriched.jsonl", heartbeat=heartbeat)
 
     enriched_n = sum(1 for line in (DATA_DIR / "enriched.jsonl").open() if line.strip())
     if enriched_n == 0:
@@ -914,7 +942,7 @@ def stage_campaign(
     except FileNotFoundError as e:
         print(f"[campaign] {e}", file=sys.stderr)
         return
-    stage_draft(DATA_DIR / "enriched.jsonl", DATA_DIR / "drafts.jsonl", cfg)
+    stage_draft(DATA_DIR / "enriched.jsonl", DATA_DIR / "drafts.jsonl", cfg, heartbeat=heartbeat)
 
     # Quick stats
     drafts = [json.loads(l) for l in (DATA_DIR / "drafts.jsonl").open() if l.strip()]
@@ -938,21 +966,26 @@ def stage_campaign(
 # Stage: enrich
 # ============================================================================
 
-def stage_enrich(input_path: Path, out_path: Path) -> None:
+def stage_enrich(input_path: Path, out_path: Path, heartbeat: str | None = None) -> None:
     leads = [json.loads(l) for l in input_path.open()]
     print(f"[enrich] {len(leads)} leads to enrich")
+    hb_mode = resolve_heartbeat_mode(heartbeat, task="enrich")
+    hb = HeartbeatSession(SKILL_DIR, "enrich", len(leads), heartbeat=hb_mode, data_dir=DATA_DIR)
+    hb.start(f"{len(leads)} 件のプロフィールを開きます")
     enriched: list[dict[str, Any]] = []
     for i, lead in enumerate(leads, 1):
-        print(f"[enrich] ({i}/{len(leads)}) {lead.get('name') or lead['id']}")
+        label = lead.get("name") or lead["id"]
+        print(f"[enrich] ({i}/{len(leads)}) {label}")
         oc_browser("open", lead["profile_url"])
         time.sleep(RATE_LIMIT_SECONDS)
         snap = oc_browser("snapshot")
         if snap is None:
             print(f"[enrich] failed snapshot for {lead['id']}, skipping")
+            hb.tick(i, f"enrich skip (snapshot failed): {label}")
             continue
         profile = parse_profile(snap)
         enriched.append({**lead, **profile, "_enriched_at": datetime.utcnow().isoformat() + "Z"})
-        # Save sample for first lead
+        hb.tick(i, f"enrich 完了: {label}")
         if i == 1:
             (DATA_DIR / "sample_profile.txt").write_text(snap)
 
@@ -960,6 +993,7 @@ def stage_enrich(input_path: Path, out_path: Path) -> None:
         for lead in enriched:
             f.write(json.dumps(lead, ensure_ascii=False) + "\n")
     print(f"[enrich] wrote {len(enriched)} enriched leads -> {out_path}")
+    hb.end(f"enrich 完了: {len(enriched)}/{len(leads)} 件")
 
 
 # ============================================================================
@@ -990,7 +1024,19 @@ def build_user_block(lead: dict[str, Any], max_chars: int) -> str:
 extract_first_json = core_prompt.extract_first_json
 
 
-def stage_draft(input_path: Path, out_path: Path, config: dict[str, Any]) -> None:
+def stage_draft(input_path: Path, out_path: Path, config: dict[str, Any], heartbeat: str | None = None) -> None:
+    leads_n = sum(1 for line in input_path.open() if line.strip())
+    hb_mode = resolve_heartbeat_mode(heartbeat, task="draft")
+    hb = HeartbeatSession(SKILL_DIR, "draft", leads_n, heartbeat=hb_mode, data_dir=DATA_DIR)
+    hb.start(f"Sonnet で {leads_n} 件ドラフト生成")
+
+    def _on_progress(current: int, total: int, message: str) -> None:
+        hb.tick(current, message)
+
+    from _outreach_core import events as ev
+
+    if not ev.get_context().data_dir:
+        ev.configure(skill="linkedin-outreach", data_dir=DATA_DIR)
     core_draft.stage_draft(
         input_path,
         out_path,
@@ -1000,7 +1046,13 @@ def stage_draft(input_path: Path, out_path: Path, config: dict[str, Any]) -> Non
         oc_infer_fn=oc_infer,
         append_skip_fn=append_skip_history,
         default_model=DEFAULT_MODEL,
+        on_progress=_on_progress,
+        skill="linkedin-outreach",
+        data_dir=DATA_DIR,
+        sender=config.get("sender"),
     )
+    drafts_n = sum(1 for line in out_path.open() if line.strip()) if out_path.exists() else 0
+    hb.end(f"draft 完了: {drafts_n} 件")
 
 
 # ============================================================================
@@ -1158,12 +1210,35 @@ _CLICK_SEND_JS = r"""
 
 _VERIFY_SENT_JS = r"""
 () => {
+  const text = (document.body && document.body.innerText) ? document.body.innerText : '';
+  const url = location.href || '';
+  const success = [
+    /message sent/i, /inmail sent/i, /successfully sent/i,
+    /your message has been sent/i, /送信しました/, /送信が完了/, /メッセージを送信/
+  ];
+  for (const re of success) {
+    if (re.test(text)) {
+      return { sent: true, reason: 'success banner/text on page', url, text: text.slice(0, 500) };
+    }
+  }
   const subj = document.querySelector(
     'input[id^="compose-form-subject"], input[aria-label="Subject (required)"]'
   );
-  // Compose modal closes after successful send → subject input is gone
-  if (!subj) return { sent: true, reason: 'compose modal closed' };
-  return { sent: false, reason: 'compose modal still open' };
+  if (!subj) {
+    return { sent: true, reason: 'compose modal closed', url, text: text.slice(0, 500) };
+  }
+  const err = document.querySelector(
+    '[role="alert"], .artdeco-inline-feedback--error, [data-test-artdeco-toast-item-type="error"]'
+  );
+  if (err) {
+    return {
+      sent: false,
+      reason: 'validation/error visible: ' + (err.textContent || '').trim().slice(0, 120),
+      url,
+      text: text.slice(0, 500),
+    };
+  }
+  return { sent: false, reason: 'compose modal still open', url, text: text.slice(0, 500) };
 }
 """
 
@@ -1390,15 +1465,21 @@ def stage_send(
             continue
 
         print(f"  [send] clicked Send button: {send_res.get('label')}")
-        time.sleep(3.0)
+        time.sleep(5.0)
 
-        # 6. Verify
+        # 6. Verify (JS page text + optional snapshot for keyword fallback)
         browser_verify = _verify_sent_via_js()
+        post_snap = oc_browser("snapshot")
+        snap_path = DATA_DIR / f"verify_snapshot_{d.get('id', idx)}.txt"
+        if post_snap:
+            snap_path.write_text(post_snap, encoding="utf-8")
         vresult = verify_send_completed(
             d,
             "linkedin",
+            snapshot=post_snap or "",
             browser_verify=browser_verify,
             data_dir=DATA_DIR,
+            snapshot_path=snap_path if post_snap else None,
         )
         outcome = handle_verify_result(d, vresult, DATA_DIR, channel="linkedin")
         if outcome != "sent_ok":
@@ -1467,8 +1548,20 @@ def stage_mark_sent(input_path: Path, ids: set[int]) -> None:
 # CLI
 # ============================================================================
 
+def _cli_heartbeat(args: argparse.Namespace, task: str) -> str | None:
+    hb = getattr(args, "heartbeat", "auto")
+    explicit = None if hb == "auto" else hb
+    return resolve_heartbeat_mode(explicit, task=task)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(prog="linkedin-outreach", description=__doc__)
+    ap.add_argument(
+        "--heartbeat",
+        choices=["auto", "slack", "off"],
+        default="auto",
+        help="Slack progress (auto=webhook+enabled_for in sender_brief.yaml; off=disable)",
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("fetch-leads", help="Scrape Sales Nav saved search")
@@ -1534,13 +1627,6 @@ def main() -> None:
                              help="Fill and click Send without prompting. Used by Slack agent AFTER user has confirmed.")
     mode_group.add_argument("--no-confirm", action="store_true",
                              help="Fill the compose modal and stop — human clicks Send manually.")
-    p.add_argument(
-        "--heartbeat",
-        default=None,
-        choices=["slack"],
-        help="Post progress to Slack incoming webhook every ~5 min",
-    )
-
     p = sub.add_parser("resolve", help="Close needs_attention and retry send")
     p.add_argument("--target-id", required=True)
     p.add_argument("--field", action="append", default=[], help="key=value (jp_form overrides)")
@@ -1559,10 +1645,16 @@ def main() -> None:
             clean=args.clean,
             skip_lookup=args.skip_lookup,
             skip_send=args.skip_send,
+            heartbeat=_cli_heartbeat(args, "campaign"),
         )
     elif args.cmd == "fetch-leads":
-        stage_fetch_leads(args.search_url, args.limit, Path(args.out),
-                          ignore_skip_history=args.ignore_skip_history)
+        stage_fetch_leads(
+            args.search_url,
+            args.limit,
+            Path(args.out),
+            ignore_skip_history=args.ignore_skip_history,
+            heartbeat=_cli_heartbeat(args, "fetch-leads"),
+        )
     elif args.cmd == "fetch-from-csv":
         stage_fetch_from_csv(Path(args.input), Path(args.out),
                              ignore_skip_history=args.ignore_skip_history)
@@ -1577,14 +1669,23 @@ def main() -> None:
     elif args.cmd == "history":
         stage_history(args.action)
     elif args.cmd == "enrich":
-        stage_enrich(Path(args.input_path), Path(args.out))
+        stage_enrich(
+            Path(args.input_path),
+            Path(args.out),
+            heartbeat=_cli_heartbeat(args, "enrich"),
+        )
     elif args.cmd == "draft":
         try:
             cfg = load_merged_config(SKILL_DIR)
         except FileNotFoundError as e:
             print(f"[draft] {e}", file=sys.stderr)
             sys.exit(2)
-        stage_draft(Path(args.input_path), Path(args.out), cfg)
+        stage_draft(
+            Path(args.input_path),
+            Path(args.out),
+            cfg,
+            heartbeat=_cli_heartbeat(args, "draft"),
+        )
     elif args.cmd == "preview":
         stage_preview(Path(args.input_path), interactive_send=not args.no_send)
     elif args.cmd == "send":
@@ -1595,7 +1696,7 @@ def main() -> None:
             mode = "fill-only"
         else:
             mode = "interactive"
-        stage_send(Path(args.input_path), ids, mode=mode, heartbeat=args.heartbeat)
+        stage_send(Path(args.input_path), ids, mode=mode, heartbeat=_cli_heartbeat(args, "send"))
     elif args.cmd == "resolve":
         fields: dict[str, str] = {}
         for item in args.field:

@@ -31,14 +31,17 @@ desired_channels:
   - "jp_form"
 
 slack:
-  incoming_webhook_url: ""   # one-way status posts (empty = notify no-op)
-  channel_id: ""             # align with OpenClaw Slack plugin channel
+  incoming_webhook_url: ""   # optional; if empty, uses OpenClaw ~/.openclaw/openclaw.json botToken
+  channel_id: ""             # optional override; else latest Slack channel from OpenClaw sessions (#general)
+
+# OpenClaw browser for fetch/enrich/send (profile: openclaw)
+browser:
+  headless: true   # true = no Chrome window; false = visible; omit = OpenClaw default
 
 heartbeat:
   interval_sec: 300
   enabled_for:
-    - "send"
-    - "enrich"
+    - "all"   # research, fetch-leads, enrich, draft, send, campaign
 
 # Reference only — Python oc_infer reads each skill's config.yaml model.name (Sonnet).
 notes_on_models: |

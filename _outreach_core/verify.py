@@ -15,13 +15,67 @@ from typing import Any, Callable
 
 FORM_SUCCESS_KEYWORDS = (
     "送信完了",
+    "送信を受け付け",
+    "受付完了",
     "ありがとうございました",
+    "お問い合わせありがとう",
+    "お問い合わせを受け付け",
+    "ご連絡ありがとう",
     "ご連絡",
+    "完了しました",
     "完了画面",
+    "送信が完了",
     "THANKS",
     "thank you",
-    "お問い合わせを受け付け",
+    "thank you for",
+    "successfully submitted",
+    "inquiry has been received",
+    "we have received",
 )
+
+LINKEDIN_SUCCESS_KEYWORDS = (
+    "message sent",
+    "inmail sent",
+    "successfully sent",
+    "your message has been sent",
+    "送信しました",
+    "送信が完了",
+    "メッセージを送信",
+)
+
+PAGE_EVIDENCE_JS = r"""
+() => ({
+  url: location.href,
+  title: document.title || '',
+  text: (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 16000),
+})
+"""
+
+
+def _norm(text: str) -> str:
+    return (text or "").casefold()
+
+
+def _text_has_keyword(text: str, keywords: tuple[str, ...]) -> bool:
+    hay = _norm(text)
+    return any(_norm(k) in hay for k in keywords)
+
+
+def _url_looks_like_success(url: str) -> bool:
+    u = _norm(url)
+    markers = (
+        "thanks",
+        "thank",
+        "complete",
+        "completed",
+        "success",
+        "done",
+        "finish",
+        "/thanks",
+        "arigato",
+        "kanryo",
+    )
+    return any(m in u for m in markers)
 FORM_ERROR_KEYWORDS = (
     "入力エラー",
     "未入力",
@@ -32,10 +86,20 @@ FORM_ERROR_KEYWORDS = (
     "エラーがあります",
 )
 
-SCAN_REQUIRED_JS = r"""
+PICK_TARGET_FORM_JS = r"""
 () => {
+  const forms = [...document.querySelectorAll('form')];
+  const withTextarea = forms.filter(f => f.querySelector('textarea'));
+  withTextarea.sort((a, b) =>
+    b.querySelectorAll('input,select,textarea').length -
+    a.querySelectorAll('input,select,textarea').length);
+  return withTextarea[0] || forms[0] || document.body;
+}
+"""
+
+_SCAN_REQUIRED_BODY = r"""
   const empty = [];
-  for (const el of document.querySelectorAll('[required]')) {
+  for (const el of root.querySelectorAll('[required]')) {
     let isEmpty = false;
     const tag = el.tagName;
     if (tag === 'SELECT') isEmpty = !el.value;
@@ -53,8 +117,41 @@ SCAN_REQUIRED_JS = r"""
     }
   }
   return { empty_required: empty };
-}
 """
+
+SCAN_REQUIRED_JS = (
+    r"""
+() => {
+  const root = ("""
+    + PICK_TARGET_FORM_JS.strip()
+    + r""")();
+"""
+    + _SCAN_REQUIRED_BODY
+    + "\n}\n"
+)
+
+
+def build_scan_required_js(target: dict[str, Any] | None = None) -> str:
+    """Prefer enrich-time form_root_selector; fall back to textarea heuristic."""
+    sel = (target or {}).get("form_root_selector")
+    if not sel:
+        return SCAN_REQUIRED_JS
+    sel_lit = json.dumps(sel)
+    return (
+        r"""
+() => {
+  let root = document.querySelector("""
+        + sel_lit
+        + r""");
+  if (!root) {
+    root = ("""
+        + PICK_TARGET_FORM_JS.strip()
+        + r""")();
+  }
+"""
+        + _SCAN_REQUIRED_BODY
+        + "\n}\n"
+    )
 
 
 def needs_attention_path(data_dir: Path) -> Path:
@@ -115,6 +212,15 @@ def _plan_field_names(plan: dict[str, Any] | None) -> set[str]:
     return names
 
 
+def _jp_form_success_confirmed(evidence: dict[str, Any]) -> bool:
+    """Strong success: keyword on page AND (thanks URL OR no error banner)."""
+    if not evidence.get("has_success_keyword"):
+        return False
+    if evidence.get("url_success"):
+        return True
+    return not evidence.get("has_error_keyword")
+
+
 def _required_not_in_plan(target: dict[str, Any], plan: dict[str, Any] | None) -> list[dict[str, Any]]:
     form_fields = target.get("form_fields") or {}
     planned = _plan_field_names(plan)
@@ -151,6 +257,7 @@ def verify_send_completed(
     evaluate_fn: Callable[[str], Any] | None = None,
     data_dir: Path | None = None,
     snapshot_path: Path | None = None,
+    verify_strict: bool = True,
 ) -> dict[str, Any]:
     """
     Returns dict with status: ok | uncertain | needs_attention, reason, evidence, etc.
@@ -160,38 +267,79 @@ def verify_send_completed(
     unresolved_fields: list[dict[str, Any]] = []
 
     if channel == "linkedin":
+        snap = snapshot or ""
+        page = browser_verify if isinstance(browser_verify, dict) else {}
+        page_text = snap or str(page.get("text") or "")
+        page_url = str(page.get("url") or "")
+        evidence = {"browser_verify": browser_verify, "url": page_url or None}
+
+        if page_text and _text_has_keyword(page_text, LINKEDIN_SUCCESS_KEYWORDS):
+            return {
+                "status": "ok",
+                "reason": f"{name}: 送信成功メッセージをページ上で確認",
+                "evidence": {**evidence, "matched": "linkedin_keywords"},
+                "snapshot_path": str(snapshot_path) if snapshot_path else None,
+                "unresolved_fields": None,
+            }
+        if page_url and _url_looks_like_success(page_url):
+            return {
+                "status": "ok",
+                "reason": f"{name}: 送信後 URL を確認 ({page_url[:80]})",
+                "evidence": {**evidence, "matched": "url"},
+                "snapshot_path": str(snapshot_path) if snapshot_path else None,
+                "unresolved_fields": None,
+            }
         if browser_verify and browser_verify.get("sent"):
             return {
                 "status": "ok",
                 "reason": browser_verify.get("reason", "compose modal closed"),
-                "evidence": browser_verify,
+                "evidence": evidence,
                 "snapshot_path": str(snapshot_path) if snapshot_path else None,
                 "unresolved_fields": None,
             }
+        reason = (browser_verify or {}).get("reason", "送信完了を確認できません（モーダルが開いたまま等）")
         return {
             "status": "uncertain",
-            "reason": (browser_verify or {}).get("reason", "送信完了を確認できません"),
-            "evidence": browser_verify or {},
+            "reason": f"{name}: {reason}",
+            "evidence": evidence,
             "snapshot_path": str(snapshot_path) if snapshot_path else None,
             "unresolved_fields": None,
         }
 
     # jp_form (and generic form channel)
     snap = snapshot or ""
+    page_url = ""
+    if isinstance(browser_verify, dict):
+        page_url = str(browser_verify.get("url") or "")
+        extra = str(browser_verify.get("text") or "")
+        if extra and extra not in snap:
+            snap = f"{snap}\n{extra}"
+    if page_url:
+        evidence["url_success"] = _url_looks_like_success(page_url)
     if snap:
-        evidence["has_success_keyword"] = any(k in snap for k in FORM_SUCCESS_KEYWORDS)
-        evidence["has_error_keyword"] = any(k in snap for k in FORM_ERROR_KEYWORDS)
-        if evidence["has_error_keyword"]:
-            return {
-                "status": "needs_attention",
-                "reason": f"{name}: 確認画面にエラーメッセージが検出されました",
-                "evidence": evidence,
-                "snapshot_path": str(snapshot_path) if snapshot_path else None,
-                "unresolved_fields": unresolved_fields or None,
-            }
+        evidence["has_success_keyword"] = _text_has_keyword(snap, FORM_SUCCESS_KEYWORDS)
+        evidence["has_error_keyword"] = _text_has_keyword(snap, FORM_ERROR_KEYWORDS)
 
-    if evaluate_fn:
-        scan = evaluate_fn(SCAN_REQUIRED_JS)
+    if evidence.get("has_error_keyword"):
+        return {
+            "status": "needs_attention",
+            "reason": f"{name}: 確認画面にエラーメッセージが検出されました",
+            "evidence": evidence,
+            "snapshot_path": str(snapshot_path) if snapshot_path else None,
+            "unresolved_fields": None,
+        }
+
+    if _jp_form_success_confirmed(evidence):
+        return {
+            "status": "ok",
+            "reason": f"{name}: 送信完了画面を確認",
+            "evidence": evidence,
+            "snapshot_path": str(snapshot_path) if snapshot_path else None,
+            "unresolved_fields": None,
+        }
+
+    if verify_strict and evaluate_fn:
+        scan = evaluate_fn(build_scan_required_js(target))
         if isinstance(scan, dict):
             empty = scan.get("empty_required") or []
             evidence["empty_required"] = empty
@@ -199,7 +347,11 @@ def verify_send_completed(
                 if isinstance(item, dict):
                     unresolved_fields.append(item)
 
-    plan_gaps = _required_not_in_plan(target, plan or target.get("_llm_plan"))
+    plan_gaps = (
+        _required_not_in_plan(target, plan or target.get("_llm_plan"))
+        if verify_strict
+        else []
+    )
     for g in plan_gaps:
         if g not in unresolved_fields:
             unresolved_fields.append(g)
@@ -218,30 +370,24 @@ def verify_send_completed(
             "unresolved_fields": unresolved_fields,
         }
 
-    if snap and any(k in snap for k in FORM_SUCCESS_KEYWORDS):
-        return {
-            "status": "ok",
-            "reason": f"{name}: 送信完了画面を確認",
-            "evidence": evidence,
-            "snapshot_path": str(snapshot_path) if snapshot_path else None,
-            "unresolved_fields": None,
-        }
-
     if snap and not evidence.get("has_success_keyword"):
+        hint = ""
+        if page_url:
+            hint = f" (url={page_url[:100]})"
         return {
             "status": "uncertain",
-            "reason": f"{name}: 送信完了画面が確認できません",
+            "reason": f"{name}: 送信完了画面が確認できません{hint}",
             "evidence": evidence,
             "snapshot_path": str(snapshot_path) if snapshot_path else None,
             "unresolved_fields": None,
         }
 
-    if browser_verify is not None:
+    if browser_verify is not None and browser_verify.get("sent") is not None:
         ok = bool(browser_verify.get("sent"))
         return {
             "status": "ok" if ok else "uncertain",
-            "reason": browser_verify.get("reason", ""),
-            "evidence": browser_verify,
+            "reason": f"{name}: {browser_verify.get('reason', '')}",
+            "evidence": {**evidence, "browser_verify": browser_verify},
             "snapshot_path": str(snapshot_path) if snapshot_path else None,
             "unresolved_fields": None,
         }
@@ -253,6 +399,41 @@ def verify_send_completed(
         "snapshot_path": str(snapshot_path) if snapshot_path else None,
         "unresolved_fields": None,
     }
+
+
+def scan_empty_required(
+    evaluate_fn: Callable[[str], Any],
+    target: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Return empty required fields inside the target form (scoped scan JS)."""
+    scan = evaluate_fn(build_scan_required_js(target))
+    if not isinstance(scan, dict):
+        return []
+    return [x for x in (scan.get("empty_required") or []) if isinstance(x, dict)]
+
+
+def _field_key(item: dict[str, Any]) -> str:
+    return str(item.get("name") or item.get("label") or "").strip()
+
+
+def scan_new_required_after_fill(
+    evaluate_fn: Callable[[str], Any],
+    *,
+    baseline_empty_names: set[str],
+    filled_names: set[str],
+    target: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """
+  After a plan field is applied: return newly visible empty required fields
+  (not in baseline, not already filled).
+    """
+    newly: list[dict[str, Any]] = []
+    for item in scan_empty_required(evaluate_fn, target):
+        key = _field_key(item)
+        if not key or key in filled_names or key in baseline_empty_names:
+            continue
+        newly.append(item)
+    return newly
 
 
 def handle_verify_result(
@@ -272,6 +453,7 @@ def handle_verify_result(
 
     if status == "ok":
         notify_post(f"{name} 送信完了", level="info")
+        _emit_send_event(target, result, channel, "sent_ok")
         return "sent_ok"
 
     entry = {
@@ -291,7 +473,54 @@ def handle_verify_result(
             f"{f.get('type', '?')}: {f.get('label') or f.get('name')}" for f in fields[:5]
         )
         notify_post(f"{name} 想定外の入力項目: {field_txt}", level="warn")
+        _emit_send_event(target, result, channel, "needs_attention", escalated=True)
         return "needs_attention"
 
-    notify_post(f"{name} 送信完了が確認できません: {result.get('reason', '')}", level="warn")
+    reason = str(result.get("reason") or "")
+    prefix = f"{name}: "
+    if reason.startswith(prefix):
+        reason = reason[len(prefix) :]
+    notify_post(f"{name} 送信完了が確認できません: {reason}", level="warn")
+    _emit_send_event(target, result, channel, "uncertain")
     return "uncertain"
+
+
+def _emit_send_event(
+    target: dict[str, Any],
+    result: dict[str, Any],
+    channel: str,
+    outcome: str,
+    *,
+    escalated: bool = False,
+) -> None:
+    try:
+        from _outreach_core import events as ev
+
+        if not ev.get_context().data_dir:
+            return
+        tid = str(target.get("id") or "")
+        ev.emit(
+            "send.verify.completed",
+            stage="send",
+            target_id=tid or None,
+            outcome=outcome,
+            payload={
+                "status": result.get("status"),
+                "reason": (result.get("reason") or "")[:200],
+                "evidence_keys": list((result.get("evidence") or {}).keys()),
+                "channel": channel,
+            },
+            trace_dir=result.get("snapshot_path"),
+        )
+        if escalated:
+            ev.emit(
+                "send.escalated",
+                stage="send",
+                target_id=tid or None,
+                payload={
+                    "field_count_unresolved": len(result.get("unresolved_fields") or []),
+                    "slack_posted": True,
+                },
+            )
+    except Exception:
+        pass

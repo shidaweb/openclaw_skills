@@ -11,7 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from _outreach_core.progress import HeartbeatSession
+from _outreach_core.progress import HeartbeatSession, resolve_heartbeat_mode
 
 
 class TestProgress(unittest.TestCase):
@@ -41,6 +41,18 @@ class TestProgress(unittest.TestCase):
                     time.sleep(2.5)
                     hb.end()
             self.assertTrue(post.called)
+
+
+    def test_resolve_auto_respects_enabled_for(self) -> None:
+        brief = {
+            "slack": {"incoming_webhook_url": "https://hooks.slack.com/test"},
+            "heartbeat": {"enabled_for": ["enrich"]},
+        }
+        with mock.patch("_outreach_core.progress.load_sender_brief", return_value=brief):
+            with mock.patch("_outreach_core.progress.webhook_configured", return_value=True):
+                self.assertEqual(resolve_heartbeat_mode(None, task="enrich"), "slack")
+                self.assertIsNone(resolve_heartbeat_mode(None, task="draft"))
+                self.assertEqual(resolve_heartbeat_mode("off", task="enrich"), None)
 
 
 if __name__ == "__main__":

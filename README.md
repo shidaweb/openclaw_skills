@@ -12,6 +12,8 @@ OpenClaw skills for outbound outreach. Sister skills share a canonical
 
 See each skill's `SKILL.md` for the spec and usage.
 
+**OpenClaw エージェント向け（5分毎 Slack 進捗）:** [`docs/OPENCLAW_AGENT.md`](./docs/OPENCLAW_AGENT.md)
+
 ## Install
 
 ```bash

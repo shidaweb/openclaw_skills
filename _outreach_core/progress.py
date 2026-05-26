@@ -11,8 +11,48 @@ from pathlib import Path
 from typing import Any
 
 from _outreach_core.config import heartbeat_interval_sec, load_merged_config, load_sender_brief
+from _outreach_core.notify import webhook_configured
 
 _log = logging.getLogger(__name__)
+
+# Tasks that may auto-enable Slack heartbeat when webhook + enabled_for allow it.
+_ALL_TASKS = frozenset(
+    {
+        "research",
+        "campaign",
+        "fetch-leads",
+        "fetch-from-csv",
+        "enrich",
+        "draft",
+        "send",
+    }
+)
+
+
+def resolve_heartbeat_mode(explicit: str | None, *, task: str) -> str | None:
+    """
+    Resolve heartbeat for a stage.
+
+    explicit: None or \"auto\" → use sender_brief (webhook + heartbeat.enabled_for).
+    \"slack\" → force on (notify no-ops if webhook empty).
+    \"off\" → force off.
+    """
+    if explicit == "off":
+        return None
+    if explicit == "slack":
+        return "slack"
+    if not webhook_configured():
+        return None
+    brief = load_sender_brief()
+    hb = brief.get("heartbeat") or {}
+    enabled = hb.get("enabled_for")
+    if enabled is not None:
+        allowed = {str(x) for x in enabled}
+        if not (allowed & {"all", "*"} or task in allowed):
+            return None
+    elif task not in _ALL_TASKS:
+        return None
+    return "slack"
 
 
 def current_task_path(data_dir: Path) -> Path:
@@ -69,6 +109,20 @@ class HeartbeatSession:
             self._thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
             self._thread.start()
 
+    def note(self, message: str) -> None:
+        """Update last action + log without changing progress counter."""
+        self._last_action = message
+        _append_event(
+            self.data_dir,
+            {
+                "event": "note",
+                "task": self.task,
+                "current": self._current,
+                "total": self.total,
+                "message": message,
+            },
+        )
+
     def tick(self, current: int, message: str = "") -> None:
         self._current = current
         self._last_action = message or f"completed item {current}/{self.total}"
@@ -106,6 +160,27 @@ class HeartbeatSession:
 
             post(summary, level="info")
 
+    def _refresh_from_log(self) -> None:
+        """Pick up child-stage ticks written to current_task.jsonl by subprocesses."""
+        path = current_task_path(self.data_dir)
+        if not path.is_file():
+            return
+        try:
+            lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            if not lines:
+                return
+            ev = json.loads(lines[-1])
+            if ev.get("task"):
+                self.task = str(ev["task"])
+            if ev.get("current") is not None:
+                self._current = int(ev.get("current") or 0)
+            if ev.get("total") is not None:
+                self.total = int(ev.get("total") or self.total)
+            if ev.get("message"):
+                self._last_action = str(ev["message"])
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return
+
     def _heartbeat_loop(self) -> None:
         from _outreach_core.notify import post
 
@@ -113,6 +188,7 @@ class HeartbeatSession:
         while not self._stop.wait(5.0):
             if not self._started_at:
                 continue
+            self._refresh_from_log()
             elapsed = time.time() - self._started_at
             if elapsed < self._interval:
                 continue
@@ -123,6 +199,21 @@ class HeartbeatSession:
                 f"[{self.task}] {self._current}/{self.total} 件目 · 経過 {mins} 分 · {self._last_action}",
                 level="info",
             )
+            try:
+                from _outreach_core import events as ev
+
+                if ev.get_context().data_dir:
+                    ev.emit(
+                        "heartbeat.tick",
+                        stage=self.task,
+                        payload={
+                            "current": self._current,
+                            "total": self.total,
+                            "elapsed_sec": int(elapsed),
+                        },
+                    )
+            except Exception:
+                pass
             last_post = time.time()
 
     def __enter__(self) -> HeartbeatSession:

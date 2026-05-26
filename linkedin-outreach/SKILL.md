@@ -20,15 +20,51 @@ This skill drives a full LinkedIn InMail outreach pipeline using the OpenClaw
 browser plugin (Chrome with the user's signed-in profile) and the OpenClaw
 inference CLI (Sonnet for personalization, with prompt caching).
 
-## Model assumption (v3)
+## Model assumption (v4)
 
 | Layer | Model | Where configured |
 |---|---|---|
 | Slack で会話する OpenClaw エージェント | **Opus 4.7（固定）** | OpenClaw gateway / agent profile（本リポジトリ外） |
-| `run.py draft` / enrich 内の `oc_infer` | **Sonnet 4.6** | `config.yaml` → `model.name` |
+| `run.py draft` / `_refine_draft` | **Opus 4.7** | `config.yaml` → `model.name`（`claude-cli/claude-opus-4-7`） |
 | `verify.py` / webhook / heartbeat | **LLM なし** | `_outreach_core`（純 Python） |
 
 リスト生成・承認・needs_attention への質問は **Opus エージェント**が担当。Python から Opus を呼ぶ CLI は作らない。
+
+## OpenClaw エージェント: 進捗通知（必須）
+
+長時間タスク（リサーチ・enrich・draft・send・campaign）では **ユーザーが不安にならないよう、約5分ごとに Slack へ状況を出す**。口だけ「進捗を共有します」は禁止。
+
+### やること（この順）
+
+1. **パイプライン起動** — 必ず次のいずれか（`--heartbeat auto` が既定）:
+   ```bash
+   cd ~/.openclaw/skills/linkedin-outreach
+   .venv/bin/python research.py --clean --limit 10
+   # または
+   .venv/bin/python run.py campaign --search-url "..." --limit 10 --clean
+   ```
+   `research.py` は内部で `heartbeat_watch.py` も起動し、サブプロセス中も Slack に投稿する。
+
+2. **手動で run.py を段階実行する場合** — 先にバックグラウンド watcher を起動:
+   ```bash
+   cd ~/.openclaw/skills/linkedin-outreach
+   nohup .venv/bin/python heartbeat_watch.py >> /tmp/doorman-hb.log 2>&1 &
+   # 完了後: kill %1  （またはプロセスを terminate）
+   ```
+
+3. **待機中・「進捗どう？」** — 5分経過ごと、またはユーザーが聞いたら:
+   ```bash
+   .venv/bin/python pipeline_status.py
+   .venv/bin/python heartbeat_watch.py --once
+   ```
+   出力を **Slack スレッドに要約して投稿**（ログを貼るだけでも可）。
+
+4. **終了時** — `research` / `campaign` のサマリ + sendable 件数 + 「送信はまだ。N番送ってと言ってください」。
+
+### 投稿経路
+
+- Python: `notify.py` → OpenClaw `channels.slack.botToken` + 直近セッションの `#general` 等
+- ログ: `data/current_task.jsonl`（`pipeline_status.py` で人間可読）
 
 ## The Outreach Pattern (canonical 6-phase contract)
 
@@ -48,7 +84,7 @@ outreach skill (form-outreach, email-outreach, etc.) should mirror.
 |---|---|---|---|---|---|
 | 1 | **Pull** | Source leads | Sales Nav saved search URL OR curated CSV | `data/leads.jsonl` (id, name, profile_url) | none |
 | 2 | **Enrich** | Per-lead deep context | leads.jsonl + browser | `data/enriched.jsonl` (+ headline/about/recent_activity) | none |
-| 3 | **Personalize** | Compose | enriched.jsonl + config.yaml | `data/drafts.jsonl` (+ draft.subject/body OR SKIP) | Sonnet, cached system prompt |
+| 3 | **Personalize** | Compose | enriched.jsonl + config.yaml | `data/drafts.jsonl` (+ draft.subject/body OR SKIP) | Opus (`model.name`), cached system prompt |
 | 4 | **Approve** | Human review | drafts.jsonl | selected ids | none |
 | 5 | **Send** | Dispatch | profile_url, subject, body | (browser action) | none |
 | 6 | **Log** | Audit trail | sent leads | `data/sent_history.jsonl` | none |
@@ -116,7 +152,7 @@ draft → preview into one command.
 | **"Run the campaign" / "キャンペーン回して"** | `cd ~/.openclaw/skills/linkedin-outreach && .venv/bin/python run.py campaign --input targets.csv --limit 5 --clean` |
 | **"Campaign without sending" / "送らずに draft まで"** | `… run.py campaign --input targets.csv --limit 5 --skip-send` |
 | **"Run from saved search not CSV" / "保存検索でcampaign"** | `… run.py campaign --search-url "<url>" --limit 10 --clean` |
-| "Run a 10-lead research" / "10件リサーチして" | `cd ~/.openclaw/skills/linkedin-outreach && .venv/bin/python research.py --clean --limit 10` |
+| "Run a 10-lead research" / "10件リサーチして" | `cd ~/.openclaw/skills/linkedin-outreach && .venv/bin/python research.py --clean --limit 10`（**進捗は自動で約5分毎 Slack**） |
 | "Just 5 this time" / "5件だけ" | `… research.py --clean --limit 5` |
 | "Show me the drafts" / "ドラフト見せて" | `… run.py preview --no-send` (display only, no prompt) |
 | "Review and send" / "確認して送って" | `… run.py preview` (prompts at end: all / IDs / n) — chains into send |
@@ -129,7 +165,7 @@ draft → preview into one command.
 | **"Look up LinkedIn URLs" / "URL自動取得して" / "name+companyからURL埋めて"** | `… run.py lookup-urls --input targets.csv` |
 | **"First N URLs only" / "Tier 1だけ自動で"** | `… run.py lookup-urls --input targets.csv --limit 5` |
 | **"Build target list" / "リスト作って"** | List build flow（§下記）— WebSearch + `dump_exclude_set` + `append_targets` |
-| **"進捗どう？" / "今何してる？"** | `tail -n 20 data/current_task.jsonl` を要約して返す |
+| **"進捗どう？" / "今何してる？"** | `cd …/linkedin-outreach && .venv/bin/python pipeline_status.py` または `tail -n 20 data/current_task.jsonl` を要約 |
 | **"<会社>に <値> で送って"** (needs_attention 応答) | `… run.py resolve --target-id <id> --field key=value` |
 | **"全部止めて"** | `pkill -f "run.py send"` + 必要なら webhook で中断通知 |
 
@@ -258,15 +294,61 @@ Slack（incoming webhook 経由）のサイン:
 
 `data/needs_attention.jsonl` に保留。一覧: `run.py history needs-attention`
 
-## Heartbeat behavior
+## Heartbeat behavior（5 分毎の進捗共有）
 
-長時間 send では `--heartbeat slack` を付与（webhook URL 設定時のみ 5 分毎に状況投稿）:
+`heartbeat.enabled_for` に `all` を含めると（Slack 投稿は `incoming_webhook_url` または OpenClaw の `botToken` + セッション channel）、
+`research.py` / `run.py fetch-leads|enrich|draft|send|campaign` は **デフォルト `--heartbeat auto`** で:
+
+- `data/current_task.jsonl` に常時ログ
+- 約 5 分毎に Slack へ「今どの段階・何件目か」を投稿（開始・終了も）
 
 ```bash
-.venv/bin/python run.py send --ids 1,2,3 --auto-send --heartbeat slack
+.venv/bin/python research.py --clean --limit 10          # auto heartbeat
+.venv/bin/python run.py send --ids 1,2,3 --auto-send     # 同上（--heartbeat auto が既定）
+.venv/bin/python run.py enrich --heartbeat off           # 無効化
 ```
 
-未指定時は従来どおり（バックグラウンドスレッドなし）。
+エージェントは長時間タスクで **必ず** `research.py` / `run.py campaign` を使うか、`heartbeat_watch.py` をバックグラウンド起動する。待機中は **5分ごと** に `heartbeat_watch.py --once` または `pipeline_status.py` を実行し、結果を Slack に投稿する。
+
+## バックグラウンド（headless）ブラウザ
+
+OpenClaw の `openclaw` プロファイルは **headless Chrome** で動かせる（ウィンドウ非表示、ログイン状態は `~/.openclaw/browser/openclaw/` に保持）。
+
+**Doorman 既定**（`sender_brief.yaml`）:
+
+```yaml
+browser:
+  headless: true
+```
+
+`research.py` / パイプライン開始時に `openclaw browser start --headless` を試みる。
+
+**初回だけ**、いまウィンドウ付き Chrome が既に動いている場合は headless に切り替わらない。一度止めてから:
+
+```bash
+openclaw browser --browser-profile openclaw stop
+cd ~/.openclaw/skills/linkedin-outreach && .venv/bin/python research.py --clean --limit 10
+```
+
+恒久設定（OpenClaw 全体）:
+
+```bash
+openclaw config patch --stdin <<'EOF'
+{"browser":{"profiles":{"openclaw":{"headless":true}}}}
+EOF
+```
+
+環境変数だけで上書き: `DOORMAN_BROWSER_HEADLESS=1` または `OPENCLAW_BROWSER_HEADLESS=1`。
+
+注意: LinkedIn / Sales Nav は headless 検知で挙動が変わることがある。失敗したら `browser.headless: false` に戻す。
+
+## Troubleshooting「止まってるように見える」
+
+1. **プロセス確認**: `pgrep -fl 'research.py|linkedin-outreach.*run.py'` — 何も出なければ既に終了
+2. **成果物の時刻**: `ls -la data/*.jsonl` — `drafts.jsonl` が更新されていれば draft まで完了
+3. **進捗ログ**: `tail data/current_task.jsonl` — 空なら heartbeat 未使用の古い実行
+4. **preview でブロック**: 非 TTY では `research.py` が自動で `--no-send` を付ける。手動 `run.py preview` は `--no-send` 推奨
+5. **Slack に何も来ない**: `incoming_webhook_url` が空でも、`~/.openclaw/openclaw.json` の `channels.slack.botToken` と直近の Slack セッション（例: #general）があれば `chat.postMessage` で投稿する。どちらも無い場合のみ no-op
 
 ## Notes
 

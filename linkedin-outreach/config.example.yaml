@@ -48,9 +48,14 @@ target_persona:
 
 # Claude model & generation settings
 model:
-  name: "claude-cli/claude-sonnet-4-6"
+  name: "claude-cli/claude-opus-4-7"   # v4: draft / refine (override to sonnet-4-6 to cut cost)
   max_chars: 1800   # InMail limit is 1900; keep buffer
+  max_chars_extended: 1900
   language: "ja"    # ja / en
+
+# Draft pipeline (v4) — jp-form has _refine_draft; LinkedIn uses single-pass unless extended later
+draft:
+  refine_default: true
 
 # Personalization rules
 personalization:

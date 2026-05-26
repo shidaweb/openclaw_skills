@@ -3,7 +3,8 @@
 # Copy this file to config.yaml and fill in your own pitch/sender info.
 # Optional: copy ../sender_brief.example.yaml to ../sender_brief.yaml (merged; overrides apply).
 #
-# Model policy (v3): Slack/OpenClaw agent = Opus 4.7. Python oc_infer uses model.name (Sonnet).
+# Model policy (v4): Slack/OpenClaw agent = Opus 4.7. draft/refine = model.name (Opus).
+# _llm_analyze_form = form_analyzer_name (Sonnet, cost-optimal for DOM→JSON).
 # The contents become a cached system prompt — keeping this file stable
 # across runs gives ~95% prompt cache hits and minimal Claude credit usage.
 
@@ -67,10 +68,15 @@ target_persona:
 
 # Claude model & generation settings
 model:
-  name: "claude-cli/claude-sonnet-4-6"
+  name: "claude-cli/claude-opus-4-7"           # draft / refine / char_limit compress
+  form_analyzer_name: "claude-cli/claude-sonnet-4-6"  # _llm_analyze_form only
   max_chars: 400        # 多くのJP法人フォームの制限が400字
   max_chars_extended: 1800  # ファビウス／カラダノート等は2000字許容
   language: "ja"
+
+# Draft pipeline (v4)
+draft:
+  refine_default: true   # run.py draft / campaign use 2-pass unless --no-refine
 
 # Personalization rules
 personalization:

@@ -32,4 +32,6 @@ _outreach_core/data/
 # Per-skill escalation / progress logs
 **/data/needs_attention.jsonl
 **/data/current_task.jsonl
+**/data/events.jsonl
+**/data/traces/
 **/data/verify_snapshot_*.txt

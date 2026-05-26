@@ -9,8 +9,11 @@ Model policy (v3):
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from typing import Any
+
+from _outreach_core.config import load_sender_brief
 
 # Sonnet — pinned default for draft / form-analyzer (prompt-cache friendly, low cost).
 DEFAULT_MODEL = "claude-cli/claude-sonnet-4-6"
@@ -20,6 +23,50 @@ BROWSER_PROFILE = "openclaw"
 def _run(cmd: list[str]) -> tuple[int, str, str]:
     res = subprocess.run(cmd, capture_output=True, text=True)
     return res.returncode, res.stdout, res.stderr
+
+
+def browser_headless_preference() -> bool | None:
+    """
+    Whether Doorman should request a headless OpenClaw browser.
+
+    Priority: DOORMAN_BROWSER_HEADLESS → sender_brief browser.headless →
+    OPENCLAW_BROWSER_HEADLESS (1/0) → None (OpenClaw default = visible).
+    """
+    env = os.environ.get("DOORMAN_BROWSER_HEADLESS", "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    if env in ("0", "false", "no", "off"):
+        return False
+    brief = load_sender_brief() or {}
+    browser = brief.get("browser") or {}
+    if "headless" in browser:
+        return bool(browser.get("headless"))
+    oc = os.environ.get("OPENCLAW_BROWSER_HEADLESS", "").strip()
+    if oc == "1":
+        return True
+    if oc == "0":
+        return False
+    return None
+
+
+def oc_browser_start(*, headless: bool | None = None, profile: str = BROWSER_PROFILE) -> bool:
+    """
+    Ensure the OpenClaw managed browser is running.
+
+    headless=True → `openclaw browser start --headless` (no window; same login profile).
+    If a visible browser is already running, OpenClaw keeps it (no-op). Stop first:
+      openclaw browser --browser-profile openclaw stop
+    """
+    h = headless if headless is not None else browser_headless_preference()
+    args = ["start"]
+    if h is True:
+        args.append("--headless")
+    cmd = ["openclaw", "browser", "--browser-profile", profile, *args]
+    rc, out, err = _run(cmd)
+    if rc != 0:
+        print(f"[browser start err] {err.strip() or out.strip()}", file=__import__("sys").stderr)
+        return False
+    return True
 
 
 def oc_browser(*args: str, profile: str = BROWSER_PROFILE) -> str | None:

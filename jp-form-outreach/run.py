@@ -21,7 +21,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -33,6 +33,7 @@ from _outreach_core import prompt as core_prompt
 from _outreach_core.config import load_merged_config
 from _outreach_core.progress import HeartbeatSession
 from _outreach_core.verify import (
+    append_needs_attention,
     close_needs_attention,
     handle_verify_result,
     list_open_needs_attention,
@@ -221,6 +222,33 @@ def stage_bootstrap(targets_path: Path, out_path: Path,
 
 _FORM_FIELDS_JS = r"""
 () => {
+  const pickRoot = () => {
+    const forms = [...document.querySelectorAll('form')];
+    const withTextarea = forms.filter(f => f.querySelector('textarea'));
+    withTextarea.sort((a, b) =>
+      b.querySelectorAll('input,select,textarea').length -
+      a.querySelectorAll('input,select,textarea').length);
+    return withTextarea[0] || forms[0] || document.body;
+  };
+  const root = pickRoot();
+
+  const getStableSelector = (el, rootEl) => {
+    if (el.name) return `[name="${CSS.escape(el.name)}"]`;
+    if (el.id) return `#${CSS.escape(el.id)}`;
+    if (el.dataset && el.dataset.qa) return `[data-qa="${el.dataset.qa}"]`;
+    const path = [];
+    let cur = el;
+    while (cur && cur !== rootEl && cur !== document.body) {
+      let part = cur.tagName.toLowerCase();
+      const sibs = [...(cur.parentElement?.children || [])]
+        .filter(s => s.tagName === cur.tagName);
+      if (sibs.length > 1) part += `:nth-of-type(${sibs.indexOf(cur) + 1})`;
+      path.unshift(part);
+      cur = cur.parentElement;
+    }
+    return path.join(' > ');
+  };
+
   const result = {
     inputs: [],
     selects: [],
@@ -250,12 +278,13 @@ _FORM_FIELDS_JS = r"""
     return null;
   };
 
-  for (const el of document.querySelectorAll('input,textarea,select')) {
+  for (const el of root.querySelectorAll('input,textarea,select')) {
     const tag = el.tagName.toLowerCase();
     const type = (el.type || '').toLowerCase();
     if (type === 'hidden' || type === 'submit' || type === 'button' || type === 'image') continue;
 
     const name = el.name || el.id || '';
+    const selector = getStableSelector(el, root);
     const placeholder = el.placeholder || '';
     const required = el.required || el.getAttribute('aria-required') === 'true';
     const maxLength = el.maxLength > 0 ? el.maxLength : null;
@@ -279,21 +308,21 @@ _FORM_FIELDS_JS = r"""
     }
     if (tag === 'select') {
       result.selects.push({
-        name: name, label: label, required: required,
+        name: name, selector: selector, label: label, required: required,
         options: Array.from(el.options).map(o => o.text).slice(0, 60)
       });
       continue;
     }
     if (tag === 'textarea') {
       result.textareas.push({
-        name: name, label: label, required: required,
+        name: name, selector: selector, label: label, required: required,
         max_length: maxLength, placeholder: placeholder
       });
       continue;
     }
     // Standard input
     result.inputs.push({
-      name: name, label: label, required: required, type: type,
+      name: name, selector: selector, label: label, required: required, type: type,
       max_length: maxLength, placeholder: placeholder
     });
   }
@@ -330,9 +359,27 @@ _FORM_FIELDS_JS = r"""
     }
   }
 
+  let form_root_selector = null;
+  if (root && root.tagName === 'FORM') {
+    if (root.id) form_root_selector = `#${CSS.escape(root.id)}`;
+    else if (root.name) form_root_selector = `form[name="${CSS.escape(root.name)}"]`;
+    else {
+      const forms = [...document.querySelectorAll('form')];
+      const idx = forms.indexOf(root);
+      if (idx >= 0) form_root_selector = `form:nth-of-type(${idx + 1})`;
+    }
+  }
+  result.form_root_selector = form_root_selector;
+
   return result;
 }
 """
+
+
+def _emit_event(kind: str, *, stage: str, target_id: str | None = None, **kwargs: Any) -> None:
+    from _outreach_core import events as ev
+
+    ev.emit(kind, stage=stage, target_id=target_id, **kwargs)
 
 
 def stage_enrich(input_path: Path, out_path: Path) -> None:
@@ -382,6 +429,36 @@ def stage_enrich(input_path: Path, out_path: Path) -> None:
                 sample.write_text(snap)
                 print(f"[enrich] saved first form snapshot -> {sample}")
 
+        if fields.get("form_root_selector"):
+            t = {**t, "form_root_selector": fields["form_root_selector"]}
+        field_count = (
+            len(fields.get("inputs") or [])
+            + len(fields.get("selects") or [])
+            + len(fields.get("textareas") or [])
+        )
+        max_chars = 0
+        for ta in fields.get("textareas") or []:
+            ml = (ta or {}).get("max_length")
+            if ml:
+                max_chars = max(max_chars, int(ml))
+        tid = str(t.get("id") or t.get("name") or i)
+        trace = None
+        from _outreach_core import events as ev
+
+        if ev.get_context().data_dir:
+            trace = ev.trace_dir_for(tid)
+            ev.dump_trace(trace, "form_snapshot_pre.txt", snap or "", sender=None)
+        _emit_event(
+            "enrich.form.completed",
+            stage="enrich",
+            target_id=tid,
+            payload={
+                "field_count": field_count,
+                "has_captcha": bool(fields.get("has_recaptcha_v2")),
+                "detected_max_chars": max_chars or None,
+            },
+            trace_dir=trace,
+        )
         enriched_entry = {
             **t,
             "form_fields": fields,
@@ -474,6 +551,10 @@ Now act as a tough senior copywriter and **critique then rewrite** it.
 
 8. Body length: must be ≤ {max_chars} characters.
 
+9. Opening rotation (v4): which of types 1-4 does the draft use? Would the
+   last 2 drafts in this batch use the same opening pattern?
+   → If duplicate pattern: rewrite opening to a different type.
+
 ## Output format (STRICT JSON)
 
 ```json
@@ -516,8 +597,25 @@ def _refine_draft(target: dict[str, Any], draft: dict[str, Any],
     return refined
 
 
+def _cli_refine_enabled(
+    config: dict[str, Any],
+    args: argparse.Namespace,
+) -> bool:
+    if getattr(args, "refine_only_if_low_quality", False):
+        return False
+    return core_draft.resolve_refine_enabled(
+        config,
+        cli_refine=getattr(args, "refine", None),
+        cli_no_refine=getattr(args, "no_refine", False),
+    )
+
+
 def stage_draft(input_path: Path, out_path: Path, config: dict[str, Any],
-                 refine: bool = False) -> None:
+                 refine: bool = False, run_id: str | None = None) -> None:
+    from _outreach_core import events as ev
+
+    if not ev.get_context().data_dir:
+        ev.configure(skill="jp-form-outreach", data_dir=DATA_DIR, run_id=run_id)
     refine_fn = _refine_draft if refine else None
     core_draft.stage_draft(
         input_path,
@@ -529,6 +627,10 @@ def stage_draft(input_path: Path, out_path: Path, config: dict[str, Any],
         append_skip_fn=append_skip_history,
         default_model=DEFAULT_MODEL,
         refine_fn=refine_fn,
+        skill="jp-form-outreach",
+        data_dir=DATA_DIR,
+        run_id=run_id or ev.get_run_id(),
+        sender=config.get("sender"),
     )
 
 
@@ -632,6 +734,11 @@ def stage_campaign(
     linkedin-outreach's stage_campaign for cross-skill consistency."""
     bar = "=" * 70
 
+    from _outreach_core import events as ev
+
+    run_id = ev.configure(skill="jp-form-outreach", data_dir=DATA_DIR)
+    print(f"[campaign] run_id={run_id}")
+
     if clean:
         for f in ("leads.jsonl", "enriched.jsonl", "drafts.jsonl"):
             (DATA_DIR / f).unlink(missing_ok=True)
@@ -666,7 +773,7 @@ def stage_campaign(
     print(f"\n[campaign] → {enriched_n} targets enriched")
 
     # --- Phase 3: Personalize ---
-    print(f"\n{bar}\n[3/6] PERSONALIZE — Sonnet draft (cached system prompt)\n{bar}")
+    print(f"\n{bar}\n[3/6] PERSONALIZE — Opus draft (cached system prompt)\n{bar}")
     try:
         cfg = load_merged_config(SKILL_DIR)
     except FileNotFoundError as e:
@@ -1058,7 +1165,8 @@ def _llm_analyze_form(target: dict[str, Any], config: dict[str, Any],
         form_fields_json=json.dumps(form_fields, ensure_ascii=False, indent=2),
     )
 
-    model = config.get("model", {}).get("name", DEFAULT_MODEL)
+    model_cfg = config.get("model", {}) or {}
+    model = model_cfg.get("form_analyzer_name") or model_cfg.get("name", DEFAULT_MODEL)
     response = oc_infer(prompt, model=model)
     plan = extract_first_json(response or "")
     if not plan or "fields" not in plan:
@@ -1081,8 +1189,13 @@ _APPLY_PLAN_FIELD_JS = r"""
     el.dispatchEvent(new Event('change', { bubbles: true }));
   };
 
-  // Find element by name first, then id
-  const findEl = (selectorAttr) => {
+  const findEl = (selectorAttr, cssSelector) => {
+    if (cssSelector) {
+      try {
+        const byCss = document.querySelector(cssSelector);
+        if (byCss) return byCss;
+      } catch (e) {}
+    }
     let el = document.querySelector(`[name="${selectorAttr}"]`);
     if (el) return el;
     el = document.querySelector(`#${CSS.escape(selectorAttr)}`);
@@ -1090,14 +1203,14 @@ _APPLY_PLAN_FIELD_JS = r"""
   };
 
   if (action === "set_text") {
-    const el = findEl(name);
+    const el = findEl(name, args.selector || '');
     if (!el) return { ok: false, reason: "element not found", name };
     setVal(el, value);
     return { ok: true, action, name, value: String(value).slice(0, 50) };
   }
 
   if (action === "select_option") {
-    const sel = findEl(name);
+    const sel = findEl(name, args.selector || '');
     if (!sel || sel.tagName !== 'SELECT') return { ok: false, reason: "select not found", name };
     for (const opt of sel.options) {
       if (opt.text === value || opt.value === value
@@ -1151,8 +1264,10 @@ _CHECK_BY_NAME_JS = r"""
 """
 
 
-def _apply_field_action(name: str, action: str, value: str) -> dict[str, Any] | None:
-    args = {"name": name, "action": action, "value": value}
+def _apply_field_action(
+    name: str, action: str, value: str, selector: str | None = None
+) -> dict[str, Any] | None:
+    args = {"name": name, "action": action, "value": value, "selector": selector or ""}
     js = f"""
     (() => {{
       const fn = {_APPLY_PLAN_FIELD_JS};
@@ -1175,31 +1290,135 @@ def _check_by_name(name: str) -> dict[str, Any] | None:
     return res if isinstance(res, dict) else None
 
 
-def fill_form_with_plan(plan: dict[str, Any], body: str) -> dict[str, Any]:
-    """Apply an LLM-generated fill plan via JS. Returns diagnostics."""
-    diag = {"filled": [], "errors": [], "skipped": [], "warnings": plan.get("warnings", [])}
-    BODY_TOKEN = "__BODY__"
+def _postal_sort_key(entry: dict[str, Any]) -> int:
+    name = (entry.get("name") or "").lower()
+    label = (entry.get("label") or "").lower()
+    blob = name + label
+    if any(k in blob for k in ("postal", "zip", "〒", "郵便")):
+        return 1
+    if any(k in blob for k in ("address", "addr", "都道府県", "市区", "住所", "番地")):
+        return -1
+    return 0
 
-    for entry in plan.get("fields", []):
+
+def _escalate_dynamic_required(
+    target: dict[str, Any], fields: list[dict[str, Any]]
+) -> None:
+    from _outreach_core.notify import post as notify_post
+
+    tid = target.get("id", "?")
+    name = target.get("name", "?")
+    labels = ", ".join(
+        f"{f.get('type', '?')}: {f.get('label') or f.get('name')}" for f in fields[:5]
+    )
+    append_needs_attention(
+        DATA_DIR,
+        {
+            "target_id": tid,
+            "name": name,
+            "channel": "jp_form",
+            "reason": f"動的に出現した必須項目: {labels}",
+            "unresolved_fields": fields,
+            "action_needed": "field_values",
+        },
+    )
+    notify_post(f"{name} 想定外の必須項目（動的）: {labels}", level="warn")
+
+
+def _apply_plan_entry(
+    entry: dict[str, Any], body: str, diag: dict[str, Any]
+) -> bool:
+    """Apply one plan field entry. Returns True on success."""
+    BODY_TOKEN = "__BODY__"
+    name = entry.get("name")
+    action = entry.get("action")
+    value = entry.get("value", "")
+    selector = entry.get("selector")
+    if not name or not action:
+        return False
+    if action == "skip":
+        diag["skipped"].append(name)
+        return True
+    if isinstance(value, str) and BODY_TOKEN in value:
+        value = value.replace(BODY_TOKEN, body)
+    res = _apply_field_action(name, action, value, selector=selector)
+    if res and res.get("ok"):
+        label = res.get("value") or res.get("action")
+        diag["filled"].append(f"{name}={str(label)[:30]} ({action})")
+        return True
+    reason = (res or {}).get("reason", "unknown")
+    diag["errors"].append(f"{name} ({action}): {reason}")
+    return False
+
+
+def fill_form_with_plan(
+    plan: dict[str, Any],
+    body: str,
+    *,
+    target: dict[str, Any] | None = None,
+    evaluate_fn: Callable[[str], Any] | None = None,
+) -> dict[str, Any]:
+    """Apply an LLM-generated fill plan via JS. Returns diagnostics."""
+    from _outreach_core.verify import scan_empty_required, scan_new_required_after_fill
+
+    eval_fn = evaluate_fn or _evaluate
+    diag: dict[str, Any] = {
+        "filled": [],
+        "errors": [],
+        "skipped": [],
+        "warnings": list(plan.get("warnings") or []),
+        "dynamic_filled": [],
+        "dynamic_escalated": [],
+    }
+    BODY_TOKEN = "__BODY__"
+    fields = sorted(plan.get("fields") or [], key=_postal_sort_key)
+    plan_by_name = {
+        str(e["name"]): e for e in fields if e.get("name")
+    }
+
+    baseline_empty: set[str] = set()
+    for item in scan_empty_required(eval_fn, target):
+        key = str(item.get("name") or item.get("label") or "").strip()
+        if key:
+            baseline_empty.add(key)
+
+    filled_names: set[str] = set()
+    escalated_names: set[str] = set()
+
+    for entry in fields:
         name = entry.get("name")
-        action = entry.get("action")
-        value = entry.get("value", "")
-        if not name or not action:
+        if not name:
             continue
-        if action == "skip":
+        if entry.get("action") == "skip":
             diag["skipped"].append(name)
             continue
-        # Substitute body placeholder
-        if isinstance(value, str) and BODY_TOKEN in value:
-            value = value.replace(BODY_TOKEN, body)
-        res = _apply_field_action(name, action, value)
-        if res and res.get("ok"):
-            label = res.get("value") or res.get("action")
-            diag["filled"].append(f"{name}={str(label)[:30]} ({action})")
-        else:
-            reason = (res or {}).get("reason", "unknown")
-            diag["errors"].append(f"{name} ({action}): {reason}")
+        if isinstance(entry.get("value"), str) and BODY_TOKEN in entry["value"]:
+            entry = {**entry, "value": entry["value"].replace(BODY_TOKEN, body)}
+        if _apply_plan_entry(entry, body, diag):
+            filled_names.add(str(name))
         time.sleep(0.1)
+
+        time.sleep(0.3)
+        for item in scan_new_required_after_fill(
+            eval_fn,
+            baseline_empty_names=baseline_empty,
+            filled_names=filled_names,
+            target=target,
+        ):
+            key = str(item.get("name") or item.get("label") or "").strip()
+            if not key or key in escalated_names:
+                continue
+            baseline_empty.add(key)
+            if key in plan_by_name:
+                if _apply_plan_entry(plan_by_name[key], body, diag):
+                    filled_names.add(key)
+                    diag["dynamic_filled"].append(key)
+            elif target:
+                escalated_names.add(key)
+                diag["dynamic_escalated"].append(key)
+                _escalate_dynamic_required(target, [item])
+            else:
+                diag["warnings"].append(f"dynamic required {key} (no target to escalate)")
 
     for cb_name in plan.get("checkboxes_to_check", []):
         res = _check_by_name(cb_name)
@@ -1211,8 +1430,14 @@ def fill_form_with_plan(plan: dict[str, Any], body: str) -> dict[str, Any]:
     return diag
 
 
-def fill_form_for_target(target: dict[str, Any], config: dict[str, Any],
-                         body: str) -> dict[str, Any]:
+def fill_form_for_target(
+    target: dict[str, Any],
+    config: dict[str, Any],
+    body: str,
+    *,
+    trace_dir: Path | None = None,
+    iterative_fill: bool = False,
+) -> dict[str, Any]:
     """Fill all known sender fields + body. Returns diagnostic dict.
 
     Strategy:
@@ -1223,20 +1448,105 @@ def fill_form_for_target(target: dict[str, Any], config: dict[str, Any],
     sender = config.get("sender", {})
 
     # === Phase 1: LLM-driven fill ===
-    char_limit = int(target.get("char_limit", config.get("model", {}).get("max_chars", 400)))
+    from _outreach_core.draft import resolve_max_chars
+
+    model_cfg = config.get("model", {}) or {}
+    char_limit = resolve_max_chars(
+        target,
+        config,
+        default_max=int(model_cfg.get("max_chars", 400)),
+        extended_max=int(model_cfg.get("max_chars_extended", 400)),
+    )
     plan = _llm_analyze_form(target, config, body_max_chars=char_limit)
     plan_diag = None
     if plan:
+        target["_llm_plan"] = plan
+        tid = str(target.get("id") or "?")
+        _emit_event(
+            "send.plan.generated",
+            stage="send",
+            target_id=tid,
+            payload={
+                "field_count": len(plan.get("fields") or []),
+                "checkboxes_count": len(plan.get("checkboxes_to_check") or []),
+                "flow": plan.get("next_step"),
+            },
+            trace_dir=trace_dir,
+        )
+        from _outreach_core import events as ev
+
+        if trace_dir:
+            ev.dump_trace(trace_dir, "fill_plan.json", plan, sender=config.get("sender"))
         print(f"  [fill] LLM plan: {len(plan.get('fields', []))} field actions, "
               f"{len(plan.get('checkboxes_to_check', []))} checkboxes, "
               f"flow={plan.get('next_step', '?')}")
         for w in plan.get("warnings", []):
             print(f"    ⚠ {w}")
-        plan_diag = fill_form_with_plan(plan, body)
+        plan_diag = fill_form_with_plan(plan, body, target=target, evaluate_fn=_evaluate)
+        _emit_event(
+            "send.fill.applied",
+            stage="send",
+            target_id=tid,
+            payload={
+                "filled": len(plan_diag.get("filled") or []),
+                "errors": len(plan_diag.get("errors") or []),
+                "skipped": len(plan_diag.get("skipped") or []),
+            },
+            trace_dir=trace_dir,
+        )
+        for key in plan_diag.get("dynamic_escalated") or []:
+            _emit_event(
+                "send.fill.dynamic_required",
+                stage="send",
+                target_id=tid,
+                payload={"field_label": key},
+                trace_dir=trace_dir,
+            )
+        if trace_dir:
+            ev.dump_trace(trace_dir, "fill_diagnostics.json", plan_diag)
         print(f"  [fill] plan applied: {len(plan_diag['filled'])} ok, "
               f"{len(plan_diag['errors'])} errors, {len(plan_diag['skipped'])} intentionally skipped")
         for e in plan_diag["errors"][:5]:
             print(f"    ✗ {e}")
+
+        if iterative_fill and (
+            plan_diag.get("errors") or plan_diag.get("dynamic_escalated")
+        ):
+            print("  [fill] iterative-fill: refreshing form_fields + re-plan ...")
+            fresh = _evaluate(_FORM_FIELDS_JS) or {}
+            if fresh:
+                target["form_fields"] = fresh
+                if fresh.get("form_root_selector"):
+                    target["form_root_selector"] = fresh["form_root_selector"]
+            target.pop("_llm_plan", None)
+            plan2 = _llm_analyze_form(target, config, body_max_chars=char_limit)
+            if plan2 and plan2.get("fields"):
+                already = set()
+                for x in plan_diag.get("filled") or []:
+                    part = str(x).split("=")[0].strip()
+                    if part:
+                        already.add(part)
+                plan2["fields"] = [
+                    f for f in plan2["fields"]
+                    if f.get("name") and f["name"] not in already
+                ]
+                if plan2["fields"]:
+                    diag2 = fill_form_with_plan(
+                        plan2, body, target=target, evaluate_fn=_evaluate
+                    )
+                    plan_diag["filled"] = (plan_diag.get("filled") or []) + (
+                        diag2.get("filled") or []
+                    )
+                    plan_diag["errors"] = (plan_diag.get("errors") or []) + (
+                        diag2.get("errors") or []
+                    )
+                    _emit_event(
+                        "send.fill.iterative_pass",
+                        stage="send",
+                        target_id=tid,
+                        payload={"fields": len(plan2["fields"])},
+                        trace_dir=trace_dir,
+                    )
     else:
         print(f"  [fill] no LLM plan available (form_fields missing or analyzer failed) — using heuristics only")
 
@@ -1355,12 +1665,36 @@ def _heuristic_fill_fallback(target: dict[str, Any], config: dict[str, Any],
     return diagnostics
 
 
+def _escalate_await_proceed(target: dict[str, Any], reason: str) -> None:
+    """Record needs_attention + Slack notify; browser stays open for resolve --action proceed."""
+    from _outreach_core.notify import post as notify_post
+
+    tid = target.get("id", "?")
+    name = target.get("name", "?")
+    append_needs_attention(
+        DATA_DIR,
+        {
+            "target_id": tid,
+            "name": name,
+            "channel": "jp_form",
+            "reason": reason,
+            "action_needed": "proceed",
+        },
+    )
+    notify_post(
+        f"⚠️ {name} で reCAPTCHA / 確認待ちです。Slack で「{tid} 進めて」と返してください",
+        level="warn",
+    )
+
+
 def stage_send(
     input_path: Path,
     ids: set[int],
     mode: str = "interactive",
     config: dict[str, Any] | None = None,
     heartbeat: str | None = None,
+    verify_strict: bool = True,
+    iterative_fill: bool = False,
 ) -> None:
     if not config:
         print("[send] missing config", file=sys.stderr)
@@ -1410,18 +1744,44 @@ def stage_send(
         print(f"  URL: {form_url}")
         print(f"  Flow: {flow}, captcha: {captcha and 'v2 (manual)' or 'none/v3'}, chars: {len(body)}")
 
+        tid = str(d.get("id") or name)
+        from _outreach_core import events as ev
+
+        if not ev.get_context().data_dir:
+            ev.configure(skill="jp-form-outreach", data_dir=DATA_DIR)
+        trace = ev.trace_dir_for(tid)
+
         # 1. Open form
+        t0 = time.time()
         oc_browser("open", form_url)
         time.sleep(RATE_LIMIT_SECONDS)
+        _emit_event(
+            "send.opened",
+            stage="send",
+            target_id=tid,
+            payload={"url": form_url, "time_ms": int((time.time() - t0) * 1000)},
+            trace_dir=trace,
+        )
+        pre_snap = oc_browser("snapshot")
+        ev.dump_trace(trace, "form_snapshot_pre.txt", pre_snap or "")
 
         # 2. Click any pre-form entry (e.g. "法人のお客様" tab)
         if d.get("entry_click_text"):
             for txt in (d["entry_click_text"] if isinstance(d["entry_click_text"], list) else [d["entry_click_text"]]):
-                _click_button([re.escape(txt)])
+                cr = _click_button([re.escape(txt)])
+                _emit_event(
+                    "send.entry_clicked",
+                    stage="send",
+                    target_id=tid,
+                    payload={"text": txt, "success": bool(cr and cr.get("clicked"))},
+                    trace_dir=trace,
+                )
                 time.sleep(1.5)
 
         # 3. Fill all fields
-        diagnostics = fill_form_for_target(d, config, body)
+        diagnostics = fill_form_for_target(
+            d, config, body, trace_dir=trace, iterative_fill=iterative_fill
+        )
         print(f"  [send] filled: {len(diagnostics['filled'])} / unfilled: {len(diagnostics['unfilled'])} / errors: {len(diagnostics['errors'])}")
         for f in diagnostics["filled"][:8]:
             print(f"    ✓ {f}")
@@ -1431,13 +1791,9 @@ def stage_send(
 
         if captcha:
             print(f"  [send] ⚠ reCAPTCHA v2 detected — manual completion required")
-            print(f"          Browser is left open with form filled. Complete CAPTCHA + Send manually.")
+            print(f"          Browser left open. Complete CAPTCHA, then: run.py resolve --target-id {d.get('id')} --action proceed")
             filled_only.append(d)
-            if mode == "interactive":
-                ans = input("  [send] After manual submit, type 'y' to log: ").strip().lower()
-                if ans == "y":
-                    sent.append(d)
-                    filled_only.pop()
+            _escalate_await_proceed(d, "awaiting_user_proceed: reCAPTCHA v2")
             continue
 
         if mode == "fill-only":
@@ -1458,40 +1814,72 @@ def stage_send(
             filled_only.append(d)
             continue
         print(f"  [send] clicked: {click_res.get('text')}")
+        _emit_event(
+            "send.button.clicked",
+            stage="send",
+            target_id=tid,
+            payload={
+                "pattern_matched": True,
+                "text": (click_res.get("text") or "")[:80],
+            },
+            trace_dir=trace,
+        )
         time.sleep(3)
 
         # 5. If confirm flow, click final submit
         if flow == "confirm":
-            if mode == "interactive":
-                ans = input("  [send] Confirmation page reached. Click 送信する now? (y/N): ").strip().lower()
-                if ans != "y":
-                    print(f"  [send] aborted; modal left at confirm page")
-                    filled_only.append(d)
-                    continue
+            _emit_event(
+                "send.confirm.reached",
+                stage="send",
+                target_id=tid,
+                payload={"wait_user_ms": 0},
+                trace_dir=trace,
+            )
             click2 = _click_button([r"^送信する$", r"^送信$", r"この内容で送信", r"内容を送信する"])
             if not click2 or not click2.get("clicked"):
-                print(f"  [send] ⚠ final submit button not found")
+                print(f"  [send] ⚠ final submit button not found — awaiting proceed")
                 filled_only.append(d)
+                _escalate_await_proceed(d, "awaiting_user_proceed: confirm-page final submit not found")
                 continue
             print(f"  [send] clicked final: {click2.get('text')}")
-            time.sleep(3)
+            _emit_event(
+                "send.final.clicked",
+                stage="send",
+                target_id=tid,
+                payload={"text": (click2.get("text") or "")[:80]},
+                trace_dir=trace,
+            )
+            time.sleep(5)
 
         # 6. Verify send (keywords, required fields, plan gaps)
+        time.sleep(2)
+        ev.dump_trace(trace, "form_snapshot_post.txt", oc_browser("snapshot") or "")
+        from _outreach_core.verify import PAGE_EVIDENCE_JS
+
+        page_evidence = _evaluate(PAGE_EVIDENCE_JS)
         snap = oc_browser("snapshot")
         snap_path = DATA_DIR / f"verify_snapshot_{d.get('id', di)}.txt"
-        if snap:
-            snap_path.write_text(snap, encoding="utf-8")
+        combined = snap or ""
+        if isinstance(page_evidence, dict):
+            combined = f"{combined}\n{page_evidence.get('text', '')}\n{page_evidence.get('url', '')}"
+        if combined.strip():
+            snap_path.write_text(combined, encoding="utf-8")
 
         if mode in ("auto", "interactive"):
+            if d.get("_llm_plan"):
+                ev.dump_trace(trace, "fill_plan.json", d["_llm_plan"], sender=config.get("sender"))
             vresult = verify_send_completed(
                 d,
                 "jp_form",
-                snapshot=snap or "",
+                snapshot=combined,
+                browser_verify=page_evidence if isinstance(page_evidence, dict) else None,
                 plan=d.get("_llm_plan"),
                 evaluate_fn=_evaluate,
                 data_dir=DATA_DIR,
-                snapshot_path=snap_path if snap else None,
+                snapshot_path=snap_path if combined.strip() else None,
+                verify_strict=verify_strict,
             )
+            ev.dump_trace(trace, "verify_evidence.json", vresult.get("evidence") or {})
             outcome = handle_verify_result(d, vresult, DATA_DIR, channel="jp_form")
             if outcome == "sent_ok":
                 print(f"  [send] ✅ {vresult.get('reason')}")
@@ -1672,6 +2060,76 @@ def stage_walkthrough(input_path: Path, config: dict[str, Any],
     print(bar)
 
 
+def stage_resolve_proceed(
+    target_id: str,
+    config: dict[str, Any],
+    *,
+    drafts_path: Path | None = None,
+) -> None:
+    """Resume send after user completed CAPTCHA or confirm page (browser still open)."""
+    path = drafts_path or (DATA_DIR / "drafts.jsonl")
+    if not path.exists():
+        print(f"[resolve] {path} not found", file=sys.stderr)
+        return
+
+    drafts = [json.loads(line) for line in path.open() if line.strip()]
+    sendable = [d for d in drafts if (d.get("draft") or {}).get("subject") != "SKIP"]
+    d = next((x for x in sendable if x.get("id") == target_id), None)
+    if not d:
+        print(f"[resolve] target_id {target_id} not in sendable drafts", file=sys.stderr)
+        return
+
+    name = d.get("name", "?")
+    flow = d.get("flow", "single")
+    print(f"[resolve] proceed → {name} (flow={flow})")
+
+    patterns = [r"^送信する$", r"^送信$", r"この内容で送信", r"内容を送信する", r"submit"]
+    click_res = _click_button(patterns)
+    if not click_res or not click_res.get("clicked"):
+        print("[resolve] ⚠ submit button not found on current page", file=sys.stderr)
+        _escalate_await_proceed(d, "awaiting_user_proceed: submit button not found on resume")
+        return
+
+    print(f"[resolve] clicked: {click_res.get('text')}")
+    time.sleep(5)
+
+    from _outreach_core.verify import PAGE_EVIDENCE_JS
+
+    page_evidence = _evaluate(PAGE_EVIDENCE_JS)
+    snap = oc_browser("snapshot")
+    combined = snap or ""
+    if isinstance(page_evidence, dict):
+        combined = f"{combined}\n{page_evidence.get('text', '')}\n{page_evidence.get('url', '')}"
+    snap_path = DATA_DIR / f"verify_snapshot_{d.get('id', 0)}.txt"
+    if combined.strip():
+        snap_path.write_text(combined, encoding="utf-8")
+
+    vresult = verify_send_completed(
+        d,
+        "jp_form",
+        snapshot=combined,
+        browser_verify=page_evidence if isinstance(page_evidence, dict) else None,
+        plan=d.get("_llm_plan"),
+        evaluate_fn=_evaluate,
+        data_dir=DATA_DIR,
+        snapshot_path=snap_path if combined.strip() else None,
+    )
+    outcome = handle_verify_result(d, vresult, DATA_DIR, channel="jp_form")
+    if outcome == "sent_ok":
+        append_sent_history([d])
+        close_needs_attention(DATA_DIR, target_id, resolution="proceed: verified ok")
+        _emit_event(
+            "send.resolved",
+            stage="send",
+            target_id=target_id,
+            outcome="ok",
+            payload={"previous_status": "awaiting_user_proceed", "new_status": "ok"},
+        )
+        print(f"[resolve] ✅ {vresult.get('reason')}")
+    else:
+        print(f"[resolve] ⚠ verify: {vresult.get('status')} — {vresult.get('reason')}")
+
+
 def stage_resolve(
     target_id: str,
     fields: dict[str, str],
@@ -1749,8 +2207,19 @@ def main() -> None:
                    help="Stop at preview without sending (display only)")
     p.add_argument("--include-sent", action="store_true",
                    help="Also include companies marked status: sent (re-send mode)")
-    p.add_argument("--refine", action="store_true",
-                   help="Two-pass draft generation (critique + rewrite) for higher quality")
+    refine_grp = p.add_mutually_exclusive_group()
+    refine_grp.add_argument(
+        "--refine",
+        action="store_true",
+        default=None,
+        help="Two-pass draft (critique + rewrite). Default: config draft.refine_default (true)",
+    )
+    refine_grp.add_argument("--no-refine", action="store_true", help="Disable refine pass")
+    p.add_argument(
+        "--refine-only-if-low-quality",
+        action="store_true",
+        help="Agent-led: draft all, then refine only low-rated ids (see SKILL.md quality gate)",
+    )
     p.add_argument("--limit", type=int, default=None,
                    help="Pull only the first N eligible targets (after filters)")
     p.add_argument("--only", default=None,
@@ -1766,8 +2235,19 @@ def main() -> None:
     p.add_argument("--config", default=str(SKILL_DIR / "config.yaml"))
     p.add_argument("--from-targets", action="store_true",
                    help="Skip enrich; draft directly from data/leads.jsonl")
-    p.add_argument("--refine", action="store_true",
-                   help="Two-pass: generate draft, then critique+rewrite for higher quality (~2x cost)")
+    draft_refine_grp = p.add_mutually_exclusive_group()
+    draft_refine_grp.add_argument(
+        "--refine",
+        action="store_true",
+        default=None,
+        help="Two-pass critique+rewrite (default: config draft.refine_default)",
+    )
+    draft_refine_grp.add_argument("--no-refine", action="store_true", help="Single-pass draft only")
+    p.add_argument(
+        "--refine-only-if-low-quality",
+        action="store_true",
+        help="Single-pass draft; agent re-runs --refine for low-rated ids (SKILL.md)",
+    )
 
     p = sub.add_parser("preview",
                         help="(Approve) Show all drafts in terminal, then prompt to send")
@@ -1789,12 +2269,29 @@ def main() -> None:
     p.add_argument(
         "--heartbeat",
         default=None,
-        choices=["slack"],
-        help="Post progress to Slack incoming webhook every ~5 min",
+        choices=["slack", "auto"],
+        help="Progress to Slack: slack=webhook only, auto=webhook or OpenClaw botToken (~5 min)",
+    )
+    p.add_argument(
+        "--verify-strict",
+        choices=["true", "false"],
+        default="true",
+        help="false = success markers only (skip empty-required scan)",
+    )
+    p.add_argument(
+        "--iterative-fill",
+        action="store_true",
+        help="On fill errors, refresh DOM and run a second LLM fill plan",
     )
 
-    p = sub.add_parser("resolve", help="Resolve needs_attention with field overrides and retry send")
+    p = sub.add_parser("resolve", help="Resolve needs_attention with field overrides or resume send")
     p.add_argument("--target-id", required=True)
+    p.add_argument(
+        "--action",
+        default="fields",
+        choices=["fields", "proceed"],
+        help="fields: apply --field overrides and retry send; proceed: click submit on open browser",
+    )
     p.add_argument("--field", action="append", default=[], help="key=value (repeatable)")
     p.add_argument("--config", default=str(SKILL_DIR / "config.yaml"))
 
@@ -1828,13 +2325,21 @@ def main() -> None:
                         only_ids=only_ids)
     elif args.cmd == "campaign":
         only_ids = [x.strip() for x in args.only.split(",")] if args.only else None
+        try:
+            cfg = load_merged_config(SKILL_DIR)
+        except FileNotFoundError:
+            cfg = {}
+        refine = _cli_refine_enabled(cfg, args)
+        if getattr(args, "refine_only_if_low_quality", False):
+            print("[campaign] --refine-only-if-low-quality: pass-1 draft only; "
+                  "agent scores drafts then run.py draft --refine for low ids")
         stage_campaign(
             targets_path=Path(args.targets),
             clean=args.clean,
             skip_enrich=args.skip_enrich,
             skip_send=args.skip_send,
             include_sent=args.include_sent,
-            refine=args.refine,
+            refine=refine,
             limit=args.limit,
             only_ids=only_ids,
         )
@@ -1850,7 +2355,11 @@ def main() -> None:
         in_path = Path(args.input_path)
         if args.from_targets and not in_path.exists():
             in_path = DATA_DIR / "leads.jsonl"
-        stage_draft(in_path, Path(args.out), cfg, refine=args.refine)
+        refine = _cli_refine_enabled(cfg, args)
+        if getattr(args, "refine_only_if_low_quality", False):
+            print("[draft] pass-1 only (--refine-only-if-low-quality). "
+                  "Re-run with --refine for low-rated target ids after agent review.")
+        stage_draft(in_path, Path(args.out), cfg, refine=refine)
     elif args.cmd == "preview":
         cfg = None
         if not args.no_send:
@@ -1876,12 +2385,18 @@ def main() -> None:
             mode = "fill-only"
         else:
             mode = "interactive"
+        from _outreach_core import events as ev
+
+        if not ev.get_context().data_dir:
+            ev.configure(skill="jp-form-outreach", data_dir=DATA_DIR)
         stage_send(
             Path(args.input_path),
             ids,
             mode=mode,
             config=cfg,
             heartbeat=args.heartbeat,
+            verify_strict=str(args.verify_strict).lower() == "true",
+            iterative_fill=bool(getattr(args, "iterative_fill", False)),
         )
     elif args.cmd == "resolve":
         try:
@@ -1889,14 +2404,20 @@ def main() -> None:
         except FileNotFoundError as e:
             print(f"[resolve] {e}", file=sys.stderr)
             sys.exit(2)
-        fields: dict[str, str] = {}
-        for item in args.field:
-            if "=" not in item:
-                print(f"[resolve] bad --field {item!r}, want key=value", file=sys.stderr)
+        if args.action == "proceed":
+            stage_resolve_proceed(args.target_id, cfg)
+        else:
+            fields: dict[str, str] = {}
+            for item in args.field:
+                if "=" not in item:
+                    print(f"[resolve] bad --field {item!r}, want key=value", file=sys.stderr)
+                    sys.exit(2)
+                k, v = item.split("=", 1)
+                fields[k.strip()] = v.strip()
+            if not fields:
+                print("[resolve] --action fields requires at least one --field key=value", file=sys.stderr)
                 sys.exit(2)
-            k, v = item.split("=", 1)
-            fields[k.strip()] = v.strip()
-        stage_resolve(args.target_id, fields, cfg)
+            stage_resolve(args.target_id, fields, cfg)
     elif args.cmd == "walk":
         config_path = Path(args.config)
         if not config_path.exists():
