@@ -589,6 +589,29 @@ Now act as a tough senior copywriter and **critique then rewrite** it.
    last 2 drafts in this batch use the same opening pattern?
    → If duplicate pattern: rewrite opening to a different type.
 
+10. **Japanese nativeness (v5)** — count katakana business jargon: 論点, シナリオ,
+    レバレッジ, クロスセル, LTV, オペレーション, セグメント, スキーム, ナレッジ,
+    アジェンダ. If 4 or more appear → rewrite using Japanese-native equivalents
+    (per system_persona §3).
+
+11. **Sentence length (v5)** — count sentences exceeding 80 characters (excluding
+    URLs). If 3 or more such sentences exist → split at natural 句点 boundaries.
+    Avoid nested clauses like 「〜という数字でございますが、〜と拝察しております」.
+
+12. **「拝察」「拝見」 overuse (v5)** — if 「拝察」 appears 2+ times or
+    「拝察」+「拝見」 combined exceed 3 → replace some with 「感じております」「見受けられます」
+    「読みました」「受け取りました」.
+
+13. **Closing salutation (v5)** — the draft body must contain at least one of
+    「何卒よろしくお願い申し上げます」「末筆ながら」「ご検討のほど」 before the calendar URL.
+    If missing → insert before the URL line.
+
+14. **English-translated phrasings (v5)** — flag and rewrite any of these:
+    「〜することができます」→「〜できます」, 「〜において」→「〜で」,
+    「〜に関して」→「〜について」, 「〜を有しております」→「〜がございます」,
+    「〜の観点から」→「〜の面で」, 「〜にアプローチします」→「〜に取り組みます」,
+    「〜の一助となります」→「お役に立てれば幸いです」.
+
 ## Output format (STRICT JSON)
 
 ```json
