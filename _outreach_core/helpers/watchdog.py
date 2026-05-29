@@ -33,6 +33,7 @@ from _outreach_core.helpers.healthcheck import (
 GATEWAY_LABEL = "ai.openclaw.gateway"
 HEALTH_TIMEOUT_SEC = 20
 HEALTH_FAIL_RESTART_THRESHOLD = 2  # consecutive failed probes before restart (~2 min)
+CHANNEL_FAIL_RESTART_THRESHOLD = 5  # consecutive ticks with a stuck channel before restart (~5 min)
 STALE_HEARTBEAT_SEC = 300  # 5 minutes
 RESTART_WINDOW_MIN = 10
 MAX_RESTARTS = 3
@@ -127,6 +128,36 @@ def is_gateway_healthy() -> bool:
         # openclaw not on PATH for this launchd context — cannot probe; treat as
         # healthy so we never restart blindly without evidence.
         return True
+
+
+def configured_but_down_channels() -> list[str]:
+    """Return ids of channels that are configured but not running.
+
+    This catches the failure where the gateway process is alive and ``openclaw
+    health`` returns 0, yet a chat channel (e.g. Slack) is stuck disconnected —
+    typically after a network outage that the channel's own reconnect logic never
+    recovered from. Returns [] on any error so parse failures never trigger a
+    restart without evidence.
+    """
+    try:
+        out = subprocess.run(
+            ["openclaw", "channels", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=HEALTH_TIMEOUT_SEC,
+            check=False,
+        )
+        if out.returncode != 0:
+            return []
+        data = json.loads(out.stdout)
+        channels = data.get("channels") or {}
+        down: list[str] = []
+        for cid, info in channels.items():
+            if isinstance(info, dict) and info.get("configured") and not info.get("running"):
+                down.append(str(cid))
+        return down
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, ValueError):
+        return []
 
 
 def restart_gateway() -> bool:
@@ -249,11 +280,46 @@ def tick(skills_root: Path | None = None) -> str:
             append_log("abandoned (gateway unhealthy)", root)
             return "abandoned"
 
-        # Gateway responsive: clear failure streak and run the secondary
-        # stuck-detection (active run whose heartbeat stopped advancing).
+        # Gateway responsive: clear the health failure streak.
         changed = False
         if state.get("health_fail_streak"):
             state["health_fail_streak"] = 0
+            changed = True
+
+        # A configured channel (e.g. Slack) can be stuck disconnected while the
+        # gateway itself is healthy — this is what caused "生きてる?" to go
+        # unanswered after a network outage. Force-restart the gateway (which
+        # cleanly reconnects channels) after a sustained streak, rate limited.
+        down = configured_but_down_channels()
+        if down:
+            streak = int(state.get("channel_fail_streak", 0)) + 1
+            state["channel_fail_streak"] = streak
+            if streak < CHANNEL_FAIL_RESTART_THRESHOLD:
+                save_state(state, root)
+                append_log(f"channel down {down} streak={streak} (waiting)", root)
+                return "stuck"
+            if can_restart(state):
+                notify_slack(
+                    f"⚠️ チャンネル {down} が gateway 生存中に切断したままです。"
+                    "gateway を再起動して再接続します。",
+                    level="error",
+                )
+                restart_gateway()
+                record_restart(state, "channel-restart")
+                state["channel_fail_streak"] = 0
+                save_state(state, root)
+                append_log(f"restarted gateway (channel down {down} streak={streak})", root)
+                return "restarted"
+            notify_slack(
+                "🚨 チャンネル切断の復旧を 10 分以内に 3 回試みましたが復旧しません。手動確認が必要です。",
+                level="error",
+            )
+            record_restart(state, "abandoned")
+            save_state(state, root)
+            append_log(f"abandoned (channel down {down})", root)
+            return "abandoned"
+        if state.get("channel_fail_streak"):
+            state["channel_fail_streak"] = 0
             changed = True
 
         health = read_health(root)
