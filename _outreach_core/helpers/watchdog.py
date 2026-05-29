@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
-"""External watchdog for OpenClaw / Cowork (v4 §15-C)."""
+"""External watchdog for the OpenClaw gateway (v4 §15-C).
+
+On this host the agent runtime is the launchd-managed ``ai.openclaw.gateway``
+node process (``openclaw gateway``), NOT a "Cowork" app. launchd already has
+``KeepAlive=true``, so plain process death is auto-recovered by the OS. The gap
+launchd cannot see is a process that is alive but hung/unresponsive (Slack stops
+being processed). This watchdog therefore probes responsiveness via
+``openclaw health`` and only force-restarts (``launchctl kickstart -k``) after a
+sustained failure streak, with rate limiting and Slack notifications.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -15,11 +25,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from _outreach_core.config import SKILLS_ROOT
 from _outreach_core.helpers.healthcheck import (
+    collect_active_runs,
     heartbeat_age_seconds,
     read_health,
-    write_heartbeat,
 )
 
+GATEWAY_LABEL = "ai.openclaw.gateway"
+HEALTH_TIMEOUT_SEC = 20
+HEALTH_FAIL_RESTART_THRESHOLD = 2  # consecutive failed probes before restart (~2 min)
 STALE_HEARTBEAT_SEC = 300  # 5 minutes
 RESTART_WINDOW_MIN = 10
 MAX_RESTARTS = 3
@@ -78,24 +91,49 @@ def append_log(message: str, skills_root: Path | None = None) -> None:
         f.write(line)
 
 
-def is_cowork_running() -> bool:
+def is_gateway_loaded() -> bool:
+    """True when launchd has the gateway job registered (managing it)."""
     try:
         out = subprocess.run(
-            ["pgrep", "-f", "Cowork"],
+            ["launchctl", "list", GATEWAY_LABEL],
             capture_output=True,
             text=True,
-            timeout=3,
+            timeout=5,
             check=False,
         )
-        return out.returncode == 0 and bool(out.stdout.strip())
+        return out.returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
 
 
-def relaunch_cowork() -> bool:
+def is_gateway_healthy() -> bool:
+    """True when ``openclaw health`` responds successfully within the timeout.
+
+    A timeout or non-zero exit means the gateway is unresponsive (hung) even if
+    the process technically still exists.
+    """
+    try:
+        out = subprocess.run(
+            ["openclaw", "health"],
+            capture_output=True,
+            text=True,
+            timeout=HEALTH_TIMEOUT_SEC,
+            check=False,
+        )
+        return out.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+    except OSError:
+        # openclaw not on PATH for this launchd context — cannot probe; treat as
+        # healthy so we never restart blindly without evidence.
+        return True
+
+
+def restart_gateway() -> bool:
+    """Force launchd to kill and relaunch the gateway job."""
     try:
         subprocess.run(
-            ["open", "-a", "Cowork"],
+            ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{GATEWAY_LABEL}"],
             capture_output=True,
             timeout=15,
             check=False,
@@ -154,44 +192,96 @@ def tick(skills_root: Path | None = None) -> str:
     """
     One watchdog check. Returns: ok | restarted | abandoned | stuck.
     Never raises to caller (launchd safety).
+
+    Responsiveness (``openclaw health``) is the authoritative signal: launchd's
+    KeepAlive already revives a dead process, so the watchdog targets the harder
+    case of an alive-but-hung gateway. To avoid flapping on transient blips, a
+    force-restart only fires after HEALTH_FAIL_RESTART_THRESHOLD consecutive
+    failed probes, and is rate limited. The watchdog never writes the heartbeat
+    itself — that would mask staleness used by the secondary stuck-detection,
+    whose freshness is owned by HeartbeatSession during active runs.
     """
     root = skills_root or SKILLS_ROOT
     try:
-        write_heartbeat(root)
-        health = read_health(root)
-        age = heartbeat_age_seconds(health)
         state = read_state(root)
 
-        if age is not None and age < STALE_HEARTBEAT_SEC:
-            append_log("tick ok", root)
-            return "ok"
-
-        cowork_up = is_cowork_running()
-        age_txt = f"{age}s" if age is not None else "missing"
-
-        if not cowork_up:
-            if can_restart(state):
-                notify_slack("⚠️ OpenClaw (Cowork) 停止検知。再起動を試みます。", level="error")
-                relaunch_cowork()
-                record_restart(state, "relaunched")
+        if not is_gateway_loaded():
+            # launchd is not managing the gateway at all — outside our restart
+            # contract. Surface it once per interval and let the operator decide.
+            now = datetime.now(timezone.utc)
+            last = _parse_ts(str(state.get("last_unloaded_notify") or ""))
+            if last is None or (now - last.astimezone(timezone.utc)).total_seconds() >= ABANDON_NOTIFY_INTERVAL_SEC:
+                notify_slack(
+                    f"🚨 launchd に {GATEWAY_LABEL} が登録されていません。"
+                    "gateway サービスの再インストールが必要かもしれません。",
+                    level="error",
+                )
+                state["last_unloaded_notify"] = _utc_now()
                 save_state(state, root)
-                append_log(f"restarted cowork (heartbeat {age_txt})", root)
+            append_log("gateway not loaded in launchd", root)
+            return "stuck"
+
+        healthy = is_gateway_healthy()
+        if not healthy:
+            streak = int(state.get("health_fail_streak", 0)) + 1
+            state["health_fail_streak"] = streak
+            if streak < HEALTH_FAIL_RESTART_THRESHOLD:
+                save_state(state, root)
+                append_log(f"gateway unhealthy streak={streak} (waiting)", root)
+                return "stuck"
+            if can_restart(state):
+                notify_slack(
+                    f"⚠️ gateway が応答しません (連続 {streak} 回)。強制再起動します。",
+                    level="error",
+                )
+                restart_gateway()
+                record_restart(state, "kickstart")
+                state["health_fail_streak"] = 0
+                save_state(state, root)
+                append_log(f"restarted gateway (unhealthy streak={streak})", root)
                 return "restarted"
             notify_slack(
-                "🚨 OpenClaw 再起動を 10 分以内に 3 回試行しましたが復旧しません。手動確認が必要です。",
+                "🚨 gateway 強制再起動を 10 分以内に 3 回試行しましたが応答しません。手動確認が必要です。",
                 level="error",
             )
             record_restart(state, "abandoned")
             save_state(state, root)
-            append_log(f"abandoned (heartbeat {age_txt})", root)
+            append_log("abandoned (gateway unhealthy)", root)
             return "abandoned"
 
-        notify_slack(
-            f"⚠️ Cowork は生存中ですが heartbeat が {age_txt} 前から停止しています。スレッド詰まり疑い。",
-            level="warn",
-        )
-        append_log(f"stuck cowork alive heartbeat {age_txt}", root)
-        return "stuck"
+        # Gateway responsive: clear failure streak and run the secondary
+        # stuck-detection (active run whose heartbeat stopped advancing).
+        changed = False
+        if state.get("health_fail_streak"):
+            state["health_fail_streak"] = 0
+            changed = True
+
+        health = read_health(root)
+        age = heartbeat_age_seconds(health)
+        active = collect_active_runs(root)
+        if active and age is not None and age >= STALE_HEARTBEAT_SEC:
+            now = datetime.now(timezone.utc)
+            last = _parse_ts(str(state.get("last_stuck_notify") or ""))
+            if last is None or (now - last.astimezone(timezone.utc)).total_seconds() >= ABANDON_NOTIFY_INTERVAL_SEC:
+                notify_slack(
+                    f"⚠️ gateway は応答していますが、実行中 run の heartbeat が {age}s 前から"
+                    "更新されていません。タスクが詰まっている可能性があります。",
+                    level="warn",
+                )
+                state["last_stuck_notify"] = _utc_now()
+                changed = True
+            if changed:
+                save_state(state, root)
+            append_log(f"stuck heartbeat {age}s active_runs={len(active)}", root)
+            return "stuck"
+
+        if state.get("last_stuck_notify"):
+            state["last_stuck_notify"] = None
+            changed = True
+        if changed:
+            save_state(state, root)
+        append_log("tick ok", root)
+        return "ok"
     except Exception as exc:
         append_log(f"tick error: {exc!s}", root)
         return "error"

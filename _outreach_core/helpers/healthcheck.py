@@ -299,15 +299,27 @@ def cmd_touch_command(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _refresh_then_read() -> dict[str, Any] | None:
+    """Recompute the heartbeat on demand so ping/status never show stale data.
+
+    A user asking "進捗どう？" implies OpenClaw is responding right now, so a fresh
+    ts is truthful at this moment. Falls back to the last written file if the
+    refresh fails for any reason.
+    """
+    try:
+        write_heartbeat()
+    except Exception:
+        pass
+    return read_health()
+
+
 def cmd_ping(_args: argparse.Namespace) -> int:
-    health = read_health()
-    print(format_ping_line(health))
+    print(format_ping_line(_refresh_then_read()))
     return 0
 
 
 def cmd_status(_args: argparse.Namespace) -> int:
-    health = read_health()
-    print(format_status(health))
+    print(format_status(_refresh_then_read()))
     return 0
 
 
