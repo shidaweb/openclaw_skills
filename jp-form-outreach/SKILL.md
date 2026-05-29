@@ -93,14 +93,18 @@ cd ~/.openclaw/skills
 ./healthcheck touch-command   # Slack 受信時に last_command_at を更新（任意）
 ```
 
-**cron（推奨）**: 1 分毎に heartbeat を更新:
+heartbeat は専用 cron 不要。実行中は `HeartbeatSession` が**実進捗（tick）ごと**に
+`system_health/<host>.json` を更新し、`./healthcheck ping/status` は呼ばれる度に
+その場で再計算するため常に最新を返す。
 
-```bash
-openclaw cron add --schedule "* * * * *" \
-  "doorman: cd ~/.openclaw/skills && python3 -m _outreach_core.helpers.healthcheck write-heartbeat"
-```
+**watchdog（§15-C、インストール済み）**: `scripts/install-watchdog.sh` で launchd 60 秒 tick。
+監視対象は launchd 管理の `ai.openclaw.gateway`（agent runtime）。
 
-**watchdog（§15-C、任意）**: `scripts/install-watchdog.sh` で launchd 60 秒 tick。
+- gateway プロセス**死亡**は gateway 自身の launchd `KeepAlive` が自動復旧（OS レベル）。
+- watchdog は `openclaw health` で**応答性**を確認し、連続失敗時のみ
+  `launchctl kickstart -k` で**hung した gateway を強制再起動**（10 分 3 回まで、超過で手動エスカレーション）。
+- 実行中 run の heartbeat が 5 分以上止まったら「タスク詰まり」を Slack 警告。
+- 状態確認: `tail -5 data/watchdog.log` / 再インストール `scripts/install-watchdog.sh` / 解除 `scripts/uninstall-watchdog.sh`。
 
 ## Stateless context reconstruction
 
