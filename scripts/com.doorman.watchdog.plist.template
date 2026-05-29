@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.doorman.watchdog</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{PYTHON3}}</string>
+    <string>-m</string>
+    <string>_outreach_core.helpers.watchdog</string>
+    <string>tick</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>{{SKILLS_DIR}}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>{{SKILLS_DIR}}</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>KeepAlive</key>
+  <false/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{{SKILLS_DIR}}/data/watchdog.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{SKILLS_DIR}}/data/watchdog.err</string>
+</dict>
+</plist>

@@ -18,6 +18,29 @@ description: |
 
 # jp-form-outreach
 
+## Auto-acknowledge (MANDATORY, 最優先ルール)
+
+非自明なリクエスト（list-build / campaign / draft / send / preview / enrich /
+status 確認 など）を Slack で受けたら、**他のどの SKILL.md 規約より先に**、
+agent は 5 秒以内に必ず thread 返信する:
+
+```
+👍 受信しました。<brief_id> · <skill> で進めます。
+推定所要 ~X 分です。
+```
+
+- ack 投稿は **thread 内**で行う（親階層は run 開始時の状態通知のみ）
+- ack を出すまで OpenClaw / run.py のサブコマンドは 1 つも叩かない
+- ack 後に Session start confirmation（次節）→ Stateless reconstruction → 実作業
+- もし brief / channel 未確定で確認が要る場合、ack の続きで「ところで、どの brief で
+  進めますか？」と質問する形にする（**先に ack だけは必ず出す**）
+- 「ping」「生きてる？」「status」のような軽量問い合わせは、ack 不要で 5 秒以内に
+  本回答を返す（§15-B 参照）
+
+**なぜ必須か**: ユーザーは Slack で命令を投げた後「届いた？動いてる？」と不安になる。
+無音時間を絶対に作らない設計が、OpenClaw 系プロダクトの操作可能感を担保する。
+
+
 ## Session start: brief & channel confirmation (MANDATORY)
 
 新規セッションで list-build / campaign / draft / send / preview など
@@ -41,7 +64,10 @@ description: |
 | 品質ポイント教えて | `../report draft-quality --since 7d` |
 | 送信ファネル見せて | `../report send-funnel --since 7d` |
 | needs_attention まとめて | `../report needs-attention` |
-| 全部止めて | `active_run.lock` の pid を停止 |
+| 全部止めて | `brief stop-run --brief <id>` |
+| **ping** / **生きてる？** | `cd ~/.openclaw/skills && ./healthcheck ping`（5 秒以内に 1 行返答） |
+| **status** / **詳しく** | `./healthcheck status` |
+| **watchdog 元気？** | `tail -1 data/watchdog.log` |
 
 **Slack 経由**: チャンネルが `data/channel_state/<channel_id>.json` にバインド済みなら、毎スレッドの brief 確認は省略し、一行「`torana-line-crm` × jp_form で進めます」と明示してから実行。未バインドチャンネルは §14-N onboarding wizard。
 
@@ -55,6 +81,26 @@ description: |
 # または
 python3 ../brief bind --channel-id C09... --brief torana-line-crm
 ```
+
+## Health check commands（§15-B）
+
+Slack で **ping / 生きてる？ / status** を受けたら Auto-ack 不要で即答:
+
+```bash
+cd ~/.openclaw/skills
+./healthcheck ping      # 1 行: heartbeat 経過秒・active runs・needs_attention
+./healthcheck status    # ping + system_health JSON + events 末尾
+./healthcheck touch-command   # Slack 受信時に last_command_at を更新（任意）
+```
+
+**cron（推奨）**: 1 分毎に heartbeat を更新:
+
+```bash
+openclaw cron add --schedule "* * * * *" \
+  "doorman: cd ~/.openclaw/skills && python3 -m _outreach_core.helpers.healthcheck write-heartbeat"
+```
+
+**watchdog（§15-C、任意）**: `scripts/install-watchdog.sh` で launchd 60 秒 tick。
 
 ## Stateless context reconstruction
 
@@ -135,18 +181,33 @@ reCAPTCHA / 確認画面待ちで `needs_attention` になったら、ユーザ�
 
 ラジオ選択後に出る必須項目は `fill_form_with_plan` が検知する。plan にあれば自動入力、なければ `needs_attention` + Slack → `resolve --field key=value` で再送。
 
-## OpenClaw エージェント: 進捗通知（必須）
+## OpenClaw エージェント: 応答保証と進捗通知（必須）
 
-長時間タスクでは **約5分ごとに Slack へ状況を投稿**。詳細は [`docs/OPENCLAW_AGENT.md`](../docs/OPENCLAW_AGENT.md)。
+### Slack ターンをブロックしない（最重要・§15）
+
+長時間タスク（campaign / send / enrich / draft）は **前景実行禁止**。
+必ず detached 起動し、即座に run_id を返してターンを終える:
+
+```bash
+cd ~/.openclaw/skills
+./job start jp-form-outreach campaign --brief torana-line-crm --limit 5 \
+  --slack-channel-id "$DOORMAN_SLACK_CHANNEL_ID" --slack-thread-ts "$DOORMAN_SLACK_THREAD_TS"
+```
+
+`./job start` が **開始 🚀 / 心拍 … / 終了 ✅❌**（成功・失敗・例外いずれも）を
+Python から直接 Slack 投稿する。エージェントは起動後すぐ自由になる。
+
+- 受信したら **5 秒以内に一言 ack**（必要なら `./healthcheck touch-command`）
+- 「進捗どう？」→ `./healthcheck ping` / `./brief status --brief <id>`（file から即答）
+- 詳細は [`docs/OPENCLAW_AGENT.md`](../docs/OPENCLAW_AGENT.md)
+
+### 段階実行（手動で stage を回す稀なケース）
 
 ```bash
 cd ~/.openclaw/skills/jp-form-outreach
-nohup .venv/bin/python heartbeat_watch.py >> /tmp/doorman-hb.log 2>&1 &   # 手動段階実行時
-.venv/bin/python run.py campaign --limit 5 --clean   # または campaign（各 stage --heartbeat auto 推奨）
-.venv/bin/python heartbeat_watch.py --once           # 進捗どう？ / 5分ごとのフォロー
+nohup .venv/bin/python heartbeat_watch.py >> /tmp/doorman-hb.log 2>&1 &
+.venv/bin/python run.py send --ids 1 --auto-send --heartbeat auto
 ```
-
-`run.py send` には `--heartbeat auto` を付ける（webhook または OpenClaw `botToken` 経由で約5分ごとに投稿）。
 
 ### 構造化ログ（v4 §13）
 

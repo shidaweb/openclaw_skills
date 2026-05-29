@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""Run Doorman healthcheck CLI from any directory."""
+from __future__ import annotations
+
+import runpy
+import sys
+from pathlib import Path
+
+_SKILLS_ROOT = Path(__file__).resolve().parent
+if str(_SKILLS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SKILLS_ROOT))
+
+runpy.run_module("_outreach_core.helpers.healthcheck", run_name="__main__")

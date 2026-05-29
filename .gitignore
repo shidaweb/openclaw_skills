@@ -34,6 +34,11 @@ data/channel_state/C*.json
 
 # Shared core runtime data
 _outreach_core/data/
+data/system_health/
+data/watchdog.log
+data/watchdog.err
+data/watchdog.state.json
+data/job_logs/
 
 # Per-skill escalation / progress logs
 **/data/needs_attention.jsonl

@@ -1549,7 +1549,325 @@ python3 jp-form-outreach/run.py preview --brief torana-line-crm --no-send
 
 ---
 
-## 15. v4 まとめ・チェックポイント（v3 §12 を統合）
+## 15. v4 追加: 監視と自動復旧（運用安心感の確保）
+
+### 15-A. 目的と 3 層構成
+
+ユーザーが Slack で命令を投げたとき「届いたか / 動いているか / 詰まっているか」が
+即座に分かり、もし OpenClaw 自体が落ちていても **外部からの自動検知と再起動** が
+かかる状態にする。
+
+**3 層構成:**
+
+| Layer | 何をするか | 実装場所 | 状態 |
+|---|---|---|---|
+| **Layer 1: Auto-ack** | 命令受信 5 秒以内に Slack に 👍 返信 | SKILL.md（**v4 ですでに実装済**） | ✅ |
+| **Layer 2: ping / status / healthcheck** | 「生きてる？」に即答、heartbeat ファイル更新 | `_outreach_core/helpers/healthcheck.py` + SKILL.md | **本節 §15-B** |
+| **Layer 3: 外部 watchdog + 自動再起動** | OpenClaw 死亡時に launchd 配下の番犬が検知・通知・relaunch | `_outreach_core/helpers/watchdog.py` + `~/Library/LaunchAgents/com.doorman.watchdog.plist` | **本節 §15-C** |
+
+Layer 1 が「OpenClaw 自身が生きていることの即時シグナル」、
+Layer 2 が「対話的に状況を確認できる手段」、
+Layer 3 が「OpenClaw が**死んでいる**時の最後の砦」。それぞれ独立に効く。
+
+### 15-B. Layer 2: ping / status / healthcheck
+
+#### 15-B-1. healthcheck.py（heartbeat 書き込み）
+
+`_outreach_core/helpers/healthcheck.py` を新設:
+
+```python
+def write_heartbeat(
+    skills_root: Path | None = None,
+    *,
+    openclaw_pid: int | None = None,
+    slack_connected: bool | None = None,
+    extra: dict[str, Any] | None = None,
+) -> Path:
+    """Write data/system_health/<hostname>.json. Idempotent. Never raises."""
+```
+
+書き込み内容（スキーマ）:
+
+```json
+{
+  "host": "norimitsushida-mbp",
+  "ts": "2026-05-26T15:30:00Z",
+  "openclaw_pid": 12345,
+  "slack_connected": true,
+  "last_command_at": "2026-05-26T15:25:00Z",
+  "active_runs": [
+    {
+      "brief_id": "torana-line-crm",
+      "skill": "jp-form-outreach",
+      "run_id": "20260526-152000",
+      "stage": "send",
+      "current": 4,
+      "total": 10,
+      "thread_ts": "1716714800.123456"
+    }
+  ],
+  "open_needs_attention_count": 0,
+  "doorman_version": "v4"
+}
+```
+
+ファイル位置: `~/.openclaw/skills/data/system_health/<hostname>.json`。
+
+#### 15-B-2. heartbeat の更新タイミング
+
+3 経路で更新する:
+
+1. **`openclaw cron`** に 1 分毎の更新タスクを登録:
+   ```bash
+   openclaw cron add --schedule "* * * * *" \
+     "doorman: python3 -m _outreach_core.helpers.healthcheck write-heartbeat"
+   ```
+   → これが基本のリズム
+
+2. **`progress.HeartbeatSession`** の start/tick/end で同 helper を呼び、active_runs を反映
+
+3. **agent が Slack で受信した時**に `last_command_at` を更新（軽量 helper を SKILL.md から呼び出す）
+
+#### 15-B-3. ping / status / health コマンド
+
+SKILL.md に追記（両 SKILL.md 共通）:
+
+```markdown
+## Health check commands
+
+以下の発話は **Auto-ack 不要、5 秒以内に即答**:
+
+| 発話 | 行動 |
+|---|---|
+| 「ping」「生きてる？」 | data/system_health/<host>.json を読み、heartbeat の経過秒・active_run 数・open needs_attention 数を 1 行で返答 |
+| 「status」「詳しく」 | 同上 + 直近 events.jsonl 末尾 5 件を整形 |
+| 「watchdog 元気？」 | data/watchdog.log 末尾 1 行 + 直近 1 時間の再起動回数 |
+
+返答例:
+> ✅ alive. heartbeat 12 秒前 / active runs: 1 (jp-form send 4/10) /
+> open needs_attention: 2 件 / 直近 event: send.verify.completed (kitanotatsujin)
+```
+
+#### 15-B-4. 受け入れ条件（§15-B 部分）
+
+22. `python3 -m _outreach_core.helpers.healthcheck write-heartbeat` が
+    `data/system_health/<host>.json` を作成・更新する
+23. `write_heartbeat()` が例外を投げず、書き込み失敗時も呼び出し元を落とさない
+24. SKILL.md の health check commands に従い、「ping」発話で 5 秒以内に
+    heartbeat 経過秒数を含む 1 行返答が返ること（手動テスト OK）
+25. progress.HeartbeatSession の start/tick/end が active_runs フィールドを
+    更新する（ユニットテスト追加）
+
+### 15-C. Layer 3: 外部 watchdog + launchd
+
+#### 15-C-1. ファイル構成
+
+```
+~/.openclaw/skills/
+├── _outreach_core/
+│   └── helpers/
+│       ├── healthcheck.py
+│       └── watchdog.py             # 番犬本体
+├── scripts/
+│   ├── install-watchdog.sh         # launchd plist 配置 + launchctl load
+│   ├── uninstall-watchdog.sh       # launchctl unload + plist 削除
+│   └── com.doorman.watchdog.plist.template
+└── data/
+    ├── system_health/<host>.json   # ← Layer 2 で更新
+    ├── watchdog.log                # 番犬のログ
+    └── watchdog.state.json         # 再起動レートリミット用
+```
+
+#### 15-C-2. watchdog.py のロジック
+
+```python
+def tick():
+    """1 回のチェック。launchd から 60 秒毎に呼ばれる。"""
+    health = read_heartbeat()
+    age = now() - health.ts if health else None
+    state = read_watchdog_state()
+
+    # 1. heartbeat が新鮮なら何もしない
+    if age and age < timedelta(minutes=5):
+        return "ok"
+
+    # 2. heartbeat が古い → OpenClaw 停止 or 詰まり
+    cowork_running = is_cowork_running()
+
+    if not cowork_running:
+        if state.can_restart():
+            notify_slack(
+                "⚠️ OpenClaw (Cowork) 停止検知。再起動を試みます。",
+                level="error"
+            )
+            relaunch_cowork()
+            state.record_restart()
+            save_state(state)
+            return "restarted"
+        else:
+            notify_slack(
+                "🚨 OpenClaw 再起動を 10 分以内に 3 回試行しましたが復旧しません。"
+                "手動確認が必要です。",
+                level="error"
+            )
+            return "abandoned"
+    else:
+        # Cowork は動いているが heartbeat だけ古い
+        # → エージェント側の Slack 接続が切れている / メイン処理がブロックされている
+        notify_slack(
+            f"⚠️ Cowork は生存中ですが heartbeat が {age.total_seconds():.0f} 秒前から"
+            f"停止しています。スレッド詰まり疑い。",
+            level="warn"
+        )
+        return "stuck"
+```
+
+#### 15-C-3. 再起動レートリミット
+
+`data/watchdog.state.json`:
+```json
+{
+  "restart_attempts": [
+    {"ts": "2026-05-26T15:00:00Z", "outcome": "relaunched"},
+    {"ts": "2026-05-26T15:03:00Z", "outcome": "relaunched"}
+  ],
+  "abandoned_until": null
+}
+```
+
+- 直近 10 分以内に 3 回まで再起動を試みる
+- 3 回失敗したら 30 分間 `abandoned` 状態（追加再起動しない）
+- abandoned 時は **5 分毎に「人を呼んで」Slack に通知**（noisy だが安全）
+
+#### 15-C-4. 必須ヘルパー関数
+
+```python
+def is_cowork_running() -> bool:
+    """pgrep -f 'Cowork' で検出。子プロセスでなく親 .app を見る。"""
+
+def relaunch_cowork() -> bool:
+    """subprocess.run(['open', '-a', 'Cowork'])"""
+
+def notify_slack(text: str, *, level: str) -> bool:
+    """sender_brief.yaml の slack.incoming_webhook_url を使う。
+    _outreach_core.notify.post を再利用してもよい。"""
+```
+
+#### 15-C-5. launchd plist テンプレート
+
+`scripts/com.doorman.watchdog.plist.template`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.doorman.watchdog</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{PYTHON3}}</string>
+    <string>-m</string>
+    <string>_outreach_core.helpers.watchdog</string>
+    <string>tick</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>{{SKILLS_DIR}}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>{{SKILLS_DIR}}</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>KeepAlive</key>
+  <false/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{{SKILLS_DIR}}/data/watchdog.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{SKILLS_DIR}}/data/watchdog.err</string>
+</dict>
+</plist>
+```
+
+- `KeepAlive: false` + `StartInterval: 60` の組み合わせで「**60 秒毎に 1 回起動して終了する**」モデル
+- 各 tick が独立プロセス（メモリ漏れ・状態破壊リスクなし）
+- 例外で落ちても次の 60 秒で復活
+
+`scripts/install-watchdog.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+SKILLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PYTHON3="$(command -v python3)"
+PLIST_DST="$HOME/Library/LaunchAgents/com.doorman.watchdog.plist"
+
+sed -e "s|{{SKILLS_DIR}}|$SKILLS_DIR|g" \
+    -e "s|{{PYTHON3}}|$PYTHON3|g" \
+    "$SKILLS_DIR/scripts/com.doorman.watchdog.plist.template" > "$PLIST_DST"
+
+launchctl unload "$PLIST_DST" 2>/dev/null || true
+launchctl load "$PLIST_DST"
+
+echo "✅ watchdog installed. Check: launchctl list | grep doorman"
+echo "   Log: tail -f $SKILLS_DIR/data/watchdog.log"
+```
+
+`scripts/uninstall-watchdog.sh`:
+
+```bash
+#!/usr/bin/env bash
+PLIST="$HOME/Library/LaunchAgents/com.doorman.watchdog.plist"
+launchctl unload "$PLIST" 2>/dev/null || true
+rm -f "$PLIST"
+echo "✅ watchdog uninstalled"
+```
+
+#### 15-C-6. プライバシー / 安全装置
+
+- watchdog は **個人情報を Slack に送らない**（heartbeat の構造データのみ）
+- relaunch_cowork は **`open -a Cowork`** だけ。kill -9 は禁止（データ破損リスク）
+- abandoned 時に Slack 通知を 5 分毎に出すのは「沈黙の方が危険」のため
+- watchdog 自身が落ちる可能性に備え、`StartInterval: 60` の new-process モデルを採用
+
+#### 15-C-7. 受け入れ条件（§15-C 部分）
+
+26. `watchdog.py tick` が新鮮な heartbeat の時 `"ok"` を返し、Slack に通知しないこと
+27. 5 分以上古い heartbeat + Cowork 死亡で `"restarted"` を返し、`open -a Cowork` を呼ぶこと
+28. 10 分以内 3 回再起動を試みても heartbeat が新鮮にならない場合、`"abandoned"` 状態に遷移すること
+29. `install-watchdog.sh` を実行すると `launchctl list | grep doorman` で表示されること（macOS 環境必須）
+30. uninstall すると launchd から消えること
+31. watchdog 自身の例外で Slack 通知や再起動ロジックが落ちないこと（テストで例外注入）
+
+### 15-D. 作業順序（推奨）
+
+1. `_outreach_core/helpers/healthcheck.py` 実装 — 30 分
+2. `progress.py` を healthcheck と連携（active_runs 更新） — 30 分
+3. SKILL.md に health check commands 追記 — 15 分
+4. ping / status のテスト（モック evaluate） — 30 分
+5. `_outreach_core/helpers/watchdog.py` 実装 — 1.5 時間
+6. レートリミット state 管理 — 30 分
+7. plist テンプレ + install/uninstall スクリプト — 30 分
+8. watchdog のユニットテスト（モック heartbeat / 模擬 Cowork PID） — 1 時間
+9. `openclaw cron add` の手順を README にドキュメント化 — 15 分
+
+**合計 約 5 時間**。Layer 2 を先に通すと安心感がすぐ得られる。Layer 3 は後でも可。
+
+### 15-E. やらないこと
+
+- **VPS 上のリモート watchdog**（外販時の選択肢になるが今はスコープ外）
+- **Anthropic API の health-check**（不安定要素を増やすので保留）
+- **systemd 対応**（macOS が当面の主戦場）
+- **OpenClaw の kill -9 + 再起動**（データ破損リスク）
+
+---
+
+## 16. v4 まとめ・チェックポイント（v3 §12 を統合）
 
 ### v4 で増えたモデル料金
 - draft: Sonnet → **Opus 4.7** に切替（~8 倍のコスト、月数十ドル）

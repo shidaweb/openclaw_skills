@@ -16,6 +16,29 @@ description: |
 
 # linkedin-outreach
 
+## Auto-acknowledge (MANDATORY, 最優先ルール)
+
+非自明なリクエスト（fetch-leads / campaign / draft / send / preview / status 確認 など）
+を Slack で受けたら、**他のどの SKILL.md 規約より先に**、agent は 5 秒以内に必ず
+thread 返信する:
+
+```
+👍 受信しました。<brief_id> · <skill> で進めます。
+推定所要 ~X 分です。
+```
+
+- ack 投稿は **thread 内**で行う
+- ack を出すまで OpenClaw / run.py のサブコマンドは 1 つも叩かない
+- ack 後に Session start confirmation（次節）→ Stateless reconstruction → 実作業
+- もし brief / channel 未確定で確認が要る場合、ack の続きで「ところで、どの brief で
+  進めますか？」と質問する形にする（**先に ack だけは必ず出す**）
+- 「ping」「生きてる？」「status」のような軽量問い合わせは、ack 不要で 5 秒以内に
+  本回答を返す（§15-B 参照）
+
+**なぜ必須か**: ユーザーは Slack で命令を投げた後「届いた？動いてる？」と不安になる。
+無音時間を絶対に作らない設計が、OpenClaw 系プロダクトの操作可能感を担保する。
+
+
 ## Session start: brief & channel confirmation (MANDATORY)
 
 新規セッションで fetch / campaign / draft / send など **データ生成・送信を伴う**
@@ -34,10 +57,17 @@ description: |
 | needs_attention まとめて | `../report needs-attention` |
 | 新しい brief を作って | §14-N onboarding → `brief write-from-json` |
 | 全部止めて | `brief stop-run --brief <id>` |
+| **ping** / **生きてる？** | `cd ~/.openclaw/skills && ./healthcheck ping` |
+| **status** / **詳しく** | `./healthcheck status` |
+| **watchdog 元気？** | `tail -1 ~/.openclaw/skills/data/watchdog.log` |
+
+**Slack ターンをブロックしない（最重要・§15）**: 長時間タスクは前景実行せず detached 起動:
 
 ```bash
-cd ~/.openclaw/skills/linkedin-outreach
-.venv/bin/python run.py campaign --brief torana-line-crm --input targets/torana-line-crm.csv --limit 5
+cd ~/.openclaw/skills
+./job start linkedin-outreach campaign --brief torana-line-crm --input targets/torana-line-crm.csv --limit 5 \
+  --slack-channel-id "$DOORMAN_SLACK_CHANNEL_ID" --slack-thread-ts "$DOORMAN_SLACK_THREAD_TS"
+# → 即 run_id 返却。開始🚀 / 心拍… / 終了✅❌ は Python が直接 Slack 投稿。
 ```
 
 進捗・`history`・`brief list` のみ確認省略可。
@@ -59,6 +89,10 @@ python3 -m _outreach_core.helpers.brief status --brief torana-line-crm --skill l
 ```
 
 Cookie 同意バナーは page open 直後に自動 dismiss（`browser.cookie_consent` in brief YAML）。InMail 送信は Slack 確認後 `--auto-send`（`stage_send` は stdin 不使用）。
+
+## Health check commands（§15-B）
+
+`jp-form-outreach/SKILL.md` の Health check セクションと同じ。`./healthcheck ping` / `status` / `touch-command`。長時間タスク中は `HeartbeatSession` が `data/system_health/<host>.json` を自動更新。
 
 This skill drives a full LinkedIn InMail outreach pipeline using the OpenClaw
 browser plugin (Chrome with the user's signed-in profile) and the OpenClaw

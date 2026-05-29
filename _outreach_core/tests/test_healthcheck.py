@@ -1,0 +1,89 @@
+"""healthcheck (v4 §15-B)."""
+
+from __future__ import annotations
+
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
+from _outreach_core import progress
+from _outreach_core.active_run import acquire_lock, remove_lock
+from _outreach_core.helpers import healthcheck as hc
+
+
+class TestHealthcheck(unittest.TestCase):
+    def test_write_heartbeat_creates_file(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with mock.patch.object(hc, "SKILLS_ROOT", root):
+                path = hc.write_heartbeat(root)
+            self.assertTrue(path.is_file())
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(data["doorman_version"], "v4")
+            self.assertIn("ts", data)
+
+    def test_write_heartbeat_never_raises_on_failure(self) -> None:
+        with mock.patch.object(hc, "health_path", side_effect=OSError("disk full")):
+            path = hc.write_heartbeat()
+            self.assertIsInstance(path, Path)
+
+    def test_collect_active_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            data = root / "jp-form-outreach" / "data" / "briefs" / "test-brief"
+            data.mkdir(parents=True)
+            acquire_lock(
+                data,
+                run_id="r1",
+                stage="send",
+                total_targets=10,
+                skill="jp-form-outreach",
+                brief_id="test-brief",
+            )
+            with mock.patch.object(hc, "SKILLS_ROOT", root):
+                runs = hc.collect_active_runs(root)
+            self.assertEqual(len(runs), 1)
+            self.assertEqual(runs[0]["brief_id"], "test-brief")
+            remove_lock(data)
+
+    def test_format_ping_line(self) -> None:
+        line = hc.format_ping_line(
+            {
+                "ts": hc._utc_now(),
+                "active_runs": [],
+                "open_needs_attention_count": 0,
+            }
+        )
+        self.assertIn("alive", line)
+        self.assertIn("heartbeat", line)
+
+    def test_heartbeat_session_syncs_health(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill = root / "jp-form-outreach"
+            data = skill / "data" / "briefs" / "b1"
+            data.mkdir(parents=True)
+            with mock.patch.object(hc, "SKILLS_ROOT", root), mock.patch.object(
+                progress, "load_merged_config", side_effect=FileNotFoundError
+            ), mock.patch.object(progress, "load_runtime_config", return_value={}):
+                hb = progress.HeartbeatSession(
+                    skill,
+                    "draft",
+                    3,
+                    heartbeat=None,
+                    data_dir=data,
+                )
+                hb.start("test")
+                hb.tick(1, "one")
+                hb.end("done")
+            health_path = root / "data" / "system_health" / f"{hc.hostname()}.json"
+            self.assertTrue(health_path.is_file())
+
+
+if __name__ == "__main__":
+    unittest.main()

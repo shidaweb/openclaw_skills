@@ -1,4 +1,47 @@
-# OpenClaw エージェント向け — Doorman 進捗通知
+# OpenClaw エージェント向け — Doorman 進捗通知と応答保証
+
+## 0. 最重要ルール: Slack ターンを絶対にブロックしない（§15 信頼性）
+
+長時間パイプライン（campaign / send / enrich / draft / research）を
+**前景で実行してはならない**。前景実行はエージェントのターンを数分〜十数分
+占有し、その間 Slack に応答できず「反応しない」状態を生む（最大の障害原因）。
+
+**必ず `./job start` で detached 起動する:**
+
+```bash
+cd ~/.openclaw/skills
+./job start jp-form-outreach campaign --brief torana-line-crm --limit 5 \
+  --slack-channel-id "$DOORMAN_SLACK_CHANNEL_ID" \
+  --slack-thread-ts "$DOORMAN_SLACK_THREAD_TS"
+# → 即座に run_id / pid を返す。ターンはすぐ終えてよい。
+```
+
+`./job start` が保証すること（エージェントが無言でも届く）:
+1. 🚀 **開始**通知（起動直後に Python が同期投稿）
+2. … 心拍（run.py の HeartbeatSession が約5分毎に投稿）
+3. ✅/❌ **終了**通知（成功・失敗・例外いずれでも supervisor が投稿）
+
+### 受信即 ack（必須）
+
+ユーザーの指示を受けたら **5 秒以内に一言** 返す（「了解、torana-line-crm で
+campaign を起動します」）。受信記録を残すなら:
+
+```bash
+cd ~/.openclaw/skills && ./healthcheck touch-command
+```
+
+### 「進捗どう？」「生きてる？」への即答（file ベース・ターンを占有しない）
+
+```bash
+cd ~/.openclaw/skills
+./healthcheck ping        # heartbeat 経過秒 / active runs / needs_attention 件数
+./healthcheck status      # 上記 + system_health JSON + events 末尾
+./brief status --brief torana-line-crm   # 進行中 run の stage / 件数を file から再構築
+```
+
+---
+
+## 1. 旧: 進捗通知（detached 起動なら自動で担保）
 
 長時間の Doorman タスクでは **約5分ごとに Slack へ進捗を投稿する**（ユーザー不安の解消）。これは Python パイプラインと **エージェント自身のフォロー** の両方で担保する。
 

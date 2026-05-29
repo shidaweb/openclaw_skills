@@ -99,6 +99,14 @@ class HeartbeatSession:
             cfg = load_runtime_config(brief_id)
         self._interval = heartbeat_interval_sec(cfg)
 
+    def _sync_system_health(self) -> None:
+        try:
+            from _outreach_core.helpers.healthcheck import write_heartbeat
+
+            write_heartbeat()
+        except Exception:
+            pass
+
     def start(self, message: str = "") -> None:
         self._started_at = time.time()
         self._last_action = message or f"{self.task} started"
@@ -106,6 +114,7 @@ class HeartbeatSession:
             self.data_dir,
             {"event": "start", "task": self.task, "total": self.total, "message": self._last_action},
         )
+        self._sync_system_health()
         if self.heartbeat_mode == "slack":
             from _outreach_core.notify import post
 
@@ -140,6 +149,7 @@ class HeartbeatSession:
                 "message": self._last_action,
             },
         )
+        self._sync_system_health()
 
     def end(self, message: str = "") -> None:
         self._stop.set()
@@ -163,6 +173,7 @@ class HeartbeatSession:
             from _outreach_core.notify import post
 
             post(summary, level="info", thread_ts=None)
+        self._sync_system_health()
 
     def _refresh_from_log(self) -> None:
         """Pick up child-stage ticks written to current_task.jsonl by subprocesses."""
