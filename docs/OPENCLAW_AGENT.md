@@ -76,3 +76,28 @@ tail -5 data/current_task.jsonl
 ```
 
 詳細は `linkedin-outreach/SKILL.md` の「OpenClaw エージェント: 進捗通知（必須）」を参照。
+
+---
+
+## 4. 自律モード（autonomous）— 人にいちいち確認しない（v5 §12）
+
+brief が `autonomy.mode: autonomous` のとき、エージェントの振る舞いは変わる。
+
+**やらないこと**: ドラフトを 1 件ずつ「送っていい？」と聞かない。reCAPTCHA / 想定外フォーム /
+submit 不明で人を待たない。skip 判断・スクリーニングを人に委ねない。
+
+**やること**:
+1. 受信即 ack（5 秒以内・従来どおり）。
+2. `./job start jp-form-outreach campaign --brief <id>` を detached 起動。
+3. **初回だけ**: campaign は brief＋リスト＋サンプルドラフトを 1 回提示して承認待ちで停止する。
+   ユーザーが「承認」と言ったら **そのターンで** `run.py approve-autonomy --brief <id>` を実行し、
+   再度 campaign を起動 → 全件自動送信。
+4. 以降は確認の往復なし。送信中の判断（自己採点で skip、ブロッカーで auto-skip）は Python が自動で行い、
+   結果のみ Slack に通知（heartbeat＋✅/⏭/❌ の終了サマリ）。
+5. 「自律状態どう？」には `run.py autonomy-status --brief <id>` で即答。
+
+**自己復旧**: run が落ちても campaign は冪等（送信済みを除外して再実行で再開）。gateway 自体の
+死活・hung・切断は §15 watchdog が自動再起動。エージェントは「止まってる？」と聞かれたら
+`./healthcheck ping` で確認し、必要なら campaign を再起動してよい（承認は維持されるので再承認は不要）。
+
+> brief が supervised（既定）なら従来どおり 1 件ずつ Slack 承認。混在運用は brief 単位で切り替わる。

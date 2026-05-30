@@ -91,6 +91,28 @@ cd ~/.openclaw/skills
 
 詳細はエージェント運用ガイド [`docs/OPENCLAW_AGENT.md`](./docs/OPENCLAW_AGENT.md)。
 
+## 自律運用（autonomous, v5）
+
+brief 単位で「人にいちいち確認しない」運用に切り替えられる（既定は従来の supervised）。
+
+- **品質は最初に1回だけ固める**: `mode: autonomous` の初回 campaign は brief＋リスト＋サンプル
+  ドラフトを提示して承認待ちで停止。`./job ... run.py approve-autonomy --brief <id>` で解禁。
+- **以降は確認なしで全件自動送信**。各ドラフトは送信前に自己採点（既定 threshold 0.75）され、
+  未満は自動スキップ＋記録。
+- **ブロッカーは自動スキップ＋記録**: 可視 reCAPTCHA v2 / 想定外フォーム / submit 不明 は人を待たず
+  skip して継続（reCAPTCHA は v3 warmup で出さない方針。突破はしない）。
+- **停止は自己復旧**: gateway の死活・hung・切断は watchdog が自動再起動、run は冪等で再開。
+
+```bash
+./job start jp-form-outreach campaign --brief <id>   # 初回は承認待ちで停止
+# Slack/CLI で承認
+cd jp-form-outreach && python run.py approve-autonomy --brief <id>
+python run.py autonomy-status --brief <id>           # mode / 承認状態を確認
+```
+
+設定は `sender_brief.yaml` の `autonomy:` ブロック（brief で上書き可）。詳細は
+[`CURSOR_INSTRUCTIONS.md`](./CURSOR_INSTRUCTIONS.md) §12。
+
 ## モデル方針（v4）
 
 | 用途 | モデル | 設定場所 |

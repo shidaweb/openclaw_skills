@@ -80,6 +80,69 @@ def cmd_draft_quality(args: argparse.Namespace) -> int:
     return 0
 
 
+def _skip_reason_bucket(reason: str) -> str:
+    """Group an auto-skip reason into a coarse bucket for the report.
+
+    Reasons look like ``"self_score_below_threshold: ..."`` or
+    ``"reCAPTCHA v2 visible (warmup insufficient)"`` — we key off a stable prefix
+    so the distribution stays readable across runs."""
+    r = (reason or "").strip()
+    low = r.lower()
+    if low.startswith("self_score"):
+        return "self_score_below_threshold"
+    if "recaptcha" in low or "captcha" in low:
+        return "captcha_v2_visible"
+    if "wrong_form" in low:
+        return "wrong_form_type"
+    if "first submit" in low:
+        return "first_submit_not_found"
+    if "confirm" in low and "submit" in low:
+        return "confirm_submit_not_found"
+    # fall back to the part before the first colon, else the whole string
+    return (r.split(":", 1)[0] or "other")[:40] or "other"
+
+
+def autonomous_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarise autonomous-mode outcomes from an event stream (v5 §12).
+
+    Pure function (no I/O) so it can be unit-tested directly. Returns ``None``
+    for ``active`` when no autonomous events are present, so callers can skip the
+    section entirely for supervised briefs.
+    """
+    scored = [e for e in events if e.get("kind") == "send.self_scored"]
+    auto_skipped = [e for e in events if e.get("kind") == "send.auto_skipped"]
+    awaiting = [e for e in events if e.get("kind") == "campaign.awaiting_upfront_approval"]
+
+    if not (scored or auto_skipped or awaiting):
+        return {"active": False}
+
+    sent = sum(1 for e in scored if (e.get("payload") or {}).get("send"))
+    gated = sum(1 for e in scored if not (e.get("payload") or {}).get("send"))
+    errored = sum(1 for e in scored if (e.get("payload") or {}).get("errored"))
+    raw_scores = [
+        (e.get("payload") or {}).get("score")
+        for e in scored
+        if isinstance((e.get("payload") or {}).get("score"), (int, float))
+    ]
+    avg_score = round(sum(raw_scores) / len(raw_scores), 3) if raw_scores else None
+
+    reasons: Counter[str] = Counter()
+    for e in auto_skipped:
+        reasons[_skip_reason_bucket((e.get("payload") or {}).get("reason", ""))] += 1
+
+    return {
+        "active": True,
+        "self_scored": len(scored),
+        "self_scored_sent": sent,
+        "self_scored_gated": gated,
+        "self_scored_errored": errored,
+        "avg_score": avg_score,
+        "auto_skipped": len(auto_skipped),
+        "skip_reasons": dict(reasons.most_common()),
+        "awaiting_upfront_approval": len(awaiting),
+    }
+
+
 def cmd_send_funnel(args: argparse.Namespace) -> int:
     data_dir = _skill_data_dir(args.skill, getattr(args, "brief", None))
     since = parse_since(args.since)
@@ -111,7 +174,29 @@ def cmd_send_funnel(args: argparse.Namespace) -> int:
             "",
         ]
     )
-    if not kinds:
+
+    auto = autonomous_summary(events)
+    if auto.get("active"):
+        lines.append("## autonomous (v5)")
+        if auto["awaiting_upfront_approval"]:
+            lines.append(
+                f"- ⏸ awaiting upfront approval: {auto['awaiting_upfront_approval']} "
+                f"(approve-autonomy で送信開始)"
+            )
+        avg = auto["avg_score"]
+        errored_n = auto["self_scored_errored"]
+        errored_frag = f" / errored {errored_n}" if errored_n else ""
+        lines.append(
+            f"- self-scored: {auto['self_scored']} "
+            f"(send {auto['self_scored_sent']} / gated {auto['self_scored_gated']}{errored_frag})"
+            + (f" · avg {avg}" if avg is not None else "")
+        )
+        lines.append(f"- auto-skipped: {auto['auto_skipped']}")
+        for reason, n in auto["skip_reasons"].items():
+            lines.append(f"    · {reason}: {n}")
+        lines.append("")
+
+    if not kinds and not auto.get("active"):
         lines.append("_No send events in range._")
     print("\n".join(lines))
     return 0

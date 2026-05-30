@@ -1906,4 +1906,73 @@ echo "✅ watchdog uninstalled"
 
 ---
 
+## 12. 自律運用プロファイル（v5、新設）
+
+**動機**: 「人間にいちいち確認しない／代わりに最初に品質を固める」運用への対応。
+従来は Approve フェーズで 1 件ずつ Slack 承認し、reCAPTCHA / 想定外フォーム / submit 不明で
+**人を待ってブロック**していた。v5 では brief 単位で *autonomous* プロファイルを opt-in できる。
+
+### 12-A. 設計原則（不変項を壊さない）
+
+- **完全に追加実装**。`autonomy.mode` 既定は `supervised`＝従来フロー完全維持。§3 の不変項
+  （6 フェーズ名・JSONL 名・append-only・既存サブコマンド表面互換）は不変。
+- 新規共通モジュール `_outreach_core/autonomy.py`（純 Python、自己採点の LLM 呼び出しは
+  `oc_infer_fn` を注入＝ユニットテスト可能）。`verify.py` 同様に LLM 直書きしない方針を踏襲。
+- 自律時の人手チェックポイントは **最初の1回（upfront approval）だけ**。
+
+### 12-B. autonomous モードの契約
+
+1. **品質を最初に固める**: `stage_campaign` が autonomous かつ未承認のとき、Pull→Enrich→Draft
+   まで進めて **brief＋リスト＋サンプルドラフト**を Slack に1回提示し
+   `campaign.awaiting_upfront_approval` を emit して停止（送信しない）。状態は
+   `data/briefs/<id>/autonomy_state.json`（`mark_pending_approval`）。
+2. **承認**: `run.py approve-autonomy --brief <id>` で `approved=true`。以降 `campaign` 再実行で
+   `_run_autonomous_send` が **全 sendable を mode=auto で自動送信**。
+3. **送信中は人を待たない**:
+   - **自己採点ゲート**: `self_score_draft`（既定 threshold 0.75、`on_error=send`＝品質は事前承認済の前提で fail-open）。
+     未満は `_auto_skip_and_log`。`send.self_scored` を emit。
+   - **ブロッカーは auto-skip**: v2 captcha 可視 / WRONG_FORM_TYPE / first submit 不明 / confirm submit 不明 は
+     `_handle_blocker(autonomous=True)` → `_auto_skip_and_log`（`skip_history` 追記＋`needs_attention` クローズ＋
+     `send.auto_skipped` emit）。**CAPTCHA は突破しない**（warmup で出さない方針／出たら捨てる）。
+   - reCAPTCHA v3 は §11-A-8 の warmup（`passthrough_with_warmup`）でスコアを上げ、そもそも出さない。
+4. **停止の自己復旧**: gateway 死活・hung・チャンネル切断は §15 watchdog が自動再起動。run は冪等＝
+   再実行で送信済み除外して再開。`autonomy.self_restart`（既定 true）。
+5. **承認の取り消し**: `approve-autonomy --revoke`（リスト/brief を大きく変えたら再承認させる）。
+
+### 12-C. 設定（brief / sender_brief.yaml）
+
+```yaml
+autonomy:
+  mode: "autonomous"           # supervised(既定) | autonomous
+  on_blocker: "skip_and_log"   # skip_and_log | escalate
+  self_restart: true
+  draft_self_score:
+    enabled: true
+    threshold: 0.75
+    on_error: "send"           # send(fail-open) | skip(fail-closed)
+  upfront_approval:
+    required: true
+    sample_drafts: 3
+```
+
+### 12-D. Slack トリガー追加
+
+| ユーザー発話 | エージェントの行動 |
+|---|---|
+| 「自律モードにして」/「全部任せる」 | brief を `mode: autonomous` に → `campaign --clean`（初回は承認待ちで停止） |
+| 「承認」/「OK 進めて」（承認待ち中） | `run.py approve-autonomy --brief <id>` → `campaign` 再実行で全件自動送信 |
+| 「自律状態どう？」 | `run.py autonomy-status --brief <id>` |
+| 「自律やめて／戻して」 | `run.py approve-autonomy --brief <id> --revoke` |
+
+### 12-E. 受け入れ条件（v5）
+
+1. **既定無改変**: `autonomy` 未設定 / `supervised` で従来の Approve→Send→Log 対話が完全維持（`blocker_action` が常に escalate）。
+2. **自己採点ゲート**: threshold 未満ドラフトが `skip_history` に入り送信されない（`send.self_scored` emit）。注入 `oc_infer_fn` でテスト。
+3. **採点失敗 fail-open/closed**: `oc_infer` 例外時、`on_error=send` で送信継続・`skip` でスキップ。
+4. **ブロッカー auto-skip**: autonomous 時、v2 captcha / wrong-form / submit 不明が `_escalate_await_proceed` を呼ばず `_auto_skip_and_log` する（grep で確認）。
+5. **upfront approval ゲート**: 未承認 campaign は送信せず `awaiting_upfront_approval` で停止。`approve-autonomy` 後に送信。冪等（二重承認で no-op）。
+6. **`autonomy.py` ユニットテスト**（`test_autonomy.py`）が全 PASS、既存スイートにリグレッション無し。
+
+---
+
 以上。

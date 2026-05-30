@@ -56,6 +56,16 @@ browser:
   headless: true
   cookie_consent: "accept"   # accept | skip (reject: future)
 
+# 自律運用 (v5 §12)。省略時は sender_brief.yaml の既定（mode: supervised）を継承。
+# この brief を完全自律にする場合のみ上書きする:
+# autonomy:
+#   mode: "autonomous"
+#   draft_self_score:
+#     threshold: 0.75
+#   upfront_approval:
+#     required: true
+#     sample_drafts: 3
+
 model:
   name: "claude-cli/claude-opus-4-7"
   form_analyzer_name: "claude-cli/claude-sonnet-4-6"

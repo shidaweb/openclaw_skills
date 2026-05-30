@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from _outreach_core import draft as core_draft
 from _outreach_core import history as core_history
+from _outreach_core import autonomy as core_autonomy
 from _outreach_core import infer as core_infer
 from _outreach_core import preview as core_preview
 from _outreach_core import prompt as core_prompt
@@ -168,6 +169,7 @@ def _evaluate(js: str) -> Any:
 def stage_bootstrap(targets_path: Path, out_path: Path,
                     include_sent: bool = False,
                     include_dropped: bool = False,
+                    include_skipped: bool = False,
                     limit: int | None = None,
                     only_ids: list[str] | None = None) -> None:
     """Read curated targets.yaml → write data/leads.jsonl.
@@ -209,7 +211,7 @@ def stage_bootstrap(targets_path: Path, out_path: Path,
         if (status == "sent" or cid in sent_ids) and not include_sent:
             filtered_sent += 1
             continue
-        if cid in skip_ids:
+        if cid in skip_ids and not include_skipped:
             filtered_skip += 1
             continue
 
@@ -406,6 +408,49 @@ def _emit_event(kind: str, *, stage: str, target_id: str | None = None, **kwargs
     ev.emit(kind, stage=stage, target_id=target_id, **kwargs)
 
 
+_NON_CONTACT_HEADING_KW = {
+    "register": ("会員登録", "新規登録", "アカウント作成", "アカウント登録", "ユーザー登録"),
+    "login": ("ログイン",),
+    "recruit": ("採用", "応募", "求人", "履歴書", "エントリーシート", "ES提出"),
+    "reservation": ("予約フォーム", "来店予約", "ご予約", "施術予約", "見学予約"),
+    "estimate_consumer": ("無料相談", "無料カウンセリング", "施術に関する相談"),
+}
+
+
+def _classify_form_type(
+    fields: dict[str, Any], snapshot: str | None
+) -> tuple[str, str | None]:
+    """Classify the page as 'contact' (B2B inquiry) or one of the non-contact
+    categories. Returns (kind, reason_if_non_contact).
+    """
+    inputs = fields.get("inputs") or []
+    textareas = fields.get("textareas") or []
+
+    for inp in inputs:
+        if str(inp.get("type", "")).lower() == "password":
+            return ("register", "password field present")
+
+    name_blob = " ".join(
+        str(x.get("name") or x.get("label") or "")
+        for x in inputs
+    ).lower()
+    if "birth" in name_blob and "year" in name_blob:
+        return ("register", "birth-year field present")
+    if "生年月日" in name_blob:
+        return ("register", "生年月日 field present")
+
+    snap_head = (snapshot or "")[:2000]
+    for kind, kws in _NON_CONTACT_HEADING_KW.items():
+        for kw in kws:
+            if kw in snap_head:
+                return (kind, f"heading mentions '{kw}'")
+
+    if not textareas:
+        return ("unknown_no_textarea", "no textarea on page (not a typical contact form)")
+
+    return ("contact", None)
+
+
 def stage_enrich(input_path: Path, out_path: Path, config: dict[str, Any] | None = None) -> None:
     targets = [json.loads(l) for l in input_path.open()]
     print(f"[enrich] {len(targets)} targets to enrich")
@@ -462,6 +507,37 @@ def stage_enrich(input_path: Path, out_path: Path, config: dict[str, Any] | None
             if snap:
                 sample.write_text(snap)
                 print(f"[enrich] saved first form snapshot -> {sample}")
+
+        form_kind, form_reason = _classify_form_type(fields, snap)
+        if form_kind != "contact":
+            print(
+                f"[enrich] ({i}/{len(targets)}) {t.get('name')}: "
+                f"NON-CONTACT form ({form_kind}: {form_reason}) — adding to skip_history"
+            )
+            append_skip_history([
+                {
+                    "id": t.get("id"),
+                    "name": t.get("name"),
+                    "industry": t.get("industry"),
+                    "draft": {
+                        "body": f"non_contact_form: {form_kind} ({form_reason})"
+                    },
+                }
+            ])
+            enriched.append(
+                {
+                    **t,
+                    "_enrich_skipped": f"non_contact_form:{form_kind}",
+                    "_enrich_skip_reason": form_reason,
+                }
+            )
+            _emit_event(
+                "enrich.form.skipped_non_contact",
+                stage="enrich",
+                target_id=str(t.get("id") or ""),
+                payload={"kind": form_kind, "reason": form_reason},
+            )
+            continue
 
         if fields.get("form_root_selector"):
             t = {**t, "form_root_selector": fields["form_root_selector"]}
@@ -542,7 +618,12 @@ extract_first_json = core_prompt.extract_first_json
 
 
 _REFINE_PROMPT_TEMPLATE = """You wrote the draft below for a Japanese B2B inquiry-form message.
-Now act as a tough senior copywriter and **critique then rewrite** it.
+Now act as a tough senior copywriter and **critique then rewrite** it,
+**strictly following the persona spec embedded below** (this is persona v3).
+
+## Persona spec (MUST follow — this is the source of truth)
+
+{persona}
 
 ## Target context (the company you're writing to)
 ```json
@@ -552,78 +633,68 @@ Now act as a tough senior copywriter and **critique then rewrite** it.
 ```json
 {draft_json}```
 
-## Critique checklist (apply strictly)
+## Critique checklist (apply strictly — persona-v3 enforcement)
 
-1. Does the FIRST sentence reference a specific company fact, NOT
-   start with 「お世話になります」「突然のご連絡」「初めまして」?
-   → If no: REWRITE the opening.
+**ハード制約（違反したら必ず書き直す）:**
 
-2. Are 「拝見しました」「拝察します」「と存じます」 used more than twice combined?
-   → If yes: replace at least one with natural alternatives
-     (気になりました／考えています／効きそうです／今がタイミング etc.)
+A. **4セクション構成の保全** — 必ず次の順で構成されているか:
+   Section 1: 挨拶+自己紹介 / Section 2: 課題仮説 / Section 3: 解決策+実績 / Section 4: 定型クロージング
+   → セクション欠落・順序入れ替えがあれば書き直す。特に Section 3（弊社実績への
+     ブリッジ）と Section 4（定型クロージング）の欠落を厳しく検知。
 
-3. Is the self-introduction more than "肩書＋過去事例コピペ"?
-   Does it bridge to a specific aspect of the target's business?
-   → If no: rewrite the self-intro to bridge to the target's specific
-     context (e.g. "MDOnline出身として、御社の患者×家族の二重顧客構造は…")
+B. **Section 4 の定型文（一字一句保つ）** — 以下が **そのまま** 含まれているか:
+   - 「よろしければ一度、オンラインでご提案のお時間を頂けないでしょうか。」
+   - 「ご多忙の折、誠に恐縮ですが、何卒よろしくお願い申し上げます。」
+   - 末尾の「カレンダー：https://tenbin.link/book/u-1302066f5d4f/torana-norimitsu-shida」
+   → どれか欠けていたら **絶対に追加して書き直す**。URL 単独貼り（ラベルなし）も NG。
 
-4. Are numbers (LTV+20%, 開封率3-5倍 etc.) used? If yes, are they tied
-   to the target's specific business structure, not generic claims?
-   → If generic: remove or replace with a target-specific framing.
+C. **質問形 CTA 禁止（NG #1）** — 本文に疑問符（？）または「〜いただけますか」
+   「〜どうされていますか」「〜聞かせてください」のような問い掛けが含まれていないか
+   → 含まれていたら削除して Section 4 の定型に置換する。
 
-5. Is the CTA something other than 「30分のオンラインでご相談いただけませんでしょうか」?
-   Does it either (a) leave the recipient an OUT, or (b) offer specific
-   value, or (c) ask a curious question?
-   → If template: rewrite the CTA.
+D. **「どうぞ」「ぜひどうぞ」「お声がけください」などの軽い口語 CTA 禁止（NG #2）**
+   → Section 4 の定型に置換。
 
-6. Are paragraphs varied in length (NOT mechanical 3-para structure)?
-   → If symmetric: vary lengths.
+E. **断定回避（NG #3）** — 「〜になっている」「〜が課題である」「効きます」「刺さる」等の
+   断定的な指摘がないか → 「〜ではないかと感じております」「〜論点と見受けられます」等に置換。
 
-7. Does the writing sound like a human who actually read the target's
-   recent news, or like a generic LINE×CRM pitch?
-   → Push for the former.
+F. **NG ジャーゴン（NG #4）** — 「両輪」「ど真ん中」「直球」「ストライク」「レバー」「穴」
+   「刺さる」「効く」「食う」「眠っている」「もったいない」「手が届いていない」
+   → 全て排除。「論点になり得る」「設計余地がある」等の書き言葉に。
 
-8. Body length: must be ≤ {max_chars} characters.
+G. **カタカナ業界語 3つ以内（NG #5）** — シナリオ／レバレッジ／クロスセル／LTV／オペレーション／
+   セグメント／スキーム／ナレッジ／ナーチャリング／アジェンダ をカウントし、合計が 3 を
+   超えたら和語に置換（流れ・段階的なご案内 等）。
 
-9. Opening rotation (v4): which of types 1-4 does the draft use? Would the
-   last 2 drafts in this batch use the same opening pattern?
-   → If duplicate pattern: rewrite opening to a different type.
+H. **英訳調回避（NG #6）** — 「〜することができます→できます」「〜において→で」
+   「〜に関して→について」「〜を有しております→がございます」「〜の観点から→の面で」
+   「〜の一助となります→お役に立てれば幸いです」。
 
-10. **Japanese nativeness (v5)** — count katakana business jargon: 論点, シナリオ,
-    レバレッジ, クロスセル, LTV, オペレーション, セグメント, スキーム, ナレッジ,
-    アジェンダ. If 4 or more appear → rewrite using Japanese-native equivalents
-    (per system_persona §3).
+I. **一文 80字超を避ける（NG #7）** — 80字超の文が 1つでもあれば句点で分割。
 
-11. **Sentence length (v5)** — count sentences exceeding 80 characters (excluding
-    URLs). If 3 or more such sentences exist → split at natural 句点 boundaries.
-    Avoid nested clauses like 「〜という数字でございますが、〜と拝察しております」.
+J. **「拝察」1回・「拝見」2回まで（NG #8）** — 超過分は「感じております」「見受けられます」等へ。
 
-12. **「拝察」「拝見」 overuse (v5)** — if 「拝察」 appears 2+ times or
-    「拝察」+「拝見」 combined exceed 3 → replace some with 「感じております」「見受けられます」
-    「読みました」「受け取りました」.
+**自由度のあるチェック（必要に応じて改善）:**
 
-13. **Closing salutation (v5)** — the draft body must contain at least one of
-    「何卒よろしくお願い申し上げます」「末筆ながら」「ご検討のほど」 before the calendar URL.
-    If missing → insert before the URL line.
-
-14. **English-translated phrasings (v5)** — flag and rewrite any of these:
-    「〜することができます」→「〜できます」, 「〜において」→「〜で」,
-    「〜に関して」→「〜について」, 「〜を有しております」→「〜がございます」,
-    「〜の観点から」→「〜の面で」, 「〜にアプローチします」→「〜に取り組みます」,
-    「〜の一助となります」→「お役に立てれば幸いです」.
+1. Section 2 の課題仮説は、相手企業の固有事実（IR数値・店舗数・新サービス等）を
+   1〜2点引用しているか → していなければ enriched 情報から補う。
+2. Section 3 は「肩書＋事例コピペ」になっていないか。事例から相手企業の論点への
+   ブリッジが 1文添えられているか → なければ追加。
+3. 本文は max_chars={max_chars} 以内に収まっているか。超えていたら削る。
 
 ## Output format (STRICT JSON)
 
 ```json
 {{
-  "critique": "<2-4 sentence critique of the original draft, in Japanese>",
+  "critique": "<2-4 sentence critique of the original draft, in Japanese — どのハード制約に違反していたかを明示>",
   "subject": "<refined subject or null>",
-  "body": "<refined body, ≤{max_chars} chars>"
+  "body": "<refined body, ≤{max_chars} chars, persona-v3 完全準拠>"
 }}
 ```
 
-If the original is already excellent and you'd change nothing, set
-`critique` to "改善不要" and copy the original subject/body unchanged.
+ハード制約 A〜J のいずれかに違反していた場合は **必ず** rewrite してください。
+本当に元案が persona-v3 完全準拠で改善余地がなければ `critique` を「改善不要」、
+subject/body は元のままコピーしてください。
 
 Output only the JSON, no prose."""
 
@@ -639,7 +710,17 @@ def _refine_draft(target: dict[str, Any], draft: dict[str, Any],
     )
     target_for_prompt = {k: target[k] for k in payload_keys if k in target}
 
+    # Load persona spec so refine stays aligned with v3
+    from _outreach_core.prompt import resolve_prompts_dir
+    prompts_dir = resolve_prompts_dir(SKILL_DIR, config)
+    persona_path = prompts_dir / "system_persona.md"
+    try:
+        persona = persona_path.read_text(encoding="utf-8")
+    except OSError:
+        persona = "(persona spec not found — refine without explicit persona context)"
+
     prompt = _REFINE_PROMPT_TEMPLATE.format(
+        persona=persona,
         target_json=json.dumps(target_for_prompt, ensure_ascii=False, indent=2),
         draft_json=json.dumps({"subject": draft.get("subject"),
                                 "body": draft.get("body")},
@@ -785,6 +866,75 @@ def _slack_env() -> tuple[str | None, str | None]:
     return ch, ts
 
 
+def _build_upfront_summary(cfg: dict[str, Any], sendable: list[dict[str, Any]]) -> str:
+    """Human-readable brief + list + sample-draft summary for the one-time
+    upfront approval (the single human checkpoint in autonomous mode)."""
+    sender = (cfg or {}).get("sender") or {}
+    n_samples = core_autonomy.sample_draft_count(cfg)
+    lines = [
+        f"📋 自律送信モード — 事前承認おねがいします（最初の1回だけ）",
+        f"brief: {BRIEF_ID} / 送信者: {sender.get('company', '?')} {sender.get('name', '?')}",
+        f"対象リスト: {len(sendable)}社",
+    ]
+    names = ", ".join(d.get("name", "?") for d in sendable[:12])
+    if names:
+        lines.append(f"  → {names}{' …' if len(sendable) > 12 else ''}")
+    lines.append(f"サンプルドラフト（{min(n_samples, len(sendable))}件）:")
+    for d in sendable[:n_samples]:
+        dd = d.get("draft") or {}
+        body = (dd.get("body") or "").strip().replace("\n", " ")
+        lines.append(f"  ・{d.get('name', '?')} 「{dd.get('subject', '')}」 {body[:80]}…")
+    lines.append("")
+    lines.append("OK なら Slack で「承認」/ CLI: run.py approve-autonomy --brief "
+                 f"{BRIEF_ID}")
+    lines.append("→ 承認後は確認なしで全件 自動送信（ブロッカーは自動スキップ＋記録）。")
+    return "\n".join(lines)
+
+
+def _run_autonomous_send(
+    drafts_path: Path,
+    cfg: dict[str, Any],
+    sendable: list[dict[str, Any]],
+) -> None:
+    """Autonomous Phases 4-6.
+
+    Gate: if upfront approval is required and not yet granted, post the brief +
+    list + sample drafts ONCE and stop (no send). Once approved, send every
+    not-yet-sent sendable draft hands-off (mode=auto; blockers auto-skip; each
+    draft self-scored). Never prompts a human per item.
+    """
+    from _outreach_core.notify import post as notify_post
+
+    bar = "=" * 70
+
+    if core_autonomy.upfront_approval_required(cfg) and not core_autonomy.is_upfront_approved(DATA_DIR):
+        summary = _build_upfront_summary(cfg, sendable)
+        core_autonomy.mark_pending_approval(
+            DATA_DIR,
+            {"sendable": len(sendable), "brief": BRIEF_ID},
+        )
+        print(f"\n{bar}\n[4-6/6] AUTONOMOUS — 事前承認待ち (one-time)\n{bar}")
+        print(summary)
+        try:
+            notify_post(summary, level="info")
+        except Exception:  # noqa: BLE001
+            pass
+        _emit_event(
+            "campaign.awaiting_upfront_approval",
+            stage="campaign",
+            payload={"sendable": len(sendable), "brief": BRIEF_ID},
+        )
+        print(f"\n[campaign] 承認後に再実行すると全件自動送信します。")
+        return
+
+    print(f"\n{bar}\n[4-6/6] AUTONOMOUS SEND — hands-off (no per-item confirm)\n{bar}")
+    ids = _resolve_ids_arg(None, True, drafts_path, cmd_name="campaign")
+    if not ids:
+        print("[campaign] no sendable drafts left to auto-send")
+        return
+    stage_send(drafts_path, ids, mode="auto", config=cfg, heartbeat="auto")
+
+
 def stage_campaign(
     targets_path: Path,
     clean: bool,
@@ -880,11 +1030,18 @@ def stage_campaign(
             + f"(send rate {len(sendable) * 100 // len(drafts) if drafts else 0}%)"
         )
 
-        # --- Phases 4-6: Approve → Send → Log (inside preview's interactive flow) ---
+        # --- Phases 4-6: Approve → Send → Log ---
         if skip_send:
             print(f"\n{bar}\n[4/6] PREVIEW — display only (send skipped)\n{bar}")
             stage_preview(DATA_DIR / "drafts.jsonl", interactive_send=False, config=cfg)
             print(f"\n[campaign] stopped at preview. To send later: python run.py send --ids ...")
+            return
+
+        # --- Autonomous path: lock quality once upfront, then run hands-off ---
+        if core_autonomy.is_autonomous(cfg):
+            _run_autonomous_send(DATA_DIR / "drafts.jsonl", cfg, sendable)
+            if slack_ch:
+                touch_last_used(slack_ch)
             return
 
         print(f"\n{bar}\n[4-6/6] APPROVE → SEND → LOG (interactive)\n{bar}")
@@ -1079,15 +1236,29 @@ _CHECK_AGREEMENT_JS = r"""
 
 _CLICK_BUTTON_BY_TEXT_JS = r"""
 (args) => {
-  const { patterns } = args;
-  const buttons = Array.from(document.querySelectorAll('button, input[type="submit"], a[role="button"]'));
-  for (const pat of patterns) {
-    const re = new RegExp(pat);
-    for (const b of buttons) {
-      const txt = ((b.textContent || b.value || '') + ' ' + (b.getAttribute('aria-label') || '')).trim();
-      if (re.test(txt) && !b.disabled && b.offsetParent !== null) {
-        b.click();
-        return { clicked: true, text: txt.slice(0, 50) };
+  const { patterns, formRootSelector } = args;
+  const selector = 'button, input[type="submit"], input[type="button"], a, [role="button"]';
+  let scopes = [];
+  if (formRootSelector) {
+    try {
+      const root = document.querySelector(formRootSelector);
+      if (root) scopes.push(root);
+    } catch (e) {}
+  }
+  scopes.push(document);
+  for (const scope of scopes) {
+    const buttons = Array.from(scope.querySelectorAll(selector));
+    for (const pat of patterns) {
+      const re = new RegExp(pat);
+      for (const b of buttons) {
+        const rawTxt = ((b.textContent || b.value || '') + ' ' + (b.getAttribute('aria-label') || '')).trim();
+        const txt = rawTxt.replace(/\s+/g, ' ');
+        // Skip elements with too much text (likely a wrapper, not a button)
+        if (txt.length > 80) continue;
+        if (re.test(txt) && !b.disabled && b.offsetParent !== null) {
+          b.click();
+          return { clicked: true, text: txt.slice(0, 50), scope: scope === document ? 'document' : 'form' };
+        }
       }
     }
   }
@@ -1149,8 +1320,9 @@ def _check_agreement() -> dict[str, Any] | None:
     return res if isinstance(res, dict) else None
 
 
-def _click_button(patterns: list[str]) -> dict[str, Any] | None:
-    args = {"patterns": patterns}
+def _click_button(patterns: list[str],
+                   form_root_selector: str | None = None) -> dict[str, Any] | None:
+    args = {"patterns": patterns, "formRootSelector": form_root_selector}
     js = f"""
     (() => {{
       const fn = {_CLICK_BUTTON_BY_TEXT_JS};
@@ -1159,6 +1331,94 @@ def _click_button(patterns: list[str]) -> dict[str, Any] | None:
     """
     res = _evaluate(js)
     return res if isinstance(res, dict) else None
+
+
+_ENUMERATE_BUTTONS_JS = r"""
+(args) => {
+  const { formRootSelector } = args;
+  const selector = 'button, input[type="submit"], input[type="button"], a, [role="button"]';
+  let scope = document;
+  if (formRootSelector) {
+    try {
+      const root = document.querySelector(formRootSelector);
+      if (root) scope = root;
+    } catch (e) {}
+  }
+  const buttons = Array.from(scope.querySelectorAll(selector));
+  const out = [];
+  buttons.forEach((b, idx) => {
+    if (b.disabled || b.offsetParent === null) return;
+    const rawTxt = ((b.textContent || b.value || '') + ' ' + (b.getAttribute('aria-label') || '')).trim();
+    const txt = rawTxt.replace(/\s+/g, ' ');
+    if (!txt || txt.length > 80) return;
+    out.push({
+      idx,
+      text: txt,
+      tag: b.tagName.toLowerCase(),
+      type: b.getAttribute('type') || '',
+      role: b.getAttribute('role') || '',
+      href: b.getAttribute('href') || '',
+    });
+  });
+  return { scope: scope === document ? 'document' : 'form', buttons: out };
+}
+"""
+
+
+def _enumerate_buttons(form_root_selector: str | None = None) -> list[dict[str, Any]]:
+    args = {"formRootSelector": form_root_selector}
+    js = f"""
+    (() => {{
+      const fn = {_ENUMERATE_BUTTONS_JS};
+      return fn({json.dumps(args, ensure_ascii=False)});
+    }})()
+    """
+    res = _evaluate(js)
+    if isinstance(res, dict):
+        return res.get("buttons") or []
+    return []
+
+
+def _click_by_exact_text(text: str,
+                          form_root_selector: str | None = None) -> dict[str, Any] | None:
+    pat = "^" + re.escape(text).replace(r"\ ", r"\s*") + "$"
+    return _click_button([pat], form_root_selector=form_root_selector)
+
+
+_FINAL_SUBMIT_PICKER_PROMPT = """あなたは日本語B2B問い合わせフォームの確認画面で「最終送信ボタン」を1つ選ぶ役割です。
+
+## 状況
+ユーザーがフォームを入力済み・「確認画面へ」ボタンを押した直後で、いま確認画面にいます。
+このページ上にある全ボタンのリストから、**最終送信に該当する1個** を選んでください。
+
+## 判断基準
+- 「送信する」「上記の内容で送信」「お問い合わせを送信」など、内容を確定して送信する意図のラベル
+- 「修正する」「戻る」「キャンセル」「リセット」は最終送信ではない
+- ヘッダ/ナビ系（「お問い合わせ」「ログイン」「会社概要」など）は最終送信ではない
+- もし最終送信ボタンがどれにも該当しない（例：確認画面に到達していない／ページ遷移失敗）なら "text" を空文字、"reason" にその旨
+
+## ボタン一覧（JSON）
+{buttons_json}
+
+## 出力（JSONのみ）
+{{"text": "<選んだボタンの text フィールドをそのまま>", "reason": "<簡潔な根拠>"}}
+"""
+
+
+def _llm_pick_final_submit(buttons: list[dict[str, Any]],
+                            config: dict[str, Any]) -> dict[str, Any] | None:
+    if not buttons:
+        return None
+    prompt = _FINAL_SUBMIT_PICKER_PROMPT.format(
+        buttons_json=json.dumps(buttons, ensure_ascii=False, indent=2),
+    )
+    model_cfg = config.get("model", {}) or {}
+    model = model_cfg.get("form_analyzer_name") or model_cfg.get("name", DEFAULT_MODEL)
+    response = oc_infer(prompt, model=model)
+    result = extract_first_json(response or "")
+    if isinstance(result, dict) and result.get("text"):
+        return result
+    return None
 
 
 # ============================================================================
@@ -1359,6 +1619,38 @@ _CHECK_BY_NAME_JS = r"""
 """
 
 
+# JS that checks a checkbox by its visible label text
+_CHECK_BY_LABEL_JS = r"""
+(args) => {
+  const { label } = args;
+  const cbs = Array.from(document.querySelectorAll('input[type="checkbox"]'));
+  for (const cb of cbs) {
+    let txt = '';
+    if (cb.id) {
+      const lab = document.querySelector(`label[for="${cb.id}"]`);
+      if (lab) txt = (lab.textContent || '').trim();
+    }
+    if (!txt && cb.parentElement) {
+      txt = (cb.parentElement.textContent || '').trim();
+    }
+    if (!txt) {
+      const aria = cb.getAttribute('aria-label');
+      if (aria) txt = aria.trim();
+    }
+    if (txt && txt.includes(label)) {
+      if (!cb.checked) {
+        cb.checked = true;
+        cb.dispatchEvent(new Event('change', { bubbles: true }));
+        cb.dispatchEvent(new Event('click', { bubbles: true }));
+      }
+      return { ok: true, label, text: txt.slice(0, 60) };
+    }
+  }
+  return { ok: false, reason: "no checkbox with label", label };
+}
+"""
+
+
 def _apply_field_action(
     name: str, action: str, value: str, selector: str | None = None
 ) -> dict[str, Any] | None:
@@ -1378,6 +1670,18 @@ def _check_by_name(name: str) -> dict[str, Any] | None:
     js = f"""
     (() => {{
       const fn = {_CHECK_BY_NAME_JS};
+      return fn({json.dumps(args, ensure_ascii=False)});
+    }})()
+    """
+    res = _evaluate(js)
+    return res if isinstance(res, dict) else None
+
+
+def _check_by_label(label: str) -> dict[str, Any] | None:
+    args = {"label": label}
+    js = f"""
+    (() => {{
+      const fn = {_CHECK_BY_LABEL_JS};
       return fn({json.dumps(args, ensure_ascii=False)});
     }})()
     """
@@ -1671,6 +1975,8 @@ def _heuristic_fill_fallback(target: dict[str, Any], config: dict[str, Any],
         "filled": list((plan_diag or {}).get("filled", [])),
         "unfilled": [],
         "errors": list((plan_diag or {}).get("errors", [])),
+        "warnings": list((plan_diag or {}).get("warnings", [])),
+        "skipped": list((plan_diag or {}).get("skipped", [])),
         "llm_plan_used": plan_diag is not None,
     }
 
@@ -1754,6 +2060,15 @@ def _heuristic_fill_fallback(target: dict[str, Any], config: dict[str, Any],
         sres = _fill_select(sender["employee_count_band"], label_pattern=r"従業員")
         if sres and sres.get("selected"):
             diagnostics["filled"].append(f"employee_count={sender['employee_count_band']}")
+    extra_cb_labels = overrides.get("extra_checkboxes_by_label") or []
+    if isinstance(extra_cb_labels, str):
+        extra_cb_labels = [extra_cb_labels]
+    for lab in extra_cb_labels:
+        cres = _check_by_label(lab)
+        if cres and cres.get("ok"):
+            diagnostics["filled"].append(f"checkbox_label={lab}")
+        else:
+            diagnostics["errors"].append(f"checkbox_label not found: {lab}")
 
     # Body textarea
     bres = _fill_textarea(body)
@@ -1768,6 +2083,46 @@ def _heuristic_fill_fallback(target: dict[str, Any], config: dict[str, Any],
         diagnostics["filled"].append(f"agreement_checkbox ({cres.get('label')[:30]})")
 
     return diagnostics
+
+
+_WRONG_FORM_WARN_KW = (
+    "会員登録", "アカウント作成", "新規登録", "ログイン",
+    "採用", "応募", "求人", "履歴書",
+    "予約", "予約フォーム", "資料請求",
+)
+_WRONG_FORM_SKIPPED_KW = (
+    "login_pass", "password", "passwd",
+    "birth_date", "birthday", "birth_year",
+    "applicant", "resume", "shokureki", "gakureki", "keireki",
+    "学歴", "職歴", "保有資格", "希望勤務地", "希望年収",
+    "予約日", "希望日", "希望時間",
+)
+
+
+def _detect_wrong_form_type(diag: dict[str, Any]) -> str | None:
+    """If the filled form looks like a non-B2B form (registration / job application
+    / reservation), return a short reason string. Else None.
+    """
+    warnings = diag.get("warnings") or []
+    skipped = diag.get("skipped") or []
+
+    for w in warnings:
+        w_str = str(w)
+        for kw in _WRONG_FORM_WARN_KW:
+            if kw in w_str:
+                return f"warning mentions '{kw}'"
+
+    suspect_hits: list[str] = []
+    for s in skipped:
+        s_low = str(s).lower()
+        for kw in _WRONG_FORM_SKIPPED_KW:
+            if kw.lower() in s_low:
+                suspect_hits.append(str(s))
+                break
+    if len(suspect_hits) >= 2:
+        return f"skipped {len(suspect_hits)} non-B2B required fields: {suspect_hits[:4]}"
+
+    return None
 
 
 def _escalate_await_proceed(target: dict[str, Any], reason: str) -> None:
@@ -1796,6 +2151,49 @@ def _escalate_await_proceed(target: dict[str, Any], reason: str) -> None:
         target_id=str(tid),
         payload={"field_count_unresolved": 0, "slack_posted": True, "reason": reason[:120]},
     )
+
+
+def _auto_skip_and_log(target: dict[str, Any], reason: str) -> None:
+    """Autonomous-mode replacement for ``_escalate_await_proceed``.
+
+    Instead of leaving a browser open and blocking on a human "進めて", this
+    records the target in skip_history (so it is excluded on the next run),
+    auto-closes any matching needs_attention, and emits an event — then the
+    caller simply ``continue``s. Nothing waits on a human.
+    """
+    tid = target.get("id", "?")
+    name = target.get("name", "?")
+    skip_copy = dict(target)
+    skip_copy["draft"] = {
+        **(target.get("draft") or {}),
+        "body": f"AUTONOMOUS_SKIP: {reason}",
+    }
+    append_skip_history([skip_copy])
+    try:
+        close_needs_attention(DATA_DIR, str(tid), resolution=f"auto_skip: {reason}"[:120])
+    except Exception:  # noqa: BLE001 - best-effort cleanup
+        pass
+    print(f"  [send] ⏭ auto-skip & log: {name} — {reason}")
+    _emit_event(
+        "send.auto_skipped",
+        stage="send",
+        target_id=str(tid),
+        payload={"reason": reason[:160]},
+    )
+
+
+def _handle_blocker(
+    target: dict[str, Any],
+    reason: str,
+    *,
+    autonomous: bool,
+) -> None:
+    """Route a mid-run blocker by autonomy policy: auto-skip (autonomous) or
+    escalate-and-wait (supervised / brief override)."""
+    if autonomous:
+        _auto_skip_and_log(target, reason)
+    else:
+        _escalate_await_proceed(target, f"awaiting_user_proceed: {reason}")
 
 
 def stage_send(
@@ -1836,7 +2234,15 @@ def stage_send(
         "auto": "AUTO (no prompts)",
         "fill-only": "fill-only (no submit click)",
     }.get(mode, mode)
-    print(f"[send] processing {len(targets)} targets · mode={mode_label}")
+    autonomous = core_autonomy.is_autonomous(config)
+    score_on = core_autonomy.self_score_enabled(config)
+    if autonomous:
+        thr = core_autonomy.score_threshold(config)
+        print(f"[send] processing {len(targets)} targets · mode={mode_label} · AUTONOMOUS"
+              + (f" · self-score≥{thr:.2f}" if score_on else " · self-score off")
+              + " · blockers→auto-skip")
+    else:
+        print(f"[send] processing {len(targets)} targets · mode={mode_label}")
 
     sent: list[dict[str, Any]] = []
     filled_only: list[dict[str, Any]] = []
@@ -1861,6 +2267,51 @@ def stage_send(
         if not ev.get_context().data_dir:
             ev.configure(skill="jp-form-outreach", data_dir=DATA_DIR)
         trace = ev.trace_dir_for(tid)
+
+        # Autonomous self-score gate (the per-item replacement for human yes/no).
+        # Runs BEFORE opening the browser so weak drafts cost no page load.
+        # Quality is locked upfront; this is the secondary guard against a weak
+        # draft slipping through. Below threshold → skip & log, no human ask.
+        if autonomous and score_on and mode in ("auto", "interactive"):
+            decision = core_autonomy.self_score_draft(d, config, oc_infer_fn=oc_infer)
+            sc = decision.get("score")
+            print(f"  [send] self-score: {sc if sc is not None else 'n/a'} → "
+                  f"{'send' if decision['send'] else 'SKIP'} ({decision['reason']})")
+            _emit_event(
+                "send.self_scored",
+                stage="send",
+                target_id=tid,
+                payload={
+                    "score": sc,
+                    "send": decision["send"],
+                    "errored": decision.get("errored", False),
+                    "reason": (decision.get("reason") or "")[:160],
+                },
+                trace_dir=trace,
+            )
+            if not decision["send"]:
+                _auto_skip_and_log(d, f"self_score_below_threshold: {decision['reason']}")
+                continue
+
+        # 0. reCAPTCHA v3 warm-up (§11-A-8): visit root domain + dispatch
+        #    natural interactions before navigating to the form. Improves the
+        #    invisible v3 score for low-volume legitimate outreach.
+        from _outreach_core.warmup import apply_warmup_if_enabled
+
+        warmup_diag = apply_warmup_if_enabled(
+            form_url=form_url,
+            config=config,
+            oc_browser_fn=oc_browser,
+            evaluate_fn=_evaluate,
+            emit_event=_emit_event,
+            stage="send",
+            target_id=tid,
+        )
+        if not warmup_diag.get("skipped"):
+            print(
+                f"  [send] reCAPTCHA v3 warmup: "
+                f"{warmup_diag.get('elapsed_sec')}s on {warmup_diag.get('seed_url')}"
+            )
 
         # 1. Open form
         t0 = time.time()
@@ -1910,7 +2361,34 @@ def stage_send(
             for e in diagnostics["errors"]:
                 print(f"    ✗ {e}")
 
+        wrong_form_reason = _detect_wrong_form_type(diagnostics)
+        if wrong_form_reason:
+            print(f"  [send] ⚠ WRONG_FORM_TYPE detected — {wrong_form_reason}")
+            print(f"          aborting submit; browser left open for manual review")
+            filled_only.append(d)
+            _emit_event(
+                "send.wrong_form_type",
+                stage="send",
+                target_id=tid,
+                payload={"reason": wrong_form_reason},
+                trace_dir=trace,
+            )
+            _handle_blocker(
+                d,
+                f"WRONG_FORM_TYPE_DETECTED — {wrong_form_reason}",
+                autonomous=autonomous,
+            )
+            continue
+
         if captcha:
+            if autonomous:
+                # Warmup keeps v3 invisible; a *visible* v2 challenge means the
+                # site's risk score still tripped. We do not defeat the CAPTCHA —
+                # we skip the target and log it, then keep the run moving.
+                print(f"  [send] ⚠ reCAPTCHA v2 visible — autonomous: skip & log (warmup insufficient)")
+                filled_only.append(d)
+                _auto_skip_and_log(d, "reCAPTCHA v2 visible (warmup insufficient)")
+                continue
             print(f"  [send] ⚠ reCAPTCHA v2 detected — manual completion required")
             print(f"          Browser left open. Complete CAPTCHA, then: run.py resolve --target-id {d.get('id')} --action proceed")
             filled_only.append(d)
@@ -1929,17 +2407,33 @@ def stage_send(
         if plan_flow and plan_flow != flow:
             flow = plan_flow
         if flow == "confirm":
-            patterns = [r"入力内容を確認", r"内容(を|の)?確認", r"確認画面", r"確認する", r"確認$", r"内容の確認へ"]
+            patterns = [
+                r"入力内容を確認", r"送信内容を確認", r"内容(を|の)?確認",
+                r"確認画面", r"確認する", r"確認$", r"内容の確認へ",
+                r"同意して次へ", r"^次へ$", r"次のステップへ",
+            ]
         else:
             patterns = [r"送信する", r"^送信$", r"submit", r"内容を送信", r"同意して.*送信"]
         plan_first = plan.get("first_button_pattern")
         if plan_first and plan_first not in patterns:
-            patterns = [plan_first] + patterns
+            patterns = patterns + [plan_first]
 
-        click_res = _click_button(patterns)
+        click_res = _click_button(patterns, form_root_selector=d.get("form_root_selector"))
         if not click_res or not click_res.get("clicked"):
             print(f"  [send] ⚠ first submit button not found (patterns={patterns})")
             filled_only.append(d)
+            _emit_event(
+                "send.first_button_missing",
+                stage="send",
+                target_id=tid,
+                payload={"patterns": patterns, "flow": flow},
+                trace_dir=trace,
+            )
+            _handle_blocker(
+                d,
+                f"first submit button not found (flow={flow})",
+                autonomous=autonomous,
+            )
             continue
         print(f"  [send] clicked: {click_res.get('text')}")
         _emit_event(
@@ -1963,12 +2457,44 @@ def stage_send(
                 payload={"wait_user_ms": 0},
                 trace_dir=trace,
             )
-            click2 = _click_button([r"^送信する$", r"^送信$", r"この内容で送信", r"内容を送信する"])
+            click2 = _click_button([
+                r"^送信する$", r"^送信$", r"この内容で送信",
+                r"内容を送信する", r"上記の内容で送信", r"^回答送信$",
+                r"^送る$", r"submit", r"完了", r"確定",
+                r"内容で.*送信", r"^以上の内容", r"内容を以上で",
+                r"上記内容を送信", r"問い合わせを送信", r"お問い合わせを送信",
+            ])
             if not click2 or not click2.get("clicked"):
-                print(f"  [send] ⚠ final submit button not found — awaiting proceed")
-                filled_only.append(d)
-                _escalate_await_proceed(d, "awaiting_user_proceed: confirm-page final submit not found")
-                continue
+                print(f"  [send] ⚠ final submit not matched by patterns — falling back to LLM picker")
+                buttons = _enumerate_buttons()
+                if buttons:
+                    pick = _llm_pick_final_submit(buttons, config or {})
+                    if pick and pick.get("text"):
+                        print(f"  [send] LLM picked: {pick.get('text')} ({pick.get('reason','')[:60]})")
+                        click2 = _click_by_exact_text(pick["text"])
+                        _emit_event(
+                            "send.final.llm_pick", stage="send", target_id=tid,
+                            payload={
+                                "picked_text": pick.get("text"),
+                                "clicked": bool(click2 and click2.get("clicked")),
+                                "candidates": len(buttons),
+                            },
+                            trace_dir=trace,
+                        )
+                if not click2 or not click2.get("clicked"):
+                    print(f"  [send] ⚠ final submit still not clickable after LLM fallback — awaiting proceed")
+                    if trace:
+                        ev.dump_trace(
+                            trace, "form_snapshot_confirm.txt",
+                            oc_browser("snapshot") or "",
+                        )
+                    filled_only.append(d)
+                    _handle_blocker(
+                        d,
+                        "confirm-page final submit not found",
+                        autonomous=autonomous,
+                    )
+                    continue
             print(f"  [send] clicked final: {click2.get('text')}")
             _emit_event(
                 "send.final.clicked",
@@ -2062,9 +2588,13 @@ def _resolve_ids_arg(ids_str: str | None, use_all: bool,
         drafts = [json.loads(l) for l in input_path.open() if l.strip()]
         sendable = [d for d in drafts if d.get("draft", {}).get("subject") != "SKIP"]
         sent_ids = load_sent_set()
-        not_yet_sent = [i for i, d in enumerate(sendable, 1) if d["id"] not in sent_ids]
+        skip_ids = load_skip_set()
+        not_yet_sent = [
+            i for i, d in enumerate(sendable, 1)
+            if d["id"] not in sent_ids and d["id"] not in skip_ids
+        ]
         if not not_yet_sent:
-            print(f"[{cmd_name}] no sendable drafts left (all already in sent_history)")
+            print(f"[{cmd_name}] no sendable drafts left (all already in sent_history or skip_history)")
             return set()
         print(f"[{cmd_name}] --all → {len(not_yet_sent)} drafts: {','.join(map(str, not_yet_sent))}")
         return set(not_yet_sent)
@@ -2344,6 +2874,8 @@ def main() -> None:
                    help="Also include companies marked status: sent")
     p.add_argument("--include-dropped", action="store_true",
                    help="Also include companies marked status: dropped")
+    p.add_argument("--include-skipped", action="store_true",
+                   help="Also include companies present in skip_history.jsonl (for re-test)")
     p.add_argument("--limit", type=int, default=None,
                    help="Pull only the first N eligible targets (after status/history filters)")
     p.add_argument("--only", default=None,
@@ -2480,6 +3012,21 @@ def main() -> None:
         choices=["show", "needs-attention", "purge-skip", "purge-sent", "purge-all"],
     )
 
+    p = sub.add_parser(
+        "approve-autonomy",
+        parents=[brief_parent],
+        help="One-time approval that unlocks hands-off autonomous sending for this brief",
+    )
+    p.add_argument("--note", default="", help="Optional note recorded with the approval")
+    p.add_argument("--revoke", action="store_true",
+                   help="Revoke approval (return brief to pre-approval / supervised gating)")
+
+    p = sub.add_parser(
+        "autonomy-status",
+        parents=[brief_parent],
+        help="Show the autonomy mode + upfront-approval state for this brief",
+    )
+
     args = ap.parse_args()
     import os
 
@@ -2501,6 +3048,7 @@ def main() -> None:
             _data_path(args.out, "leads.jsonl"),
                         include_sent=args.include_sent,
                         include_dropped=args.include_dropped,
+                        include_skipped=args.include_skipped,
                         limit=args.limit,
                         only_ids=only_ids)
     elif args.cmd == "campaign":
@@ -2624,6 +3172,40 @@ def main() -> None:
         stage_mark_sent(drafts_path, ids)
     elif args.cmd == "history":
         stage_history(args.action)
+    elif args.cmd == "approve-autonomy":
+        if args.revoke:
+            core_autonomy.revoke_upfront_approval(DATA_DIR, by="cli")
+            print(f"[autonomy] brief={BRIEF_ID} approval REVOKED — "
+                  f"次回 campaign は再び事前承認待ちになります")
+        else:
+            state = core_autonomy.mark_upfront_approved(DATA_DIR, by="cli", note=args.note)
+            if state.get("_was_already_approved"):
+                print(f"[autonomy] brief={BRIEF_ID} は既に承認済みです（変更なし）")
+            else:
+                print(f"[autonomy] brief={BRIEF_ID} 承認 ✅ — "
+                      f"以降の campaign は確認なしで全件自動送信します")
+    elif args.cmd == "autonomy-status":
+        try:
+            cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
+        except FileNotFoundError:
+            cfg = {}
+        ac = core_autonomy.autonomy_config(cfg)
+        state = core_autonomy.read_autonomy_state(DATA_DIR)
+        print(f"brief={BRIEF_ID}")
+        print(f"  mode:            {ac['mode']}")
+        print(f"  on_blocker:      {ac['on_blocker']}")
+        print(f"  self_score:      enabled={ac['draft_self_score']['enabled']} "
+              f"threshold={ac['draft_self_score']['threshold']} "
+              f"on_error={ac['draft_self_score']['on_error']}")
+        print(f"  upfront_approval: required={ac['upfront_approval']['required']} "
+              f"sample_drafts={ac['upfront_approval']['sample_drafts']}")
+        print(f"  self_restart:    {ac['self_restart']}")
+        print(f"  approved:        {state.get('approved')}"
+              + (f" (at {state.get('approved_at')}, by {state.get('approved_by')})"
+                 if state.get('approved') else ""))
+        if state.get("pending"):
+            print(f"  pending:         {state['pending'].get('at')} "
+                  f"{state['pending'].get('summary')}")
 
 
 if __name__ == "__main__":

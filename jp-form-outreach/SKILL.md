@@ -332,6 +332,34 @@ Do NOT use for:
 | **enrich-research 完了後** | `record_enrich_research --from-jsonl data/enriched.jsonl` |
 | **ログ掃除（90日）** | `report prune --keep 90` |
 | **特殊フォーム（再 plan）** | `run.py send --ids N --iterative-fill --auto-send` |
+| **「自律モードにして」/「全部任せる」** | brief の `autonomy.mode: autonomous` を確認 → `run.py campaign --clean`（初回は事前承認待ちで停止） |
+| **「承認」/「OK 進めて」**（事前承認待ち中） | `run.py approve-autonomy --brief <id>` → 再度 `run.py campaign`（全件自動送信） |
+| **「自律状態どう？」** | `run.py autonomy-status --brief <id>`（mode/承認状態）。送信結果は `report send-funnel --brief <id>` の **autonomous (v5)** 節（自己採点 送信/ゲート・auto-skip 理由内訳）を要約 |
+| **「自律やめて／戻して」** | `run.py approve-autonomy --brief <id> --revoke`（supervised ゲートに戻す） |
+
+## Autonomous mode（v5 §12） — 人にいちいち確認しない運用
+
+`autonomy.mode: autonomous` の brief では、**最初の1回だけ**人手で品質を固め、以降は
+エージェントが skip / スクリーニング / 送信を自分で判断する。確認の往復は無くなる。
+
+1. **品質を最初に固める（唯一の人手チェックポイント）**: `run.py campaign` を回すと
+   Pull→Enrich→Draft まで進み、**brief＋対象リスト＋サンプルドラフト**を Slack に1回提示して
+   `awaiting_upfront_approval` で停止する（送信はしない）。
+2. **承認**: ユーザーが「承認」と返したら `run.py approve-autonomy --brief <id>`。以降この brief は
+   解禁され、`run.py campaign` 再実行で**全件を確認なしで自動送信**する。
+3. **送信中の判断はすべて自動**（人を待たない）:
+   - 各ドラフトを**自己採点**（`draft_self_score.threshold`、既定 0.75）。未満は自動スキップ＋`skip_history` 記録。
+   - **reCAPTCHA は warmup で出さない**方針（§11-A-8 v3 passthrough_with_warmup）。それでも v2 が可視化された
+     ターゲットは**自動スキップ＋記録**（CAPTCHA は突破しない）。
+   - 想定外フォーム / 送信ボタン不明 / 確認画面 submit 不明 も**自動スキップ＋記録**して次へ。
+4. **停止の自己復旧**: gateway の死活・hung・チャンネル切断は watchdog が自動再起動（§15）。run は
+   冪等＝再実行で送信済みを除外して再開できる。
+5. **承認後にリストや brief を大きく変えたら** `--revoke` で再度 事前承認に戻すこと。
+6. **結果の可視化**: `report send-funnel --brief <id>` の **autonomous (v5)** 節で、自己採点の
+   送信/ゲート件数・平均スコア・auto-skip 理由内訳（captcha/wrong-form/submit 不明 等）を確認できる。
+   「自律で何件送って何件スキップした？」には必ずこれを引いて Slack 返信する。
+
+> supervised（既定）の brief は従来どおり 1 件ずつ Slack 承認・reCAPTCHA は「<id>進めて」で resolve。
 
 ## Send flow (with Slack confirmation)
 
