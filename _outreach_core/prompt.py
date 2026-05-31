@@ -55,29 +55,74 @@ def build_system_block(config: dict[str, Any], prompts_dir: Path) -> str:
 
 
 def extract_first_json(text: str) -> dict[str, Any] | None:
-    """Pull the first {...} block out of model output, tolerant of prose."""
+    """Pull the first JSON object out of model output, tolerant of prose/fences."""
     if not text:
         return None
+    text = _strip_outer_code_fence(text)
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
     except Exception:
         pass
-    start = text.find("{")
-    while start != -1:
-        depth = 0
-        for i in range(start, len(text)):
-            ch = text[i]
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = text[start : i + 1]
-                    try:
-                        return json.loads(candidate)
-                    except Exception:
-                        break
-        start = text.find("{", start + 1)
+
+    for i, ch in enumerate(text):
+        if ch not in "{[":
+            continue
+        candidate = _extract_balanced_json(text, i, ch)
+        if not candidate:
+            continue
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, dict):
+                    return item
+    return None
+
+
+def _strip_outer_code_fence(text: str) -> str:
+    """Remove a single outer ```...``` wrapper if present."""
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    if len(lines) < 3:
+        return stripped
+    first = lines[0].strip()
+    last = lines[-1].strip()
+    if not first.startswith("```") or last != "```":
+        return stripped
+    return "\n".join(lines[1:-1]).strip()
+
+
+def _extract_balanced_json(text: str, start: int, opener: str) -> str | None:
+    closer = "}" if opener == "{" else "]"
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+            continue
+        if ch == opener:
+            depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
     return None
 
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -151,6 +153,7 @@ def stage_draft(
     data_dir: Path | None = None,
     run_id: str | None = None,
     sender: dict[str, Any] | None = None,
+    limit: int | None = None,
 ) -> None:
     from _outreach_core import events as ev
 
@@ -158,7 +161,11 @@ def stage_draft(
         ev.configure(skill=skill, data_dir=data_dir, run_id=run_id)
     sender_cfg = sender or (config.get("sender") or {})
 
-    leads = [json.loads(l) for l in input_path.open()]
+    with input_path.open(encoding="utf-8") as f:
+        leads = [json.loads(l) for l in f]
+    if limit is not None and len(leads) > limit:
+        print(f"[draft] --limit {limit} applied (all {len(leads)} leads)")
+        leads = leads[:limit]
     print(
         f"[draft] {len(leads)} leads to draft"
         + (" (with refine 2nd pass)" if refine_fn else "")
@@ -169,9 +176,19 @@ def stage_draft(
     extended_max = int(model_cfg.get("max_chars_extended", default_max))
 
     system_block = prompt_mod.build_system_block(config, prompts_dir)
-    drafts: list[dict[str, Any]] = []
+    draft_cfg = config.get("draft") or {}
+    max_parse_attempts = max(1, int(draft_cfg.get("parse_retry_max_attempts", 2)))
+    per_lead_soft_timeout_sec = float(draft_cfg.get("lead_soft_timeout_sec", 90))
+    existing_ids = _load_existing_draft_ids(out_path)
+    if existing_ids:
+        print(f"[draft] resume mode: {len(existing_ids)} existing drafts already persisted")
+    new_rows: list[dict[str, Any]] = []
 
     for i, lead in enumerate(leads, 1):
+        lead_id = str(lead.get("id", ""))
+        if lead_id and lead_id in existing_ids:
+            print(f"[draft] ({i}/{len(leads)}) skip existing id={lead_id}")
+            continue
         max_chars = resolve_max_chars(
             lead, config, default_max=default_max, extended_max=extended_max
         )
@@ -197,19 +214,52 @@ def stage_draft(
             {"system": system_block, "user": user_block},
             sender=sender_cfg,
         )
-        response = oc_infer_fn(full_prompt, model)
-        ev.dump_trace(trace, "draft_response.json", {"raw": (response or "")[:200_000]})
-        draft = prompt_mod.extract_first_json(response or "")
+        started = time.monotonic()
+        draft: dict[str, Any] | None = None
+        response = ""
+        for attempt in range(1, max_parse_attempts + 1):
+            if (time.monotonic() - started) > per_lead_soft_timeout_sec:
+                break
+            response = oc_infer_fn(full_prompt, model) or ""
+            ev.dump_trace(
+                trace,
+                f"draft_response.attempt{attempt}.json",
+                {"attempt": attempt, "raw": response[:200_000]},
+            )
+            candidate = prompt_mod.extract_first_json(response)
+            if candidate and "subject" in candidate and "body" in candidate:
+                draft = candidate
+                break
+            if attempt < max_parse_attempts:
+                print(
+                    f"[draft] ({label}) parse retry {attempt}/{max_parse_attempts} "
+                    "(invalid JSON shape)"
+                )
+
         if not draft or "subject" not in draft or "body" not in draft:
             print(f"[draft] parse failed for {label}: {(response or '')[:200]}")
+            timed_out = (time.monotonic() - started) > per_lead_soft_timeout_sec
             ev.emit(
                 "draft.skipped",
                 stage="draft",
                 target_id=target_id,
                 outcome="parse_error",
-                payload={"reason": "parse_failed"},
+                payload={
+                    "reason": "parse_error",
+                    "attempts": max_parse_attempts,
+                    "timed_out": timed_out,
+                },
                 trace_dir=trace,
             )
+            row = {
+                **lead,
+                "draft": {"subject": "SKIP", "body": "parse_error"},
+                "_drafted_at": datetime.utcnow().isoformat() + "Z",
+            }
+            _append_draft_row(out_path, row)
+            if lead_id:
+                existing_ids.add(lead_id)
+            new_rows.append(row)
             continue
 
         if draft.get("subject") == "SKIP":
@@ -272,16 +322,42 @@ def stage_draft(
         row: dict[str, Any] = {
             **lead,
             "draft": draft,
-            "_drafted_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+            "_drafted_at": datetime.utcnow().isoformat() + "Z",
         }
         if lead.get("char_limit") or max_chars != default_max:
             row["max_chars_used"] = max_chars
-        drafts.append(row)
+        _append_draft_row(out_path, row)
+        if lead_id:
+            existing_ids.add(lead_id)
+        new_rows.append(row)
 
-    with out_path.open("w") as f:
-        for d in drafts:
-            f.write(json.dumps(d, ensure_ascii=False) + "\n")
-    print(f"[draft] wrote {len(drafts)} drafts -> {out_path}")
+    print(f"[draft] wrote {len(new_rows)} new drafts -> {out_path}")
 
-    new_skips = [d for d in drafts if (d.get("draft") or {}).get("subject") == "SKIP"]
+    new_skips = [d for d in new_rows if (d.get("draft") or {}).get("subject") == "SKIP"]
     append_skip_fn(new_skips)
+
+
+def _load_existing_draft_ids(out_path: Path) -> set[str]:
+    ids: set[str] = set()
+    if not out_path.is_file():
+        return ids
+    try:
+        for line in out_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            rid = row.get("id")
+            if rid is not None:
+                ids.add(str(rid))
+    except OSError:
+        return ids
+    return ids
+
+
+def _append_draft_row(out_path: Path, row: dict[str, Any]) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
