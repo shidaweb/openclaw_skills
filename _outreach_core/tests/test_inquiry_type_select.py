@@ -138,6 +138,26 @@ class TestInquiryTypeSelect(unittest.TestCase):
         self.assertTrue(ap.called)
 
     def test_llm_click_submit_prefers_selector_click(self) -> None:
+        buttons = [{"text": "送信する", "selector": "button.submit"}]
+        with (
+            patch.object(
+                self.run_mod,
+                "_llm_pick_final_submit",
+                return_value={"text": "送信する", "selector": "button.submit"},
+            ),
+            patch.object(
+                self.run_mod,
+                "_click_by_selector",
+                return_value={"clicked": True, "text": "送信する"},
+            ) as cs,
+            patch.object(self.run_mod, "_click_by_exact_text", return_value=None) as ct,
+        ):
+            out = self.run_mod._llm_click_submit_candidate(buttons, {}, phase="final")
+        self.assertTrue(out and out.get("clicked"))
+        self.assertTrue(cs.called)
+        self.assertFalse(ct.called)
+
+    def test_llm_click_submit_rejects_confirm_button_in_final_phase(self) -> None:
         buttons = [{"text": "入力内容を確認する", "selector": "button.confirm"}]
         with (
             patch.object(
@@ -149,13 +169,24 @@ class TestInquiryTypeSelect(unittest.TestCase):
                 self.run_mod,
                 "_click_by_selector",
                 return_value={"clicked": True, "text": "入力内容を確認する"},
-            ) as cs,
-            patch.object(self.run_mod, "_click_by_exact_text", return_value=None) as ct,
+            ),
         ):
             out = self.run_mod._llm_click_submit_candidate(buttons, {}, phase="final")
-        self.assertTrue(out and out.get("clicked"))
-        self.assertTrue(cs.called)
-        self.assertFalse(ct.called)
+        self.assertIsNone(out)
+
+    def test_infer_submit_flow_from_buttons(self) -> None:
+        with patch.object(
+            self.run_mod,
+            "_enumerate_buttons",
+            return_value=[{"text": "お問い合わせ内容の確認"}],
+        ):
+            self.assertEqual(self.run_mod._infer_submit_flow_from_buttons(), "confirm")
+        with patch.object(
+            self.run_mod,
+            "_enumerate_buttons",
+            return_value=[{"text": "送信する"}],
+        ):
+            self.assertEqual(self.run_mod._infer_submit_flow_from_buttons(), "single")
 
     def test_inquiry_type_no_b2b_flags_true_when_llm_or_fallback_true(self) -> None:
         inquiry_fields = [

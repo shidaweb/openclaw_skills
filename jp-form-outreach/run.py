@@ -2031,6 +2031,37 @@ def _click_by_selector(selector: str) -> dict[str, Any] | None:
     return None
 
 
+_FIRST_STEP_BTN_RE = re.compile(r"(入力内容を確認|内容(を|の)?確認|確認画面|同意して次へ|^次へ$)", re.I)
+_FINAL_STEP_BTN_RE = re.compile(r"(送信|submit|完了|確定|問い合わせを送信|お問い合わせを送信)", re.I)
+
+
+def _looks_like_first_step_button(text: str) -> bool:
+    return bool(_FIRST_STEP_BTN_RE.search((text or "").strip()))
+
+
+def _looks_like_final_step_button(text: str) -> bool:
+    return bool(_FINAL_STEP_BTN_RE.search((text or "").strip()))
+
+
+def _infer_submit_flow_from_buttons(form_root_selector: str | None = None) -> str | None:
+    buttons = _enumerate_buttons(form_root_selector=form_root_selector)
+    if not buttons:
+        return None
+    first_like = 0
+    final_like = 0
+    for b in buttons:
+        txt = str(b.get("text") or "")
+        if _looks_like_first_step_button(txt):
+            first_like += 1
+        if _looks_like_final_step_button(txt):
+            final_like += 1
+    if first_like > 0 and final_like == 0:
+        return "confirm"
+    if final_like > 0 and first_like == 0:
+        return "single"
+    return None
+
+
 _FINAL_SUBMIT_PICKER_PROMPT = """あなたは日本語B2B問い合わせフォームの確認画面で「最終送信ボタン」を1つ選ぶ役割です。
 
 ## 状況
@@ -2148,9 +2179,14 @@ def _llm_click_submit_candidate(
         return None
     selector = str(pick.get("selector") or "").strip()
     text = str(pick.get("text") or "").strip()
+    # Guardrail: never use "確認/次へ" style buttons in final-submit phase.
+    if phase == "final" and text and _looks_like_first_step_button(text) and not _looks_like_final_step_button(text):
+        return None
     if selector:
         res = _click_by_selector(selector)
         if res and res.get("clicked"):
+            if phase == "final" and _looks_like_first_step_button(str(res.get("text") or "")) and not _looks_like_final_step_button(str(res.get("text") or "")):
+                return None
             res["picked"] = pick
             return res
     if text:
@@ -3641,6 +3677,9 @@ def _deep_submit(
     time.sleep(1.0)
 
     plan = d.get("_llm_plan") or {}
+    inferred_flow = _infer_submit_flow_from_buttons(form_root_selector=d.get("form_root_selector"))
+    if inferred_flow and inferred_flow != flow:
+        flow = inferred_flow
     if flow == "confirm":
         patterns = [r"入力内容を確認", r"内容(を|の)?確認", r"確認する", r"確認$", r"同意して次へ", r"^次へ$"]
     else:
@@ -3973,6 +4012,9 @@ def stage_send(
         plan_flow = plan.get("next_step")
         if plan_flow and plan_flow != flow:
             flow = plan_flow
+        inferred_flow = _infer_submit_flow_from_buttons(form_root_selector=d.get("form_root_selector"))
+        if inferred_flow and inferred_flow != flow:
+            flow = inferred_flow
         if flow == "confirm":
             patterns = [
                 r"入力内容を確認", r"送信内容を確認", r"内容(を|の)?確認",
