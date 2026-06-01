@@ -21,6 +21,22 @@ _RADIO_OPTION_NEGATIVE_RE = re.compile(
     r"(個人|採用|応募|ir|投資家|予約|サポート|修理|返品|faq|会員|ログイン)",
     re.I,
 )
+_SELECT_GATE_GROUP_RE = re.compile(
+    r"(お問い合わせ種別|問合せ種別|問い合わせ区分|カテゴリ|区分|件名|ご用件|種別|contact|subject)",
+    re.I,
+)
+_SELECT_OPTION_POSITIVE_RE = re.compile(
+    r"(法人|企業|業務用|提案|協業|提携|取引|営業|B2B|business|biz)",
+    re.I,
+)
+_SELECT_OPTION_NEGATIVE_RE = re.compile(
+    r"(個人|採用|応募|ir|投資家|株主|店舗について|予約|サポート|修理|返品|faq|会員|ログイン|忘れ物|苦情)",
+    re.I,
+)
+_SELECT_OPTION_PLACEHOLDER_RE = re.compile(
+    r"^(?:[-ー−‐~\s]*)?(?:以下から選択|選択してください|please select|select|お選びください).*$",
+    re.I,
+)
 
 
 def is_agreement_label(label: str | None) -> bool:
@@ -109,6 +125,63 @@ def _pick_radio_option(options: list[dict[str, Any]]) -> str | None:
     if not best:
         return None
     # avoid forcing clearly negative options
+    if best[0] < 0:
+        return None
+    return best[1]
+
+
+def pick_select_gate_actions(groups: list[dict[str, Any]] | None) -> list[dict[str, str]]:
+    """Choose select options likely required to unblock submit."""
+    if not isinstance(groups, list):
+        return []
+    actions: list[dict[str, str]] = []
+    for g in groups:
+        if not isinstance(g, dict):
+            continue
+        name = str(g.get("name") or g.get("id") or "").strip()
+        if not name:
+            continue
+        if bool(g.get("selected")):
+            continue
+        label = str(g.get("label") or "")
+        required = bool(g.get("required"))
+        if not required and not _SELECT_GATE_GROUP_RE.search(label):
+            continue
+        choice = _pick_select_option(g.get("options") or [])
+        if not choice:
+            continue
+        actions.append({"name": name, "value": choice})
+    return actions
+
+
+def _pick_select_option(options: list[dict[str, Any]]) -> str | None:
+    best: tuple[int, str] | None = None
+    for o in options:
+        if not isinstance(o, dict):
+            continue
+        if bool(o.get("selected")):
+            continue
+        if bool(o.get("disabled")):
+            continue
+        label = str(o.get("label") or "")
+        value = str(o.get("value") or "")
+        text = (label or value).strip()
+        if not text:
+            continue
+        if _SELECT_OPTION_PLACEHOLDER_RE.match(text):
+            continue
+        score = 0
+        if _SELECT_OPTION_POSITIVE_RE.search(text):
+            score += 3
+        if _SELECT_OPTION_NEGATIVE_RE.search(text):
+            score -= 5
+        # "その他のお問い合わせ" is often safer than recruit/IR/support lanes.
+        if "その他" in text:
+            score += 1
+        if best is None or score > best[0]:
+            best = (score, text)
+    if not best:
+        return None
     if best[0] < 0:
         return None
     return best[1]

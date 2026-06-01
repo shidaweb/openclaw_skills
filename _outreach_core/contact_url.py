@@ -72,6 +72,13 @@ _RECRUIT_FIELD_KW = (
 )
 _CONTACT_TEXTAREA_KW = ("お問い合わせ", "問合せ", "本文", "ご相談", "内容", "メッセージ", "message", "inquiry")
 _SEARCH_TEXTAREA_KW = ("検索", "search", "keyword", "query")
+_PRE_FORM_GATE_KW = (
+    "メールフォームはこちら",
+    "お問い合わせフォームはこちら",
+    "お問い合わせ種別",
+    "上記に同意してお問い合わせする",
+    "同意してお問い合わせ",
+)
 
 
 def registrable_domain(url_or_host: str) -> str:
@@ -177,10 +184,24 @@ def classify_form_type(fields: dict, snapshot: str | None) -> tuple[str, str | N
             if not textareas:
                 return (kind, f"heading mentions {kind}")
 
+    # Pre-form gate page: no textarea yet, but this is still the right contact flow.
+    if _looks_like_contact_gate(fields, snap_head):
+        return ("contact", "pre_form_gate")
+
     if not _has_contact_textarea(fields):
         return ("unknown_no_textarea", "no valid inquiry textarea")
 
     return ("contact", None)
+
+
+def _looks_like_contact_gate(fields: dict, snap_head: str) -> bool:
+    radios = fields.get("radios") or {}
+    checks = fields.get("checkboxes") or []
+    has_radio = bool(radios)
+    has_agreement_checkbox = any("同意" in str(c.get("label") or "") for c in checks if isinstance(c, dict))
+    text_hit = any(k in snap_head for k in _PRE_FORM_GATE_KW)
+    contact_heading = ("お問い合わせ" in snap_head) or ("contact" in snap_head.lower())
+    return contact_heading and text_hit and (has_radio or has_agreement_checkbox)
 
 
 def _has_contact_textarea(fields: dict) -> bool:

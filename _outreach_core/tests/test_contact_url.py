@@ -57,6 +57,18 @@ class TestContactUrl(unittest.TestCase):
         kind, _reason = cu.classify_form_type(fields, "法人のお問い合わせ")
         self.assertEqual(kind, "contact")
 
+    def test_classify_pre_form_gate_without_textarea_as_contact(self) -> None:
+        fields = {
+            "inputs": [{"name": "email", "label": "メールアドレス"}],
+            "textareas": [],
+            "radios": {"contact_kind": [{"label": "法人のお問い合わせ", "checked": False}]},
+            "checkboxes": [{"label": "上記に同意してお問い合わせする", "checked": False}],
+        }
+        snap = "お問い合わせ お問い合わせ種別 メールフォームはこちら 上記に同意してお問い合わせする"
+        kind, reason = cu.classify_form_type(fields, snap)
+        self.assertEqual(kind, "contact")
+        self.assertEqual(reason, "pre_form_gate")
+
 
 if __name__ == "__main__":
     unittest.main()

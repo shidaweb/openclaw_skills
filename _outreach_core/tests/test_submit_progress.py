@@ -75,6 +75,56 @@ class TestSubmitProgress(unittest.TestCase):
         actions = sp.pick_radio_gate_actions(groups)
         self.assertEqual(actions, [{"name": "topic", "value": "その他"}])
 
+    def test_pick_select_gate_actions_prefers_business_proposal(self) -> None:
+        groups = [
+            {
+                "name": "contact_category",
+                "label": "お問い合わせ区分",
+                "required": True,
+                "selected": False,
+                "options": [
+                    {"label": "ー以下から選択してくださいー", "value": "", "selected": True, "disabled": False},
+                    {"label": "採用に関するお問い合わせ", "value": "recruit", "selected": False, "disabled": False},
+                    {"label": "広報、IRなどのお問い合わせ", "value": "ir", "selected": False, "disabled": False},
+                    {"label": "業務用食材、備品、消耗品のご提案について", "value": "proposal", "selected": False, "disabled": False},
+                    {"label": "その他のお問い合わせ", "value": "other", "selected": False, "disabled": False},
+                ],
+            }
+        ]
+        actions = sp.pick_select_gate_actions(groups)
+        self.assertEqual(actions, [{"name": "contact_category", "value": "業務用食材、備品、消耗品のご提案について"}])
+
+    def test_pick_select_gate_actions_uses_other_when_only_safe_choice(self) -> None:
+        groups = [
+            {
+                "name": "contact_category",
+                "label": "お問い合わせ区分",
+                "required": True,
+                "selected": False,
+                "options": [
+                    {"label": "ー以下から選択してくださいー", "value": "", "selected": True, "disabled": False},
+                    {"label": "採用に関するお問い合わせ", "value": "recruit", "selected": False, "disabled": False},
+                    {"label": "その他のお問い合わせ", "value": "other", "selected": False, "disabled": False},
+                ],
+            }
+        ]
+        actions = sp.pick_select_gate_actions(groups)
+        self.assertEqual(actions, [{"name": "contact_category", "value": "その他のお問い合わせ"}])
+
+    def test_pick_select_gate_actions_skips_selected_group(self) -> None:
+        groups = [
+            {
+                "name": "contact_category",
+                "label": "お問い合わせ区分",
+                "required": True,
+                "selected": True,
+                "options": [
+                    {"label": "業務用食材、備品、消耗品のご提案について", "value": "proposal", "selected": True, "disabled": False},
+                ],
+            }
+        ]
+        self.assertEqual(sp.pick_select_gate_actions(groups), [])
+
 
 if __name__ == "__main__":
     unittest.main()
