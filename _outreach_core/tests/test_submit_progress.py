@@ -151,6 +151,26 @@ class TestSubmitProgress(unittest.TestCase):
         self.assertEqual(picked["value"], "お取引・ご提案")
         self.assertIn(picked["confidence"], ("high", "low"))
 
+    def test_rank_submit_candidates_prioritizes_in_form_submit_type(self) -> None:
+        candidates = [
+            {"text": "こちら", "tag": "a", "href": "/x", "is_submit_type": False, "in_form": False},
+            {"text": "こちら", "tag": "a", "href": "/y", "is_submit_type": False, "in_form": False},
+            {"text": "", "tag": "input", "type": "submit", "is_submit_type": True, "in_form": True},
+        ]
+        ranked = sp.rank_submit_candidates(candidates, phase="final")
+        self.assertTrue(ranked)
+        self.assertTrue(ranked[0]["is_submit_type"])
+        self.assertTrue(ranked[0]["in_form"])
+
+    def test_rank_submit_candidates_returns_empty_when_all_noise(self) -> None:
+        candidates = [
+            {"text": "こちら", "tag": "a", "href": "/x", "is_submit_type": False, "in_form": False},
+            {"text": "こちら", "tag": "a", "href": "/y", "is_submit_type": False, "in_form": False},
+            {"text": "プライバシー", "tag": "a", "href": "/privacy", "is_submit_type": False, "in_form": False},
+        ]
+        ranked = sp.rank_submit_candidates(candidates, phase="final")
+        self.assertEqual(ranked, [])
+
 
 if __name__ == "__main__":
     unittest.main()

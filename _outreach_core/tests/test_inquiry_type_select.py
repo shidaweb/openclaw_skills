@@ -197,6 +197,25 @@ class TestInquiryTypeSelect(unittest.TestCase):
         out = self.run_mod._phase_filter_submit_candidates(buttons, phase="final")
         self.assertEqual(out[0]["text"], "上記の内容で送信")
 
+    def test_phase_filter_prefers_submit_type_in_target_form(self) -> None:
+        buttons = [
+            {"text": "こちら", "tag": "a", "href": "/a", "is_submit_type": False, "in_form": False},
+            {"text": "", "tag": "input", "type": "submit", "is_submit_type": True, "in_form": True},
+            {"text": "送信する", "tag": "button", "is_submit_type": False, "in_form": False},
+        ]
+        out = self.run_mod._phase_filter_submit_candidates(buttons, phase="final")
+        self.assertTrue(out)
+        self.assertTrue(out[0].get("is_submit_type"))
+        self.assertTrue(out[0].get("in_form"))
+
+    def test_phase_filter_returns_empty_when_all_noise_links(self) -> None:
+        buttons = [
+            {"text": "こちら", "tag": "a", "href": "/a", "is_submit_type": False, "in_form": False},
+            {"text": "詳細", "tag": "a", "href": "/b", "is_submit_type": False, "in_form": False},
+        ]
+        out = self.run_mod._phase_filter_submit_candidates(buttons, phase="final")
+        self.assertEqual(out, [])
+
     def test_inquiry_type_no_b2b_flags_true_when_llm_or_fallback_true(self) -> None:
         inquiry_fields = [
             {
@@ -215,6 +234,16 @@ class TestInquiryTypeSelect(unittest.TestCase):
         self.assertTrue(llm)
         self.assertTrue(no_b2b)
         self.assertTrue(fallback)
+
+    def test_submit_native_wrapper_marks_clicked_on_request_submit(self) -> None:
+        with patch.object(
+            self.run_mod,
+            "_evaluate",
+            return_value={"method": "requestSubmit", "reason": "requestSubmit()", "form_sig": "form#contact"},
+        ):
+            out = self.run_mod._submit_native({"_llm_plan": {"fields": []}})
+        self.assertTrue(out.get("clicked"))
+        self.assertEqual(out.get("method"), "requestSubmit")
 
 
 if __name__ == "__main__":

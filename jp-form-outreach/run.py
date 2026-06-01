@@ -1885,11 +1885,13 @@ def _try_open_pre_form_gate() -> dict[str, Any] | None:
 
 _ENUMERATE_BUTTONS_JS = r"""
 (args) => {
-  const { formRootSelector } = args;
+  const { formRootSelector, filledNames } = args;
   const selector =
     'button, input[type="submit"], input[type="button"], input[type="image"], a, [role="button"], ' +
     '[onclick], .btn, [class*="btn" i], [class*="submit" i], [class*="confirm" i]';
   const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const toSet = (arr) => new Set((arr || []).map((x) => String(x || '').trim()).filter(Boolean));
+  const filledSet = toSet(filledNames);
   const stableSelector = (el) => {
     if (el.id) return `#${CSS.escape(el.id)}`;
     const name = el.getAttribute('name');
@@ -1909,6 +1911,60 @@ _ENUMERATE_BUTTONS_JS = r"""
     }
     return path.join(' > ');
   };
+  const visibleEnabled = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    const blocked = Boolean(
+      el.disabled ||
+      el.getAttribute('aria-disabled') === 'true' ||
+      style.pointerEvents === 'none' ||
+      style.visibility === 'hidden' ||
+      style.display === 'none'
+    );
+    return !blocked && el.offsetParent !== null;
+  };
+  const hasSubmitControl = (form) => {
+    if (!form) return false;
+    return !!form.querySelector('button[type="submit"],input[type="submit"],input[type="image"]');
+  };
+  const formScore = (form) => {
+    if (!form) return -9999;
+    if (form.querySelector('input[type="password"]')) return -9999;
+    const role = String(form.getAttribute('role') || '').toLowerCase();
+    const action = String(form.getAttribute('action') || '').toLowerCase();
+    if (role === 'search') return -9999;
+    if (/(search|login|logout)/.test(action)) return -9999;
+    let s = 0;
+    if (hasSubmitControl(form)) s += 5;
+    if (!form.closest('header, footer, nav')) s += 2;
+    const hidden = Array.from(form.querySelectorAll('input[type="hidden"]'));
+    s += Math.min(4, hidden.length);
+    if (filledSet.size > 0) {
+      let hits = 0;
+      for (const h of hidden) {
+        const nm = String(h.getAttribute('name') || '').trim();
+        if (nm && filledSet.has(nm)) hits += 1;
+      }
+      s += Math.min(8, hits * 2);
+    }
+    return s;
+  };
+  const pickTargetForm = () => {
+    if (formRootSelector) {
+      try {
+        const forced = document.querySelector(formRootSelector);
+        if (forced && forced.tagName === 'FORM') return forced;
+      } catch (e) {}
+    }
+    const forms = Array.from(document.querySelectorAll('form'));
+    if (!forms.length) return null;
+    forms.sort((a, b) => formScore(b) - formScore(a));
+    const top = forms[0];
+    if (!top || formScore(top) < 0) return null;
+    return top;
+  };
+  const targetForm = pickTargetForm();
+  const targetFormSig = targetForm ? stableSelector(targetForm) : '';
   let scope = document;
   if (formRootSelector) {
     try {
@@ -1919,15 +1975,7 @@ _ENUMERATE_BUTTONS_JS = r"""
   const buttons = Array.from(scope.querySelectorAll(selector));
   const out = [];
   buttons.forEach((b, idx) => {
-    const style = window.getComputedStyle(b);
-    const blocked = Boolean(
-      b.disabled ||
-      b.getAttribute('aria-disabled') === 'true' ||
-      style.pointerEvents === 'none' ||
-      style.visibility === 'hidden' ||
-      style.display === 'none'
-    );
-    if (blocked || b.offsetParent === null) return;
+    if (!visibleEnabled(b)) return;
     const txt = norm(
       (b.textContent || b.value || '') + ' ' +
       (b.getAttribute('aria-label') || '') + ' ' +
@@ -1939,6 +1987,12 @@ _ENUMERATE_BUTTONS_JS = r"""
     if (!txt && !['submit', 'button', 'image'].includes(btnType)) return;
     if (txt.length > 120) return;
     const className = norm(b.className || '');
+    const ownerForm = b.closest('form');
+    const ownerSig = ownerForm ? stableSelector(ownerForm) : '';
+    const isSubmitType = (
+      btnType === 'submit' || btnType === 'image' ||
+      (b.tagName.toLowerCase() === 'button' && (btnType === '' || btnType === 'submit'))
+    );
     out.push({
       idx,
       text: txt,
@@ -1950,6 +2004,9 @@ _ENUMERATE_BUTTONS_JS = r"""
       class_name: className.slice(0, 120),
       href: b.getAttribute('href') || '',
       selector: stableSelector(b),
+      is_submit_type: isSubmitType,
+      in_form: Boolean(targetFormSig && ownerSig && ownerSig === targetFormSig),
+      form_sig: ownerSig,
       intent_hint: norm(
         (b.getAttribute('type') || '') + ' ' +
         (b.getAttribute('onclick') || '') + ' ' +
@@ -1957,7 +2014,7 @@ _ENUMERATE_BUTTONS_JS = r"""
       ).slice(0, 160),
     });
   });
-  return { scope: scope === document ? 'document' : 'form', buttons: out };
+  return { scope: scope === document ? 'document' : 'form', target_form_sig: targetFormSig, buttons: out };
 }
 """
 
@@ -1992,8 +2049,112 @@ _CLICK_BY_SELECTOR_JS = r"""
 """
 
 
-def _enumerate_buttons(form_root_selector: str | None = None) -> list[dict[str, Any]]:
-    args = {"formRootSelector": form_root_selector}
+_SUBMIT_TARGET_FORM_JS = r"""
+(args) => {
+  const { formRootSelector, filledNames } = args;
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const toSet = (arr) => new Set((arr || []).map((x) => String(x || '').trim()).filter(Boolean));
+  const filledSet = toSet(filledNames);
+  const stableSelector = (el) => {
+    if (!el) return '';
+    if (el.id) return `#${CSS.escape(el.id)}`;
+    const name = el.getAttribute('name');
+    if (name) return `${el.tagName.toLowerCase()}[name="${CSS.escape(name)}"]`;
+    let cur = el;
+    const path = [];
+    for (let depth = 0; cur && depth < 7 && cur !== document.body; depth += 1) {
+      let part = cur.tagName.toLowerCase();
+      if (cur.parentElement) {
+        const sibs = Array.from(cur.parentElement.children).filter((x) => x.tagName === cur.tagName);
+        if (sibs.length > 1) part += `:nth-of-type(${sibs.indexOf(cur) + 1})`;
+      }
+      path.unshift(part);
+      cur = cur.parentElement;
+    }
+    return path.join(' > ');
+  };
+  const visibleEnabled = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    const blocked = Boolean(
+      el.disabled ||
+      el.getAttribute('aria-disabled') === 'true' ||
+      style.pointerEvents === 'none' ||
+      style.visibility === 'hidden' ||
+      style.display === 'none'
+    );
+    return !blocked && el.offsetParent !== null;
+  };
+  const score = (form) => {
+    if (!form) return -9999;
+    if (form.querySelector('input[type="password"]')) return -9999;
+    const role = String(form.getAttribute('role') || '').toLowerCase();
+    const action = String(form.getAttribute('action') || '').toLowerCase();
+    if (role === 'search') return -9999;
+    if (/(search|login|logout)/.test(action)) return -9999;
+    if (form.closest('header,footer,nav') && !form.closest('main,article,section')) return -5;
+    let s = 0;
+    const submits = Array.from(form.querySelectorAll('button[type="submit"],input[type="submit"],input[type="image"]'));
+    s += submits.length > 0 ? 5 : 0;
+    if (!form.closest('header, footer, nav')) s += 2;
+    const hidden = Array.from(form.querySelectorAll('input[type="hidden"]'));
+    s += Math.min(4, hidden.length);
+    if (filledSet.size > 0) {
+      let hits = 0;
+      for (const h of hidden) {
+        const nm = String(h.getAttribute('name') || '').trim();
+        if (nm && filledSet.has(nm)) hits += 1;
+      }
+      s += Math.min(8, hits * 2);
+    }
+    return s;
+  };
+  let target = null;
+  if (formRootSelector) {
+    try {
+      const forced = document.querySelector(formRootSelector);
+      if (forced && forced.tagName === 'FORM') target = forced;
+    } catch (e) {}
+  }
+  if (!target) {
+    const forms = Array.from(document.querySelectorAll('form'));
+    forms.sort((a, b) => score(b) - score(a));
+    if (forms.length && score(forms[0]) >= 0) target = forms[0];
+  }
+  if (!target) return { method: "none", reason: "no_target_form", form_sig: "" };
+  const formSig = stableSelector(target);
+  const controls = Array.from(target.querySelectorAll('button[type="submit"],input[type="submit"],input[type="image"]'));
+  const submitter = controls.find((el) => visibleEnabled(el)) || controls[0] || null;
+  if (submitter && visibleEnabled(submitter)) {
+    submitter.click();
+    return {
+      method: "click_submit",
+      form_sig: formSig,
+      control_text: norm((submitter.textContent || submitter.value || submitter.getAttribute('aria-label') || submitter.getAttribute('alt') || '')),
+      reason: "clicked submit control",
+    };
+  }
+  if (typeof target.requestSubmit === 'function') {
+    if (submitter) target.requestSubmit(submitter);
+    else target.requestSubmit();
+    return {
+      method: "requestSubmit",
+      form_sig: formSig,
+      control_text: submitter ? norm(submitter.textContent || submitter.value || '') : "",
+      reason: submitter ? "requestSubmit(submitter)" : "requestSubmit()",
+    };
+  }
+  return { method: "none", reason: "requestSubmit_unavailable", form_sig: formSig };
+}
+"""
+
+
+def _enumerate_buttons(
+    form_root_selector: str | None = None,
+    *,
+    filled_names: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    args = {"formRootSelector": form_root_selector, "filledNames": filled_names or []}
     js = f"""
     (() => {{
       const fn = {_ENUMERATE_BUTTONS_JS};
@@ -2004,6 +2165,49 @@ def _enumerate_buttons(form_root_selector: str | None = None) -> list[dict[str, 
     if isinstance(res, dict):
         return res.get("buttons") or []
     return []
+
+
+def _filled_name_hints(d: dict[str, Any]) -> list[str]:
+    hints: list[str] = []
+    plan = d.get("_llm_plan") or {}
+    for e in plan.get("fields") or []:
+        if not isinstance(e, dict):
+            continue
+        name = str(e.get("name") or "").strip()
+        if not name or name.startswith("selector:"):
+            continue
+        hints.append(name)
+    return sorted(set(hints))[:120]
+
+
+def _submit_native(
+    d: dict[str, Any],
+    *,
+    form_root_selector: str | None = None,
+) -> dict[str, Any]:
+    args = {
+        "formRootSelector": form_root_selector,
+        "filledNames": _filled_name_hints(d),
+    }
+    js = f"""
+    (() => {{
+      const fn = {_SUBMIT_TARGET_FORM_JS};
+      return fn({json.dumps(args, ensure_ascii=False)});
+    }})()
+    """
+    res = _evaluate(js)
+    out = res if isinstance(res, dict) else {}
+    method = str(out.get("method") or "none")
+    out["clicked"] = method in ("click_submit", "requestSubmit")
+    return out
+
+
+def _native_submit_diag(native: dict[str, Any] | None) -> str:
+    n = native or {}
+    return (
+        f"native submit: method={n.get('method', 'none')}, "
+        f"reason={n.get('reason', '')}, form={n.get('form_sig', '')}"
+    )
 
 
 def _click_by_exact_text(text: str,
@@ -2068,36 +2272,7 @@ def _phase_filter_submit_candidates(
     *,
     phase: str,
 ) -> list[dict[str, Any]]:
-    def score(btn: dict[str, Any]) -> int:
-        text = str(btn.get("text") or "").strip()
-        href = str(btn.get("href") or "").strip()
-        tag = str(btn.get("tag") or "").strip().lower()
-        s = 0
-        if not text:
-            s -= 2
-        if _NOISE_BTN_RE.search(text):
-            s -= 4
-        if "こちら" in text:
-            s -= 2
-        if tag == "a" and href and href != "#" and not href.lower().startswith("javascript:"):
-            s -= 2
-        if phase == "final":
-            if _looks_like_final_step_button(text):
-                s += 5
-            if _looks_like_first_step_button(text) and not _looks_like_final_step_button(text):
-                s -= 4
-        else:
-            if _looks_like_first_step_button(text):
-                s += 5
-            if _looks_like_final_step_button(text) and not _looks_like_first_step_button(text):
-                s -= 3
-        return s
-
-    ranked = sorted(buttons, key=score, reverse=True)
-    strong = [b for b in ranked if score(b) >= 0]
-    if strong:
-        return strong[:25]
-    return ranked[:25]
+    return core_submit_progress.rank_submit_candidates(buttons, phase=phase)
 
 
 _FINAL_SUBMIT_PICKER_PROMPT = """あなたは日本語B2B問い合わせフォームの確認画面で「最終送信ボタン」を1つ選ぶ役割です。
@@ -3639,7 +3814,10 @@ def _resolve_in_open_tab(
     ]
     cr = _click_button_with_gate_retry(patterns, form_root_selector=d.get("form_root_selector"))
     if not cr or not cr.get("clicked"):
-        buttons = _enumerate_buttons()
+        buttons = _enumerate_buttons(
+            form_root_selector=d.get("form_root_selector"),
+            filled_names=_filled_name_hints(d),
+        )
         if buttons:
             cr = _llm_click_submit_candidate(
                 buttons,
@@ -3647,6 +3825,10 @@ def _resolve_in_open_tab(
                 form_root_selector=d.get("form_root_selector"),
                 phase="first" if flow == "confirm" else "final",
             )
+        if not cr or not cr.get("clicked"):
+            native = _submit_native(d, form_root_selector=d.get("form_root_selector"))
+            if native.get("clicked"):
+                cr = {"clicked": True, "text": f"[native:{native.get('method')}]"}
     if not cr or not cr.get("clicked"):
         return {"vresult": None, "page_text": "", "status": "no_button"}
     time.sleep(3)
@@ -3657,6 +3839,21 @@ def _resolve_in_open_tab(
             r"submit", r"完了", r"確定", r"問い合わせを送信",
         ])
         if c2 and c2.get("clicked"):
+            time.sleep(5)
+        else:
+            buttons = _enumerate_buttons(
+                form_root_selector=d.get("form_root_selector"),
+                filled_names=_filled_name_hints(d),
+            )
+            if buttons:
+                c2 = _llm_click_submit_candidate(
+                    buttons,
+                    config or {},
+                    form_root_selector=d.get("form_root_selector"),
+                    phase="final",
+                )
+            if not c2 or not c2.get("clicked"):
+                _submit_native(d, form_root_selector=d.get("form_root_selector"))
             time.sleep(5)
     time.sleep(2)
     page_evidence = _evaluate(PAGE_EVIDENCE_JS)
@@ -3727,7 +3924,10 @@ def _deep_submit(
         patterns = patterns + [plan["first_button_pattern"]]
     cr = _click_button_with_gate_retry(patterns, form_root_selector=d.get("form_root_selector"))
     if not cr or not cr.get("clicked"):
-        buttons = _enumerate_buttons(form_root_selector=d.get("form_root_selector"))
+        buttons = _enumerate_buttons(
+            form_root_selector=d.get("form_root_selector"),
+            filled_names=_filled_name_hints(d),
+        )
         if buttons:
             cr = _llm_click_submit_candidate(
                 buttons,
@@ -3735,6 +3935,10 @@ def _deep_submit(
                 form_root_selector=d.get("form_root_selector"),
                 phase="first" if flow == "confirm" else "final",
             )
+        if not cr or not cr.get("clicked"):
+            native = _submit_native(d, form_root_selector=d.get("form_root_selector"))
+            if native.get("clicked"):
+                cr = {"clicked": True, "text": f"[native:{native.get('method')}]"}
     if not cr or not cr.get("clicked"):
         return {"vresult": None, "page_text": ""}
     time.sleep(3)
@@ -3745,9 +3949,19 @@ def _deep_submit(
             r"上記の内容で送信", r"submit", r"完了", r"確定", r"問い合わせを送信",
         ])
         if not c2 or not c2.get("clicked"):
-            buttons = _enumerate_buttons()
+            buttons = _enumerate_buttons(
+                form_root_selector=d.get("form_root_selector"),
+                filled_names=_filled_name_hints(d),
+            )
             if buttons:
-                c2 = _llm_click_submit_candidate(buttons, config or {}, phase="final")
+                c2 = _llm_click_submit_candidate(
+                    buttons,
+                    config or {},
+                    form_root_selector=d.get("form_root_selector"),
+                    phase="final",
+                )
+            if not c2 or not c2.get("clicked"):
+                _submit_native(d, form_root_selector=d.get("form_root_selector"))
         time.sleep(5)
 
     time.sleep(2)
@@ -4070,6 +4284,8 @@ def stage_send(
             patterns,
             form_root_selector=d.get("form_root_selector"),
         )
+        first_native: dict[str, Any] | None = None
+        first_noise_only = False
         if not click_res or not click_res.get("clicked"):
             # Strengthened detection (§3.5): before declaring failure, enumerate
             # the form's buttons and let the LLM pick the most likely confirm/submit
@@ -4077,13 +4293,21 @@ def stage_send(
             # "first submit not found" cases (e.g. オリヒロ) were mislabeled as
             # reCAPTCHA when the button simply didn't match the regex list.
             print(f"  [send] first submit button regex miss — LLM picker fallback")
-            buttons = _enumerate_buttons(form_root_selector=d.get("form_root_selector"))
+            buttons = _enumerate_buttons(
+                form_root_selector=d.get("form_root_selector"),
+                filled_names=_filled_name_hints(d),
+            )
             if buttons:
+                ranked = _phase_filter_submit_candidates(
+                    buttons,
+                    phase="first" if flow == "confirm" else "final",
+                )
+                first_noise_only = len(ranked) == 0
                 click_res = _llm_click_submit_candidate(
                     buttons,
                     config or {},
                     form_root_selector=d.get("form_root_selector"),
-                    phase="first",
+                    phase="first" if flow == "confirm" else "final",
                 )
                 pick = (click_res or {}).get("picked") or {}
                 if click_res and click_res.get("clicked"):
@@ -4099,10 +4323,20 @@ def stage_send(
                         },
                         trace_dir=trace,
                     )
+            if not click_res or not click_res.get("clicked"):
+                first_native = _submit_native(d, form_root_selector=d.get("form_root_selector"))
+                if first_native.get("clicked"):
+                    click_res = {
+                        "clicked": True,
+                        "text": f"[native:{first_native.get('method')}]",
+                        "native_submit_method": first_native.get("method"),
+                    }
         if not click_res or not click_res.get("clicked"):
             print(f"  [send] ⚠ first submit button not found (patterns={patterns})")
             if click_res and click_res.get("found_but_disabled"):
                 print(f"  [send]    ↳ matched but disabled: {(click_res.get('disabled_candidates') or [])[:3]}")
+            if first_native:
+                print(f"  [send]    ↳ {_native_submit_diag(first_native)}")
             filled_only.append(d)
             _emit_event(
                 "send.first_button_missing",
@@ -4112,6 +4346,9 @@ def stage_send(
                     "patterns": patterns,
                     "flow": flow,
                     "found_but_disabled": bool(click_res and click_res.get("found_but_disabled")),
+                    "native_submit_method": (first_native or {}).get("method"),
+                    "native_submit_reason": (first_native or {}).get("reason"),
+                    "noise_only_candidates": first_noise_only,
                 },
                 trace_dir=trace,
             )
@@ -4120,7 +4357,10 @@ def stage_send(
                 resolver_tab_ids.add(cur_tab_id)
             _queue_for_resolver(
                 d, "first_submit_not_found",
-                f"first submit button not found (flow={flow})",
+                (
+                    f"first submit button not found (flow={flow}); "
+                    f"noise_only_candidates={first_noise_only}; {_native_submit_diag(first_native)}"
+                ),
                 trace=trace, autonomous=autonomous, tab_id=cur_tab_id,
             )
             continue
@@ -4138,6 +4378,7 @@ def stage_send(
                 "text": (click_res.get("text") or "")[:80],
                 "radio_auto_selected": int(click_res.get("radio_auto_selected") or 0),
                 "select_auto_selected": int(click_res.get("select_auto_selected") or 0),
+                "native_submit_method": click_res.get("native_submit_method"),
             },
             trace_dir=trace,
         )
@@ -4159,10 +4400,17 @@ def stage_send(
                 r"内容で.*送信", r"^以上の内容", r"内容を以上で",
                 r"上記内容を送信", r"問い合わせを送信", r"お問い合わせを送信",
             ])
+            final_native: dict[str, Any] | None = None
+            final_noise_only = False
             if not click2 or not click2.get("clicked"):
                 print(f"  [send] ⚠ final submit not matched by patterns — falling back to LLM picker")
-                buttons = _enumerate_buttons(form_root_selector=d.get("form_root_selector"))
+                buttons = _enumerate_buttons(
+                    form_root_selector=d.get("form_root_selector"),
+                    filled_names=_filled_name_hints(d),
+                )
                 if buttons:
+                    ranked = _phase_filter_submit_candidates(buttons, phase="final")
+                    final_noise_only = len(ranked) == 0
                     click2 = _llm_click_submit_candidate(
                         buttons,
                         config or {},
@@ -4184,9 +4432,19 @@ def stage_send(
                             trace_dir=trace,
                         )
                 if not click2 or not click2.get("clicked"):
+                    final_native = _submit_native(d, form_root_selector=d.get("form_root_selector"))
+                    if final_native.get("clicked"):
+                        click2 = {
+                            "clicked": True,
+                            "text": f"[native:{final_native.get('method')}]",
+                            "native_submit_method": final_native.get("method"),
+                        }
+                if not click2 or not click2.get("clicked"):
                     print(f"  [send] ⚠ final submit still not clickable after LLM fallback — awaiting proceed")
                     if click2 and click2.get("found_but_disabled"):
                         print(f"  [send]    ↳ matched but disabled: {(click2.get('disabled_candidates') or [])[:3]}")
+                    if final_native:
+                        print(f"  [send]    ↳ {_native_submit_diag(final_native)}")
                     if trace:
                         ev.dump_trace(
                             trace, "form_snapshot_confirm.txt",
@@ -4198,7 +4456,10 @@ def stage_send(
                         resolver_tab_ids.add(cur_tab_id)
                     _queue_for_resolver(
                         d, "confirm_submit_not_found",
-                        "confirm-page final submit not found",
+                        (
+                            "confirm-page final submit not found; "
+                            f"noise_only_candidates={final_noise_only}; {_native_submit_diag(final_native)}"
+                        ),
                         trace=trace, autonomous=autonomous, tab_id=cur_tab_id,
                     )
                     continue
@@ -4215,6 +4476,7 @@ def stage_send(
                     "text": (click2.get("text") or "")[:80],
                     "radio_auto_selected": int(click2.get("radio_auto_selected") or 0),
                     "select_auto_selected": int(click2.get("select_auto_selected") or 0),
+                    "native_submit_method": click2.get("native_submit_method"),
                 },
                 trace_dir=trace,
             )

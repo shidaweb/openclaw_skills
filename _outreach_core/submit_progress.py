@@ -45,6 +45,12 @@ _PLACEHOLDER_RE = re.compile(
     r"^(?:[-ー−‐~\s]*)?(?:以下から選択|選択してください|選択して下さい|please select|select|お選びください|指定なし).*$",
     re.I,
 )
+_NOISE_SUBMIT_TEXT_RE = re.compile(
+    r"^(こちら|詳細|戻る|一覧|トップ|個人情報の取扱い|プライバシー|privacy|policy)$",
+    re.I,
+)
+_FIRST_STEP_TEXT_RE = re.compile(r"(入力内容を確認|内容(を|の)?確認|確認画面|同意して次へ|^次へ$)", re.I)
+_FINAL_STEP_TEXT_RE = re.compile(r"(送信|submit|完了|確定|問い合わせを送信|お問い合わせを送信)", re.I)
 
 
 def is_agreement_label(label: str | None) -> bool:
@@ -297,3 +303,76 @@ def _normalize_options(options: list[Any]) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+def is_noise_submit_text(text: str | None) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _NOISE_SUBMIT_TEXT_RE.search(t):
+        return True
+    if t == "こちら":
+        return True
+    return False
+
+
+def rank_submit_candidates(
+    candidates: list[dict[str, Any]] | None,
+    *,
+    phase: str = "final",
+) -> list[dict[str, Any]]:
+    """Rank submit candidates by structure-first heuristics.
+
+    Priority:
+      1) is_submit_type && in_form
+      2) text hints matching phase
+      3) non-noise text links/buttons
+    If every candidate is noise (and non-submit), return [].
+    """
+    if not isinstance(candidates, list):
+        return []
+    phase_val = (phase or "final").strip().lower()
+
+    def _score(c: dict[str, Any]) -> int:
+        txt = str(c.get("text") or "").strip()
+        tag = str(c.get("tag") or "").lower()
+        href = str(c.get("href") or "").strip()
+        in_form = bool(c.get("in_form"))
+        is_submit_type = bool(c.get("is_submit_type"))
+        s = 0
+        if is_submit_type and in_form:
+            s += 12
+        elif is_submit_type:
+            s += 7
+        elif in_form:
+            s += 3
+        if phase_val == "final":
+            if _FINAL_STEP_TEXT_RE.search(txt):
+                s += 5
+            if _FIRST_STEP_TEXT_RE.search(txt) and not _FINAL_STEP_TEXT_RE.search(txt):
+                s -= 4
+        else:
+            if _FIRST_STEP_TEXT_RE.search(txt):
+                s += 5
+            if _FINAL_STEP_TEXT_RE.search(txt) and not _FIRST_STEP_TEXT_RE.search(txt):
+                s -= 3
+        if is_noise_submit_text(txt):
+            s -= 6
+        if tag == "a" and href and href != "#" and not href.lower().startswith("javascript:"):
+            s -= 2
+        if not txt and not is_submit_type:
+            s -= 2
+        return s
+
+    norm: list[dict[str, Any]] = [c for c in candidates if isinstance(c, dict)]
+    if not norm:
+        return []
+    ranked = sorted(norm, key=_score, reverse=True)
+    # if everything looks like noisy non-submit links, force native fallback.
+    if all(
+        (not bool(c.get("is_submit_type"))) and is_noise_submit_text(str(c.get("text") or ""))
+        for c in ranked
+    ):
+        return []
+    filtered = [c for c in ranked if _score(c) >= 0]
+    return (filtered or ranked)[:30]
