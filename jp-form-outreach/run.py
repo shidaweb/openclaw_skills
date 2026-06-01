@@ -32,6 +32,7 @@ from _outreach_core import avoidance as core_avoidance
 from _outreach_core import captcha as core_captcha
 from _outreach_core import content_guard as core_content_guard
 from _outreach_core import resolve_queue as core_resolve_queue
+from _outreach_core import submit_progress as core_submit_progress
 from _outreach_core import tab_utils as core_tab_utils
 from _outreach_core import infer as core_infer
 from _outreach_core import preview as core_preview
@@ -1345,29 +1346,46 @@ _FILL_TEXTAREA_JS = r"""
 """
 
 
-_CHECK_AGREEMENT_JS = r"""
+_LIST_CHECKBOX_GATES_JS = r"""
 () => {
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
   const labelFor = (el) => {
+    let txt = '';
     if (el.id) {
       const l = document.querySelector(`label[for="${el.id}"]`);
-      if (l) return (l.textContent || '').trim();
+      if (l) txt = norm(l.textContent || '');
     }
-    const wrap = el.closest('label');
-    if (wrap) return (wrap.textContent || '').trim();
-    return '';
+    if (!txt) {
+      const wrap = el.closest('label');
+      if (wrap) txt = norm(wrap.textContent || '');
+    }
+    if (!txt && el.getAttribute('aria-label')) {
+      txt = norm(el.getAttribute('aria-label') || '');
+    }
+    if (!txt && el.parentElement) {
+      txt = norm(el.parentElement.textContent || '');
+    }
+    if (!txt && el.closest('div,li,p,td,th,fieldset')) {
+      txt = norm((el.closest('div,li,p,td,th,fieldset').textContent || '').slice(0, 120));
+    }
+    return txt;
   };
+  const out = [];
   for (const cb of document.querySelectorAll('input[type="checkbox"]')) {
-    const lbl = labelFor(cb);
-    if (/同意|プライバシー|利用規約|個人情報|送信する$/i.test(lbl)) {
-      if (!cb.checked) {
-        cb.checked = true;
-        cb.dispatchEvent(new Event('change', { bubbles: true }));
-        cb.dispatchEvent(new Event('click', { bubbles: true }));
-      }
-      return { checked: true, label: lbl };
-    }
+    const required = Boolean(
+      cb.required ||
+      cb.getAttribute('aria-required') === 'true' ||
+      cb.getAttribute('data-required') === 'true'
+    );
+    out.push({
+      name: cb.name || '',
+      id: cb.id || '',
+      label: labelFor(cb),
+      checked: Boolean(cb.checked),
+      required: required,
+    });
   }
-  return { checked: false };
+  return out;
 }
 """
 
@@ -1384,6 +1402,8 @@ _CLICK_BUTTON_BY_TEXT_JS = r"""
     } catch (e) {}
   }
   scopes.push(document);
+  let foundButDisabled = false;
+  const disabledCandidates = [];
   for (const scope of scopes) {
     const buttons = Array.from(scope.querySelectorAll(selector));
     for (const pat of patterns) {
@@ -1393,14 +1413,34 @@ _CLICK_BUTTON_BY_TEXT_JS = r"""
         const txt = rawTxt.replace(/\s+/g, ' ');
         // Skip elements with too much text (likely a wrapper, not a button)
         if (txt.length > 80) continue;
-        if (re.test(txt) && !b.disabled && b.offsetParent !== null) {
+        if (!re.test(txt)) continue;
+        const style = window.getComputedStyle(b);
+        const blocked = Boolean(
+          b.disabled ||
+          b.getAttribute('aria-disabled') === 'true' ||
+          style.pointerEvents === 'none' ||
+          style.visibility === 'hidden' ||
+          style.display === 'none'
+        );
+        if (!blocked && b.offsetParent !== null) {
           b.click();
-          return { clicked: true, text: txt.slice(0, 50), scope: scope === document ? 'document' : 'form' };
+          return {
+            clicked: true,
+            found_but_disabled: foundButDisabled,
+            text: txt.slice(0, 50),
+            scope: scope === document ? 'document' : 'form'
+          };
         }
+        foundButDisabled = true;
+        disabledCandidates.push(txt.slice(0, 80));
       }
     }
   }
-  return { clicked: false };
+  return {
+    clicked: false,
+    found_but_disabled: foundButDisabled,
+    disabled_candidates: disabledCandidates.slice(0, 8),
+  };
 }
 """
 
@@ -1453,9 +1493,28 @@ def _fill_textarea(value: str) -> dict[str, Any] | None:
     return res if isinstance(res, dict) else None
 
 
-def _check_agreement() -> dict[str, Any] | None:
-    res = _evaluate(_CHECK_AGREEMENT_JS)
-    return res if isinstance(res, dict) else None
+def _auto_check_submit_gates() -> dict[str, Any]:
+    """Check required/agreement checkboxes that often block submit progression."""
+    res = _evaluate(_LIST_CHECKBOX_GATES_JS)
+    checkboxes = res if isinstance(res, list) else []
+    to_check = core_submit_progress.pick_checkboxes_to_check(checkboxes)
+    checked_labels: list[str] = []
+    checked_count = 0
+    for cb in to_check:
+        name = (cb.get("name") or cb.get("id") or "").strip()
+        out = _check_by_name(name) if name else None
+        if not (out and out.get("ok")):
+            label = (cb.get("label") or "").strip()
+            out = _check_by_label(label) if label else None
+        if out and out.get("ok"):
+            checked_count += 1
+            checked_labels.append((cb.get("label") or name or "?")[:80])
+    return {
+        "checked_count": checked_count,
+        "checked_labels": checked_labels,
+        "candidates": len(to_check),
+        "total_checkboxes": len(checkboxes),
+    }
 
 
 def _click_button(patterns: list[str],
@@ -1469,6 +1528,29 @@ def _click_button(patterns: list[str],
     """
     res = _evaluate(js)
     return res if isinstance(res, dict) else None
+
+
+def _click_button_with_gate_retry(
+    patterns: list[str],
+    *,
+    form_root_selector: str | None = None,
+    retries: int = 2,
+) -> dict[str, Any] | None:
+    """Try clicking submit; if blocked by gate checkboxes, auto-check then retry."""
+    last = _click_button(patterns, form_root_selector=form_root_selector)
+    if last and last.get("clicked"):
+        return last
+    for _ in range(max(1, retries)):
+        gate = _auto_check_submit_gates()
+        if gate.get("checked_count", 0) <= 0:
+            break
+        time.sleep(0.4)
+        last = _click_button(patterns, form_root_selector=form_root_selector)
+        if last and last.get("clicked"):
+            last["gate_auto_checked"] = gate.get("checked_count", 0)
+            last["gate_labels"] = gate.get("checked_labels") or []
+            return last
+    return last
 
 
 _ENUMERATE_BUTTONS_JS = r"""
@@ -2215,10 +2297,12 @@ def _heuristic_fill_fallback(target: dict[str, Any], config: dict[str, Any],
     else:
         diagnostics["errors"].append("body textarea fill failed")
 
-    # Agreement checkbox
-    cres = _check_agreement()
-    if cres and cres.get("checked"):
-        diagnostics["filled"].append(f"agreement_checkbox ({cres.get('label')[:30]})")
+    # Submit-gate checkboxes (required / privacy agreement)
+    gate = _auto_check_submit_gates()
+    if gate.get("checked_count", 0) > 0:
+        diagnostics["filled"].append(
+            f"gate_checkboxes={gate.get('checked_count')} ({', '.join((gate.get('checked_labels') or [])[:2])})"
+        )
 
     return diagnostics
 
@@ -2588,7 +2672,7 @@ def _resolve_in_open_tab(
         r"問い合わせを送信", r"お問い合わせを送信", r"上記の内容で送信", r"submit", r"完了", r"確定",
         r"入力内容を確認", r"内容(を|の)?確認", r"確認する",
     ]
-    cr = _click_button(patterns, form_root_selector=d.get("form_root_selector"))
+    cr = _click_button_with_gate_retry(patterns, form_root_selector=d.get("form_root_selector"))
     if not cr or not cr.get("clicked"):
         buttons = _enumerate_buttons()
         if buttons:
@@ -2600,7 +2684,7 @@ def _resolve_in_open_tab(
     time.sleep(3)
     # If this was an input page (confirm flow), a confirm page may now appear.
     if flow == "confirm":
-        c2 = _click_button([
+        c2 = _click_button_with_gate_retry([
             r"^送信する$", r"^送信$", r"この内容で送信", r"内容を送信する",
             r"submit", r"完了", r"確定", r"問い合わせを送信",
         ])
@@ -2667,7 +2751,7 @@ def _deep_submit(
         patterns = [r"送信する", r"^送信$", r"submit", r"内容を送信"]
     if plan.get("first_button_pattern"):
         patterns = patterns + [plan["first_button_pattern"]]
-    cr = _click_button(patterns, form_root_selector=d.get("form_root_selector"))
+    cr = _click_button_with_gate_retry(patterns, form_root_selector=d.get("form_root_selector"))
     if not cr or not cr.get("clicked"):
         buttons = _enumerate_buttons(form_root_selector=d.get("form_root_selector"))
         if buttons:
@@ -2679,7 +2763,7 @@ def _deep_submit(
     time.sleep(3)
 
     if flow == "confirm":
-        c2 = _click_button([
+        c2 = _click_button_with_gate_retry([
             r"^送信する$", r"^送信$", r"この内容で送信", r"内容を送信する",
             r"上記の内容で送信", r"submit", r"完了", r"確定", r"問い合わせを送信",
         ])
@@ -2989,7 +3073,10 @@ def stage_send(
         if plan_first and plan_first not in patterns:
             patterns = patterns + [plan_first]
 
-        click_res = _click_button(patterns, form_root_selector=d.get("form_root_selector"))
+        click_res = _click_button_with_gate_retry(
+            patterns,
+            form_root_selector=d.get("form_root_selector"),
+        )
         if not click_res or not click_res.get("clicked"):
             # Strengthened detection (§3.5): before declaring failure, enumerate
             # the form's buttons and let the LLM pick the most likely confirm/submit
@@ -3014,12 +3101,18 @@ def stage_send(
                     )
         if not click_res or not click_res.get("clicked"):
             print(f"  [send] ⚠ first submit button not found (patterns={patterns})")
+            if click_res and click_res.get("found_but_disabled"):
+                print(f"  [send]    ↳ matched but disabled: {(click_res.get('disabled_candidates') or [])[:3]}")
             filled_only.append(d)
             _emit_event(
                 "send.first_button_missing",
                 stage="send",
                 target_id=tid,
-                payload={"patterns": patterns, "flow": flow},
+                payload={
+                    "patterns": patterns,
+                    "flow": flow,
+                    "found_but_disabled": bool(click_res and click_res.get("found_but_disabled")),
+                },
                 trace_dir=trace,
             )
             core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SUBMIT_NOT_FOUND)
@@ -3053,7 +3146,7 @@ def stage_send(
                 payload={"wait_user_ms": 0},
                 trace_dir=trace,
             )
-            click2 = _click_button([
+            click2 = _click_button_with_gate_retry([
                 r"^送信する$", r"^送信$", r"この内容で送信",
                 r"内容を送信する", r"上記の内容で送信", r"^回答送信$",
                 r"^送る$", r"submit", r"完了", r"確定",
@@ -3079,6 +3172,8 @@ def stage_send(
                         )
                 if not click2 or not click2.get("clicked"):
                     print(f"  [send] ⚠ final submit still not clickable after LLM fallback — awaiting proceed")
+                    if click2 and click2.get("found_but_disabled"):
+                        print(f"  [send]    ↳ matched but disabled: {(click2.get('disabled_candidates') or [])[:3]}")
                     if trace:
                         ev.dump_trace(
                             trace, "form_snapshot_confirm.txt",
@@ -3385,7 +3480,7 @@ def stage_resolve_proceed(
     print(f"[resolve] proceed → {name} (flow={flow})")
 
     patterns = [r"^送信する$", r"^送信$", r"この内容で送信", r"内容を送信する", r"submit"]
-    click_res = _click_button(patterns)
+    click_res = _click_button_with_gate_retry(patterns)
     if not click_res or not click_res.get("clicked"):
         print("[resolve] ⚠ submit button not found on current page", file=sys.stderr)
         _escalate_await_proceed(d, "awaiting_user_proceed: submit button not found on resume")
