@@ -325,6 +325,7 @@ Do NOT use for:
 | **"全部止めて"** | `pkill -f "run.py send"` |
 | **「品質ポイント教えて」/「draft 品質どう？」** | `python3 -m _outreach_core.helpers.report draft-quality --since 7d` |
 | **「送信ファネル見せて」** | `python3 -m _outreach_core.helpers.report send-funnel --since 7d` |
+| **「今月は何件送りましたか？」/「今週・先月・累計の送信サマリ」** | `python3 -m _outreach_core.helpers.report send-summary --period this_month`（必要に応じて `--period this_week/last_month/all` or `--all-periods`）。会社/内容・試行/成功/失敗・失敗理由を要約返信 |
 | **「needs_attention まとめて」** | `python3 -m _outreach_core.helpers.report needs-attention` |
 | **「<会社>のトレース見たい」** | `python3 -m _outreach_core.helpers.report inspect --target-id <id>` |
 | **「verify 緩め」** | `run.py send --ids N --verify-strict false` |

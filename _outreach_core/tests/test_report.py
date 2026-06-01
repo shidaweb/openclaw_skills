@@ -1,8 +1,14 @@
-"""Tests for the autonomous-mode report summary (v5 §12 observability)."""
+"""Tests for report summaries (autonomy + period send summary)."""
 
+from datetime import datetime, timezone
 import unittest
 
-from _outreach_core.helpers.report import _skip_reason_bucket, autonomous_summary
+from _outreach_core.helpers.report import (
+    _skip_reason_bucket,
+    autonomous_summary,
+    period_bounds,
+    send_period_summary,
+)
 
 
 def _scored(score, send, errored=False):
@@ -77,6 +83,65 @@ class TestAutonomousSummary(unittest.TestCase):
     def test_bucket_helper_fallback(self):
         self.assertEqual(_skip_reason_bucket("totally novel reason: details"), "totally novel reason")
         self.assertEqual(_skip_reason_bucket(""), "other")
+
+
+class TestSendPeriodSummary(unittest.TestCase):
+    def test_period_bounds_this_month_and_last_month(self):
+        now = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+        this_start, this_end = period_bounds("this_month", now=now)
+        last_start, last_end = period_bounds("last_month", now=now)
+        self.assertEqual(this_start.isoformat(), "2026-06-01T00:00:00+00:00")
+        self.assertEqual(this_end.isoformat(), now.isoformat())
+        self.assertEqual(last_start.isoformat(), "2026-05-01T00:00:00+00:00")
+        self.assertEqual(last_end.isoformat(), "2026-06-01T00:00:00+00:00")
+
+    def test_send_summary_counts_companies_and_failure_reasons(self):
+        sent_rows = [
+            {
+                "id": "a1",
+                "name": "株式会社A",
+                "subject": "ご提案A",
+                "sent_at": "2026-06-10T01:02:03Z",
+            }
+        ]
+        skip_rows = [
+            {
+                "id": "b1",
+                "name": "株式会社B",
+                "reason": "first submit button not found",
+                "skipped_at": "2026-06-10T02:00:00Z",
+            }
+        ]
+        events = [
+            {
+                "kind": "send.verify.completed",
+                "ts": "2026-06-10T01:02:05Z",
+                "target_id": "a1",
+                "payload": {"status": "ok", "reason": "sent"},
+            },
+            {
+                "kind": "send.first_button_missing",
+                "ts": "2026-06-10T02:00:01Z",
+                "target_id": "b1",
+                "payload": {"patterns": ["送信"]},
+            },
+        ]
+        now = datetime(2026, 6, 15, 0, 0, tzinfo=timezone.utc)
+        summary = send_period_summary(sent_rows, skip_rows, events, period="this_month", now=now)
+        self.assertEqual(summary["successes"], 1)
+        self.assertEqual(summary["attempts"], 2)
+        self.assertEqual(summary["failures"], 1)
+        self.assertEqual(summary["sent_companies"][0]["company"], "株式会社A")
+        self.assertEqual(summary["sent_companies"][0]["content"], "ご提案A")
+        self.assertIn("first submit button not found", summary["failure_reasons"])
+
+    def test_send_summary_all_period_includes_old_rows(self):
+        sent_rows = [
+            {"id": "x1", "name": "古い会社", "subject": "旧提案", "sent_at": "2025-01-01T00:00:00Z"},
+        ]
+        summary = send_period_summary(sent_rows, [], [], period="all")
+        self.assertEqual(summary["successes"], 1)
+        self.assertEqual(summary["sent_companies"][0]["company"], "古い会社")
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ import argparse
 import json
 import sys
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,175 @@ def _skill_data_dir(skill: str, brief_id: str | None = None) -> Path:
 
 def _needs_path(skill: str, brief_id: str | None = None) -> Path:
     return _skill_data_dir(skill, brief_id) / "needs_attention.jsonl"
+
+
+def _history_paths(skill: str, brief_id: str | None = None) -> tuple[Path, Path]:
+    data = _skill_data_dir(skill, brief_id)
+    return data / "sent_history.jsonl", data / "skip_history.jsonl"
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
+def _parse_ts(raw: Any) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def period_bounds(period: str, *, now: datetime | None = None) -> tuple[datetime | None, datetime | None]:
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    if period == "all":
+        return None, None
+    if period == "this_week":
+        # Monday 00:00 UTC
+        start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) - timedelta(days=now.weekday())
+        return start, now
+    if period == "this_month":
+        start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+        return start, now
+    if period == "last_month":
+        this_month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+        last_month_end = this_month_start
+        last_day_prev = this_month_start - timedelta(days=1)
+        last_month_start = datetime(last_day_prev.year, last_day_prev.month, 1, tzinfo=timezone.utc)
+        return last_month_start, last_month_end
+    raise ValueError(f"unknown period: {period}")
+
+
+def _in_period(ts: datetime | None, start: datetime | None, end: datetime | None) -> bool:
+    if ts is None:
+        return False
+    if start is not None and ts < start:
+        return False
+    if end is not None and ts >= end:
+        return False
+    return True
+
+
+def _failure_reason_from_event(ev: dict[str, Any]) -> str:
+    kind = str(ev.get("kind") or "")
+    payload = ev.get("payload") or {}
+    if kind == "send.verify.completed":
+        status = str(payload.get("status") or "")
+        if status == "ok":
+            return ""
+        return str(payload.get("reason") or status or "verify_not_ok")
+    if kind == "send.first_button_missing":
+        return "first submit button not found"
+    if kind == "send.auto_skipped":
+        return str(payload.get("reason") or "auto_skipped")
+    if kind == "send.queued_for_resolver":
+        return str(payload.get("reason_class") or "queued_for_resolver")
+    return kind
+
+
+def send_period_summary(
+    sent_rows: list[dict[str, Any]],
+    skip_rows: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    *,
+    period: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Aggregate period send stats for Slack-readable business summaries."""
+    start, end = period_bounds(period, now=now)
+
+    sent_in = [r for r in sent_rows if _in_period(_parse_ts(r.get("sent_at")), start, end)]
+    skip_in = [r for r in skip_rows if _in_period(_parse_ts(r.get("skipped_at")), start, end)]
+
+    attempt_kinds = {"send.verify.completed", "send.first_button_missing", "send.auto_skipped", "send.queued_for_resolver"}
+    attempt_events = []
+    for e in events:
+        ts = _parse_ts(e.get("ts"))
+        if not _in_period(ts, start, end):
+            continue
+        if str(e.get("kind") or "") in attempt_kinds:
+            attempt_events.append(e)
+
+    success_by_id = {str(r.get("id")): r for r in sent_in if r.get("id") is not None}
+    # map id -> best-known company display name
+    name_by_id: dict[str, str] = {}
+    for r in sent_in + skip_in:
+        rid = r.get("id")
+        if rid is None:
+            continue
+        nm = str(r.get("name") or r.get("company") or "").strip()
+        if nm:
+            name_by_id[str(rid)] = nm
+
+    failure_reasons: Counter[str] = Counter()
+    failed_companies: list[dict[str, Any]] = []
+    attempt_ids = {str(e.get("target_id") or "") for e in attempt_events if e.get("target_id") is not None}
+    for e in attempt_events:
+        reason = _failure_reason_from_event(e).strip()
+        if not reason:
+            continue
+        tid = str(e.get("target_id") or "")
+        company = name_by_id.get(tid) or tid or "unknown"
+        failure_reasons[reason[:120]] += 1
+        failed_companies.append({"id": tid, "company": company, "reason": reason[:160]})
+
+    # Include skip_history reasons too (for failures that never reached verify event).
+    for r in skip_in:
+        rid = str(r.get("id") or "")
+        if rid and rid in attempt_ids:
+            continue
+        reason = str(r.get("reason") or "").strip()
+        if not reason:
+            continue
+        failure_reasons[reason[:120]] += 1
+        failed_companies.append(
+            {
+                "id": str(r.get("id") or ""),
+                "company": str(r.get("name") or r.get("company") or r.get("id") or "unknown"),
+                "reason": reason[:160],
+            }
+        )
+
+    sent_companies = []
+    for r in sent_in:
+        sent_companies.append(
+            {
+                "id": str(r.get("id") or ""),
+                "company": str(r.get("name") or r.get("company") or r.get("id") or "unknown"),
+                "content": str(r.get("subject") or ""),
+                "sent_at": str(r.get("sent_at") or ""),
+            }
+        )
+
+    attempts = len(attempt_events) + sum(1 for r in skip_in if str(r.get("id") or "") not in attempt_ids)
+    successes = len(sent_in)
+    failures = max(0, attempts - successes)
+
+    return {
+        "period": period,
+        "attempts": attempts,
+        "successes": successes,
+        "failures": failures,
+        "sent_companies": sent_companies[:100],
+        "failed_companies": failed_companies[:100],
+        "failure_reasons": dict(failure_reasons.most_common(20)),
+    }
 
 
 def cmd_draft_quality(args: argparse.Namespace) -> int:
@@ -202,6 +371,80 @@ def cmd_send_funnel(args: argparse.Namespace) -> int:
     return 0
 
 
+def _write_send_summary_snapshot(data_dir: Path, payload: dict[str, Any]) -> None:
+    path = data_dir / "send_summary_latest.json"
+    try:
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _render_send_summary(summary: dict[str, Any], *, skill: str, brief: str | None) -> str:
+    lines = [
+        f"# Send Summary — {summary['period']}",
+        "",
+        f"skill: {skill}",
+        f"brief: {brief or '(active)'}",
+        "",
+        "## counts",
+        f"- attempts: {summary['attempts']}",
+        f"- successes: {summary['successes']}",
+        f"- failures: {summary['failures']}",
+        "",
+    ]
+    lines.append("## successes (company / content)")
+    if summary["sent_companies"]:
+        for r in summary["sent_companies"][:20]:
+            lines.append(f"- {r['company']} / {r['content']}")
+    else:
+        lines.append("_No successful sends in period._")
+    lines.append("")
+
+    lines.append("## failure reasons")
+    if summary["failure_reasons"]:
+        for reason, n in summary["failure_reasons"].items():
+            lines.append(f"- {reason}: {n}")
+    else:
+        lines.append("_No failure reasons in period._")
+    lines.append("")
+
+    lines.append("## failures (company / reason)")
+    if summary["failed_companies"]:
+        for r in summary["failed_companies"][:20]:
+            lines.append(f"- {r['company']} / {r['reason']}")
+    else:
+        lines.append("_No failures in period._")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def cmd_send_summary(args: argparse.Namespace) -> int:
+    data_dir = _skill_data_dir(args.skill, getattr(args, "brief", None))
+    brief = getattr(args, "brief", None)
+    sent_path, skip_path = _history_paths(args.skill, brief)
+    sent_rows = _read_jsonl(sent_path)
+    skip_rows = _read_jsonl(skip_path)
+    events = load_events(data_dir, since=None, skill=args.skill)
+
+    periods = ["this_week", "this_month", "last_month", "all"] if args.all_periods else [args.period]
+    out_payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "skill": args.skill,
+        "brief": resolve_brief_id(brief),
+        "periods": {},
+    }
+    blocks: list[str] = []
+    for p in periods:
+        summary = send_period_summary(sent_rows, skip_rows, events, period=p)
+        out_payload["periods"][p] = summary
+        blocks.append(_render_send_summary(summary, skill=args.skill, brief=brief))
+    print("\n\n".join(blocks))
+    _write_send_summary_snapshot(data_dir, out_payload)
+    if args.json:
+        print(json.dumps(out_payload, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_needs_attention(args: argparse.Namespace) -> int:
     path = _needs_path(args.skill, getattr(args, "brief", None))
     if not path.is_file():
@@ -315,6 +558,20 @@ def main() -> None:
     p.add_argument("--since", default="7d")
     p.add_argument("--skill", default="jp-form-outreach")
 
+    p = sub.add_parser(
+        "send-summary",
+        help="Period summary: attempts/success/failure + company/content + failure reasons",
+    )
+    _add_brief_arg(p)
+    p.add_argument("--skill", default="jp-form-outreach")
+    p.add_argument(
+        "--period",
+        choices=["this_week", "this_month", "last_month", "all"],
+        default="this_month",
+    )
+    p.add_argument("--all-periods", action="store_true")
+    p.add_argument("--json", action="store_true")
+
     p = sub.add_parser("needs-attention")
     _add_brief_arg(p)
     p.add_argument("--skill", default="jp-form-outreach")
@@ -341,6 +598,8 @@ def main() -> None:
         sys.exit(cmd_draft_quality(args))
     if args.cmd == "send-funnel":
         sys.exit(cmd_send_funnel(args))
+    if args.cmd == "send-summary":
+        sys.exit(cmd_send_summary(args))
     if args.cmd == "needs-attention":
         sys.exit(cmd_needs_attention(args))
     if args.cmd == "inspect":
