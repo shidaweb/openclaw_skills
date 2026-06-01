@@ -94,7 +94,7 @@ class TestSubmitProgress(unittest.TestCase):
         actions = sp.pick_select_gate_actions(groups)
         self.assertEqual(actions, [{"name": "contact_category", "value": "業務用食材、備品、消耗品のご提案について"}])
 
-    def test_pick_select_gate_actions_uses_other_when_only_safe_choice(self) -> None:
+    def test_pick_select_gate_actions_returns_none_when_no_b2b_option(self) -> None:
         groups = [
             {
                 "name": "contact_category",
@@ -109,7 +109,7 @@ class TestSubmitProgress(unittest.TestCase):
             }
         ]
         actions = sp.pick_select_gate_actions(groups)
-        self.assertEqual(actions, [{"name": "contact_category", "value": "その他のお問い合わせ"}])
+        self.assertEqual(actions, [])
 
     def test_pick_select_gate_actions_skips_selected_group(self) -> None:
         groups = [
@@ -124,6 +124,32 @@ class TestSubmitProgress(unittest.TestCase):
             }
         ]
         self.assertEqual(sp.pick_select_gate_actions(groups), [])
+
+    def test_validate_choice_rejects_placeholder_and_missing(self) -> None:
+        options = [
+            {"label": "ー以下から選択してくださいー", "value": "", "selected": True, "disabled": False},
+            {"label": "法人のお問い合わせ", "value": "corp", "selected": False, "disabled": False},
+        ]
+        self.assertTrue(sp.validate_choice(options, "法人のお問い合わせ"))
+        self.assertFalse(sp.validate_choice(options, "ー以下から選択してくださいー"))
+        self.assertFalse(sp.validate_choice(options, "存在しない選択肢"))
+
+    def test_is_inquiry_type_field_by_name_or_label(self) -> None:
+        self.assertTrue(sp.is_inquiry_type_field({"name": "contact_subject", "label": "項目"}))
+        self.assertTrue(sp.is_inquiry_type_field({"name": "foo", "label": "お問い合わせ区分"}))
+        self.assertFalse(sp.is_inquiry_type_field({"name": "email", "label": "メールアドレス"}))
+
+    def test_choose_b2b_option_confidence_and_placeholder_exclusion(self) -> None:
+        options = [
+            {"label": "選択してください", "value": "", "selected": True, "disabled": False},
+            {"label": "個人のお客様", "value": "personal", "selected": False, "disabled": False},
+            {"label": "採用に関するお問い合わせ", "value": "recruit", "selected": False, "disabled": False},
+            {"label": "お取引・ご提案", "value": "biz", "selected": False, "disabled": False},
+        ]
+        picked = sp.choose_b2b_option(options)
+        self.assertIsNotNone(picked)
+        self.assertEqual(picked["value"], "お取引・ご提案")
+        self.assertIn(picked["confidence"], ("high", "low"))
 
 
 if __name__ == "__main__":

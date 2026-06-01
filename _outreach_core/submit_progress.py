@@ -13,6 +13,10 @@ _RADIO_GATE_GROUP_RE = re.compile(
     r"(お問い合わせ種別|問合せ種別|カテゴリ|区分|お問い合わせ内容|ご相談内容|個人|法人|種別)",
     re.I,
 )
+_INQUIRY_TYPE_RE = re.compile(
+    r"(お問い合わせ種別|問合せ種別|問い合わせ区分|カテゴリ|区分|件名|ご用件|種別|contact|subject)",
+    re.I,
+)
 _RADIO_OPTION_POSITIVE_RE = re.compile(
     r"(法人|企業|営業|商品提案|ご提案|協業|提携|取材|その他|biz|business)",
     re.I,
@@ -21,20 +25,24 @@ _RADIO_OPTION_NEGATIVE_RE = re.compile(
     r"(個人|採用|応募|ir|投資家|予約|サポート|修理|返品|faq|会員|ログイン)",
     re.I,
 )
-_SELECT_GATE_GROUP_RE = re.compile(
-    r"(お問い合わせ種別|問合せ種別|問い合わせ区分|カテゴリ|区分|件名|ご用件|種別|contact|subject)",
+_STRONG_PREFER_RE = re.compile(
+    r"(法人のお客様|企業・団体|企業|法人|お取引先|お取引|お仕事のご依頼|業務提携|協業|ビジネス|OEM|卸|代理店|業務用)",
     re.I,
 )
-_SELECT_OPTION_POSITIVE_RE = re.compile(
-    r"(法人|企業|業務用|提案|協業|提携|取引|営業|B2B|business|biz)",
+_WEAK_PREFER_RE = re.compile(
+    r"(提案|取引|提携|協業|営業|business|biz|法人|企業)",
     re.I,
 )
-_SELECT_OPTION_NEGATIVE_RE = re.compile(
-    r"(個人|採用|応募|ir|投資家|株主|店舗について|予約|サポート|修理|返品|faq|会員|ログイン|忘れ物|苦情)",
+_STRONG_AVOID_RE = re.compile(
+    r"(個人のお客様|商品・サービスについて|ご意見・ご感想|お客様相談|店舗について|採用|アルバイト|予約)",
     re.I,
 )
-_SELECT_OPTION_PLACEHOLDER_RE = re.compile(
-    r"^(?:[-ー−‐~\s]*)?(?:以下から選択|選択してください|please select|select|お選びください).*$",
+_WEAK_AVOID_RE = re.compile(
+    r"(個人|採用|応募|ir|投資家|株主|サポート|修理|返品|faq|会員|ログイン|忘れ物|苦情)",
+    re.I,
+)
+_PLACEHOLDER_RE = re.compile(
+    r"^(?:[-ー−‐~\s]*)?(?:以下から選択|選択してください|選択して下さい|please select|select|お選びください|指定なし).*$",
     re.I,
 )
 
@@ -101,33 +109,121 @@ def pick_radio_gate_actions(groups: list[dict[str, Any]] | None) -> list[dict[st
 
 
 def _pick_radio_option(options: list[dict[str, Any]]) -> str | None:
-    best: tuple[int, str] | None = None
-    for o in options:
-        if not isinstance(o, dict):
+    normalized: list[dict[str, Any]] = []
+    for option in options:
+        if not isinstance(option, dict):
             continue
-        if bool(o.get("checked")):
+        normalized.append(
+            {
+                "label": option.get("label"),
+                "value": option.get("value"),
+                "selected": bool(option.get("checked")),
+                "disabled": bool(option.get("disabled")),
+            }
+        )
+    picked = choose_b2b_option(normalized)
+    if not picked:
+        for opt in normalized:
+            if bool(opt.get("selected")) or bool(opt.get("disabled")):
+                continue
+            if _is_placeholder_option(opt):
+                continue
+            label = str(opt.get("label") or "")
+            value = str(opt.get("value") or "")
+            if "その他" in f"{label} {value}":
+                return label or value
+        return None
+    choice = str(picked.get("value") or "").strip()
+    if not choice:
+        return None
+    return choice
+
+
+def is_inquiry_type_field(field: dict[str, Any] | None) -> bool:
+    if not isinstance(field, dict):
+        return False
+    name = str(field.get("name") or field.get("id") or "")
+    label = str(field.get("label") or "")
+    blob = f"{name} {label}".strip()
+    if not blob:
+        return False
+    return bool(_INQUIRY_TYPE_RE.search(blob))
+
+
+def validate_choice(options: list[Any] | None, chosen: str | None) -> bool:
+    selected = (chosen or "").strip()
+    if not selected:
+        return False
+    candidates = _normalize_options(options or [])
+    for opt in candidates:
+        if bool(opt.get("disabled")):
             continue
-        label = str(o.get("label") or "")
-        value = str(o.get("value") or "")
+        label = str(opt.get("label") or "").strip()
+        value = str(opt.get("value") or "").strip()
+        if _is_placeholder_option(opt):
+            continue
+        if selected in {label, value}:
+            return True
+    return False
+
+
+def choose_b2b_option(options: list[Any] | None) -> dict[str, Any] | None:
+    candidates = _normalize_options(options or [])
+    scored: list[dict[str, Any]] = []
+    prefer_hits = 0
+    for opt in candidates:
+        if bool(opt.get("selected")) or bool(opt.get("disabled")):
+            continue
+        if _is_placeholder_option(opt):
+            continue
+        label = str(opt.get("label") or "").strip()
+        value = str(opt.get("value") or "").strip()
         text = f"{label} {value}".strip()
         if not text:
             continue
+        strong_prefer = bool(_STRONG_PREFER_RE.search(text))
+        weak_prefer = bool(_WEAK_PREFER_RE.search(text))
+        strong_avoid = bool(_STRONG_AVOID_RE.search(text))
+        weak_avoid = bool(_WEAK_AVOID_RE.search(text))
         score = 0
-        if _RADIO_OPTION_POSITIVE_RE.search(text):
-            score += 2
-        if _RADIO_OPTION_NEGATIVE_RE.search(text):
+        if strong_prefer:
+            score += 6
+        elif weak_prefer:
+            score += 3
+        if strong_avoid:
+            score -= 8
+        elif weak_avoid:
             score -= 4
-        # "その他" is often safe when no explicit business option exists.
         if "その他" in text:
             score += 1
-        if best is None or score > best[0]:
-            best = (score, label or value)
-    if not best:
+        if strong_prefer or weak_prefer:
+            prefer_hits += 1
+        scored.append(
+            {
+                "value": label or value,
+                "score": score,
+                "strong_prefer": strong_prefer,
+                "strong_avoid": strong_avoid,
+                "label": label,
+            }
+        )
+    if not scored or prefer_hits <= 0:
         return None
-    # avoid forcing clearly negative options
-    if best[0] < 0:
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    top = scored[0]
+    if top["score"] < 2:
         return None
-    return best[1]
+    second = scored[1] if len(scored) > 1 else None
+    confidence = "high"
+    if top["score"] < 5 or (second and (top["score"] - second["score"]) <= 1):
+        confidence = "low"
+    reason = f"score={top['score']}, prefer_hits={prefer_hits}"
+    return {
+        "value": top["value"],
+        "score": int(top["score"]),
+        "confidence": confidence,
+        "reason": reason,
+    }
 
 
 def pick_select_gate_actions(groups: list[dict[str, Any]] | None) -> list[dict[str, str]]:
@@ -145,9 +241,10 @@ def pick_select_gate_actions(groups: list[dict[str, Any]] | None) -> list[dict[s
             continue
         label = str(g.get("label") or "")
         required = bool(g.get("required"))
-        if not required and not _SELECT_GATE_GROUP_RE.search(label):
+        if not required and not _INQUIRY_TYPE_RE.search(label):
             continue
-        choice = _pick_select_option(g.get("options") or [])
+        picked = choose_b2b_option(g.get("options") or [])
+        choice = str((picked or {}).get("value") or "").strip()
         if not choice:
             continue
         actions.append({"name": name, "value": choice})
@@ -155,33 +252,48 @@ def pick_select_gate_actions(groups: list[dict[str, Any]] | None) -> list[dict[s
 
 
 def _pick_select_option(options: list[dict[str, Any]]) -> str | None:
-    best: tuple[int, str] | None = None
-    for o in options:
-        if not isinstance(o, dict):
-            continue
-        if bool(o.get("selected")):
-            continue
-        if bool(o.get("disabled")):
-            continue
-        label = str(o.get("label") or "")
-        value = str(o.get("value") or "")
-        text = (label or value).strip()
-        if not text:
-            continue
-        if _SELECT_OPTION_PLACEHOLDER_RE.match(text):
-            continue
-        score = 0
-        if _SELECT_OPTION_POSITIVE_RE.search(text):
-            score += 3
-        if _SELECT_OPTION_NEGATIVE_RE.search(text):
-            score -= 5
-        # "その他のお問い合わせ" is often safer than recruit/IR/support lanes.
-        if "その他" in text:
-            score += 1
-        if best is None or score > best[0]:
-            best = (score, text)
-    if not best:
+    picked = choose_b2b_option(options)
+    if not picked:
         return None
-    if best[0] < 0:
-        return None
-    return best[1]
+    choice = str(picked.get("value") or "").strip()
+    return choice or None
+
+
+def _is_placeholder_option(option: dict[str, Any]) -> bool:
+    label = str(option.get("label") or "").strip()
+    value = str(option.get("value") or "").strip()
+    if not value:
+        return True
+    if _PLACEHOLDER_RE.match(label):
+        return True
+    if _PLACEHOLDER_RE.match(value):
+        return True
+    return False
+
+
+def _normalize_options(options: list[Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for opt in options:
+        if isinstance(opt, str):
+            out.append(
+                {
+                    "label": opt,
+                    "value": opt,
+                    "selected": False,
+                    "disabled": False,
+                }
+            )
+            continue
+        if not isinstance(opt, dict):
+            continue
+        label = str(opt.get("label") or opt.get("text") or opt.get("value") or "").strip()
+        value = str(opt.get("value") or opt.get("label") or opt.get("text") or "").strip()
+        out.append(
+            {
+                "label": label,
+                "value": value,
+                "selected": bool(opt.get("selected") or opt.get("checked")),
+                "disabled": bool(opt.get("disabled")),
+            }
+        )
+    return out

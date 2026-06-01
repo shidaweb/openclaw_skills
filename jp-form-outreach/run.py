@@ -661,6 +661,47 @@ def stage_enrich(
             )
             continue
 
+        inquiry_fields = _extract_inquiry_type_fields(fields)
+        if inquiry_fields:
+            llm_no_b2b = False
+            if config:
+                probe = {
+                    "id": t_work.get("id"),
+                    "name": t_work.get("name"),
+                    "form_fields": fields,
+                    "field_map_overrides": t_work.get("field_map_overrides", {}) or {},
+                }
+                probe_plan = _llm_analyze_form(probe, config, body_max_chars=400)
+                llm_no_b2b = bool((probe_plan or {}).get("inquiry_type_no_b2b"))
+            fallback_no_b2b = all(
+                core_submit_progress.choose_b2b_option(f.get("options") or []) is None
+                for f in inquiry_fields
+            )
+            if llm_no_b2b or fallback_no_b2b:
+                reason = "no_b2b_inquiry_type"
+                print(
+                    f"[enrich] ({i}/{len(targets)}) {t_work.get('name')}: "
+                    f"screen_skip ({reason})"
+                )
+                enriched.append(
+                    {
+                        **t_work,
+                        "_enrich_skipped": "screen_skip",
+                        "_enrich_skip_reason": reason,
+                    }
+                )
+                _emit_event(
+                    "enrich.form.screen_skipped",
+                    stage="enrich",
+                    target_id=str(t_work.get("id") or ""),
+                    payload={
+                        "reason": reason,
+                        "llm_no_b2b": llm_no_b2b,
+                        "fallback_no_b2b": fallback_no_b2b,
+                    },
+                )
+                continue
+
         if fields.get("form_root_selector"):
             t_work = {**t_work, "form_root_selector": fields["form_root_selector"]}
         field_count = (
@@ -1952,7 +1993,11 @@ The draft body will be ≤ {body_max_chars} characters. Use placeholder `__BODY_
       "value": "<value to set, or __BODY__ for the message body>",
       "reason": "<short why>"}}
   ],
-  "checkboxes_to_check": ["<element name or id>"],
+  "inquiry_type_no_b2b": false,
+  "checkboxes_to_check": [
+    "<element name or id>",
+    {{"name": "<element name or id>", "label": "<exact visible label text>"}}
+  ],
   "first_button_pattern": "<regex for the first submit button, e.g. '入力内容を確認' or '送信'>",
   "next_step": "single" | "confirm",
   "warnings": ["<diagnostic>"]
@@ -1971,12 +2016,19 @@ The draft body will be ≤ {body_max_chars} characters. Use placeholder `__BODY_
 8. For 都道府県 select: use action="select_option", value=sender.prefecture
 9. For 市区町村 / 番地 split: use sender.city + sender.address_line + sender.building
 10. For body textarea: action="set_text", value="__BODY__"
-11. For category/お問い合わせ種別 radios: use overrides.category_radio
-12. For category selects: use overrides.category_select
+11. For category/お問い合わせ種別 radios/selects:
+    - If overrides.category_radio/category_select exists, use it.
+    - Otherwise choose ONE existing option text that best matches B2B sales inquiry
+      intent (取引/提案/協業/法人向け). Do NOT invent option texts.
+    - Never choose placeholders like "選択してください", "---", empty values.
+    - Avoid individual/recruit/IR/reservation/support lanes when a B2B lane exists.
+12. If category options exist but no valid B2B option is available, set "inquiry_type_no_b2b": true.
 13. For 性別 radios: use overrides.gender_radio if set
 14. For ご希望の連絡方法 radios: use overrides.contact_method_radio
 15. For 連絡可能な時間帯 radios: use overrides.contact_time_radio
-16. For 同意 / プライバシー / 利用規約 / 個人情報 checkboxes: add to checkboxes_to_check
+16. For 同意 / プライバシー / 利用規約 / 個人情報 checkboxes:
+    add to checkboxes_to_check. If name/id is unclear, include exact label text
+    via {"name":"", "label":"..."}.
 17. For optional fields like FAX, ニュースレター, 当社をどこで知ったか when no override: action="skip"
 18. For 従業員数 select with override.employee_count_required: use sender.employee_count_band
 19. Prefer `name` attribute as the field identifier; fall back to `id`
@@ -1999,7 +2051,8 @@ def _llm_analyze_form(target: dict[str, Any], config: dict[str, Any],
     form_fields = target.get("form_fields") or {}
     if not form_fields or not (form_fields.get("inputs")
                                 or form_fields.get("textareas")
-                                or form_fields.get("selects")):
+                                or form_fields.get("selects")
+                                or form_fields.get("radios")):
         return None  # No fields to analyze (e.g. iframe form)
 
     sender = config.get("sender", {})
@@ -2181,6 +2234,210 @@ def _check_by_label(label: str) -> dict[str, Any] | None:
     return res if isinstance(res, dict) else None
 
 
+def _extract_inquiry_type_fields(form_fields: dict[str, Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for sel in form_fields.get("selects") or []:
+        if not isinstance(sel, dict):
+            continue
+        field = {
+            "kind": "select_option",
+            "name": str(sel.get("name") or "").strip(),
+            "label": str(sel.get("label") or ""),
+            "required": bool(sel.get("required")),
+            "options": [{"label": str(x), "value": str(x)} for x in (sel.get("options") or []) if str(x).strip()],
+        }
+        if field["name"] and core_submit_progress.is_inquiry_type_field(field):
+            out.append(field)
+    for name, options in (form_fields.get("radios") or {}).items():
+        opts = options if isinstance(options, list) else []
+        field = {
+            "kind": "select_radio",
+            "name": str(name or "").strip(),
+            "label": str(name or ""),
+            "required": False,
+            "options": [
+                {
+                    "label": str((o or {}).get("label") or ""),
+                    "value": str((o or {}).get("value") or ""),
+                    "selected": bool((o or {}).get("checked")),
+                }
+                for o in opts if isinstance(o, dict)
+            ],
+        }
+        if field["name"] and core_submit_progress.is_inquiry_type_field(field):
+            out.append(field)
+    return out
+
+
+def _plan_entry_for_name(plan: dict[str, Any], name: str, action: str) -> dict[str, Any] | None:
+    for entry in plan.get("fields") or []:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("name") or "") != name:
+            continue
+        if str(entry.get("action") or "") != action:
+            continue
+        return entry
+    return None
+
+
+def _ensure_inquiry_type_action(
+    target: dict[str, Any],
+    plan: dict[str, Any] | None,
+    *,
+    stage: str,
+    trace_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Apply inquiry-type select/radio before full fill.
+
+    LLM plan is primary. If invalid/missing, fallback to pure-function scorer.
+    """
+    overrides = target.get("field_map_overrides", {}) or {}
+    if overrides.get("category_select") or overrides.get("category_radio"):
+        return {"selected": 0, "src": "override"}
+    form_fields = target.get("form_fields") or {}
+    inquiry_fields = _extract_inquiry_type_fields(form_fields)
+    if not inquiry_fields:
+        return {"selected": 0, "src": "none", "no_b2b": False}
+    chosen_count = 0
+    no_b2b_hits = 0
+    for field in inquiry_fields:
+        fname = field["name"]
+        action = field["kind"]
+        options = field.get("options") or []
+        llm_entry = _plan_entry_for_name(plan or {}, fname, action) if plan else None
+        llm_value = str((llm_entry or {}).get("value") or "").strip()
+        choice = ""
+        src = ""
+        confidence = "high"
+        if llm_value and core_submit_progress.validate_choice(options, llm_value):
+            fallback = core_submit_progress.choose_b2b_option(options)
+            if fallback and str(fallback.get("value") or "") and str(fallback.get("value")) != llm_value:
+                choice = str(fallback["value"])
+                src = "fallback"
+                confidence = "low"
+            else:
+                choice = llm_value
+                src = "llm"
+        else:
+            fallback = core_submit_progress.choose_b2b_option(options)
+            if fallback:
+                choice = str(fallback.get("value") or "")
+                src = "fallback"
+                confidence = str(fallback.get("confidence") or "low")
+        if not choice:
+            no_b2b_hits += 1
+            continue
+        res = _apply_field_action(fname, action, choice)
+        if not (res and res.get("ok")):
+            continue
+        chosen_count += 1
+        tid = str(target.get("id") or target.get("name") or "")
+        _emit_event(
+            "send.inquiry_type",
+            stage=stage,
+            target_id=tid,
+            payload={
+                "name": fname,
+                "value": choice[:120],
+                "src": src,
+                "confidence": confidence,
+            },
+            trace_dir=trace_dir,
+        )
+        if llm_entry is None and plan is not None:
+            plan.setdefault("fields", []).append(
+                {
+                    "name": fname,
+                    "action": action,
+                    "value": choice,
+                    "reason": f"inquiry_type_autoselect:{src}",
+                }
+            )
+        elif llm_entry is not None:
+            llm_entry["value"] = choice
+            llm_entry["reason"] = f"inquiry_type_autoselect:{src}"
+    no_b2b = bool(inquiry_fields) and (no_b2b_hits >= len(inquiry_fields))
+    return {"selected": chosen_count, "src": "llm_or_fallback", "no_b2b": no_b2b}
+
+
+def _required_field_rows(form_fields: dict[str, Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for kind in ("inputs", "textareas", "selects"):
+        for row in form_fields.get(kind) or []:
+            if not isinstance(row, dict):
+                continue
+            if not bool(row.get("required")):
+                continue
+            out.append(
+                {
+                    "type": kind[:-1],
+                    "name": str(row.get("name") or ""),
+                    "label": str(row.get("label") or ""),
+                    "required": True,
+                }
+            )
+    return out
+
+
+def _rescan_after_inquiry_type(
+    target: dict[str, Any],
+    sender: dict[str, Any],
+    diagnostics: dict[str, Any],
+    *,
+    trace_dir: Path | None = None,
+) -> None:
+    baseline = target.get("form_fields") or {}
+    baseline_keys = {
+        f"{row.get('type')}:{row.get('name') or row.get('label')}"
+        for row in _required_field_rows(baseline)
+    }
+    fresh = _evaluate(_FORM_FIELDS_JS) or {}
+    if not isinstance(fresh, dict):
+        return
+    new_required: list[dict[str, Any]] = []
+    for row in _required_field_rows(fresh):
+        key = f"{row.get('type')}:{row.get('name') or row.get('label')}"
+        if key not in baseline_keys:
+            new_required.append(row)
+    target["form_fields"] = fresh
+    if fresh.get("form_root_selector"):
+        target["form_root_selector"] = fresh["form_root_selector"]
+    if not new_required:
+        return
+    for row in new_required:
+        label = str(row.get("label") or "")
+        blob = f"{label} {row.get('name')}".lower()
+        fill = None
+        if any(k in blob for k in ("会社", "法人", "company", "団体")):
+            fill = ("company", sender.get("company", ""), SENDER_FIELD_PATTERNS["company"])
+        elif any(k in blob for k in ("部署", "役職", "department", "position")):
+            fill = ("role", sender.get("role", ""), SENDER_FIELD_PATTERNS["role"])
+        elif any(k in blob for k in ("名前", "氏名", "担当", "name")):
+            fill = ("name", sender.get("name", ""), SENDER_FIELD_PATTERNS["name"])
+        elif any(k in blob for k in ("メール", "mail")):
+            fill = ("email", sender.get("email", ""), SENDER_FIELD_PATTERNS["email"])
+        elif any(k in blob for k in ("電話", "tel", "phone")):
+            fill = ("phone", sender.get("phone", ""), SENDER_FIELD_PATTERNS["phone"])
+        if fill and str(fill[1]).strip():
+            res = _fill_field(fill[0], str(fill[1]), fill[2])
+            if res and res.get("filled"):
+                diagnostics.setdefault("filled", []).append(
+                    f"dynamic_required:{row.get('name') or row.get('label')}={str(fill[1])[:30]}"
+                )
+                continue
+        diagnostics.setdefault("dynamic_escalated", []).append(row.get("name") or row.get("label") or "?")
+        _escalate_dynamic_required(target, [row])
+    diagnostics.setdefault("warnings", []).append(f"inquiry_rescan_new_required={len(new_required)}")
+    _emit_event(
+        "send.inquiry_type.rescan",
+        stage="send",
+        target_id=str(target.get("id") or target.get("name") or ""),
+        payload={"new_required_count": len(new_required)},
+        trace_dir=trace_dir,
+    )
+
+
 def _postal_sort_key(entry: dict[str, Any]) -> int:
     name = (entry.get("name") or "").lower()
     label = (entry.get("label") or "").lower()
@@ -2321,12 +2578,24 @@ def fill_form_with_plan(
             else:
                 diag["warnings"].append(f"dynamic required {key} (no target to escalate)")
 
-    for cb_name in plan.get("checkboxes_to_check", []):
-        res = _check_by_name(cb_name)
-        if res and res.get("ok"):
-            diag["filled"].append(f"checkbox:{cb_name}")
+    for cb in plan.get("checkboxes_to_check", []):
+        cb_name = ""
+        cb_label = ""
+        if isinstance(cb, dict):
+            cb_name = str(cb.get("name") or "").strip()
+            cb_label = str(cb.get("label") or "").strip()
         else:
-            diag["errors"].append(f"checkbox {cb_name}: {(res or {}).get('reason','?')}")
+            cb_name = str(cb or "").strip()
+            cb_label = cb_name
+        res = _check_by_name(cb_name) if cb_name else None
+        if not (res and res.get("ok")) and cb_label:
+            res = _check_by_label(cb_label)
+        if res and res.get("ok"):
+            marker = cb_name or cb_label or "?"
+            diag["filled"].append(f"checkbox:{marker}")
+        else:
+            marker = cb_name or cb_label or "?"
+            diag["errors"].append(f"checkbox {marker}: {(res or {}).get('reason','?')}")
 
     return diag
 
@@ -2383,7 +2652,20 @@ def fill_form_for_target(
               f"flow={plan.get('next_step', '?')}")
         for w in plan.get("warnings", []):
             print(f"    ⚠ {w}")
+        inquiry = _ensure_inquiry_type_action(
+            target,
+            plan,
+            stage="send",
+            trace_dir=trace_dir,
+        )
         plan_diag = fill_form_with_plan(plan, body, target=target, evaluate_fn=_evaluate)
+        if inquiry.get("selected"):
+            _rescan_after_inquiry_type(
+                target,
+                sender,
+                plan_diag,
+                trace_dir=trace_dir,
+            )
         _emit_event(
             "send.fill.applied",
             stage="send",
@@ -2392,6 +2674,7 @@ def fill_form_for_target(
                 "filled": len(plan_diag.get("filled") or []),
                 "errors": len(plan_diag.get("errors") or []),
                 "skipped": len(plan_diag.get("skipped") or []),
+                "inquiry_type_selected": int(inquiry.get("selected") or 0),
             },
             trace_dir=trace_dir,
         )
@@ -2528,6 +2811,15 @@ def _heuristic_fill_fallback(target: dict[str, Any], config: dict[str, Any],
             diagnostics["filled"].append(f"category_select={overrides['category_select']}")
         else:
             diagnostics["errors"].append(f"category_select not found: {overrides['category_select']}")
+    else:
+        inquiry = _ensure_inquiry_type_action(target, None, stage="send")
+        if inquiry.get("selected"):
+            diagnostics["filled"].append(
+                f"inquiry_type=auto(src=fallback, count={int(inquiry.get('selected') or 0)})"
+            )
+            _rescan_after_inquiry_type(target, sender, diagnostics)
+        elif inquiry.get("no_b2b"):
+            diagnostics["warnings"].append("no_b2b_inquiry_type")
     if overrides.get("gender_radio"):
         rres = _fill_radio(overrides["gender_radio"])
         if rres and rres.get("selected"):
