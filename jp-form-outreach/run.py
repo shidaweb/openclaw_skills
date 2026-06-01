@@ -1495,6 +1495,61 @@ _LIST_CHECKBOX_GATES_JS = r"""
 """
 
 
+_LIST_RADIO_GATES_JS = r"""
+() => {
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const labelForRadio = (el) => {
+    let txt = '';
+    if (el.id) {
+      const l = document.querySelector(`label[for="${el.id}"]`);
+      if (l) txt = norm(l.textContent || '');
+    }
+    if (!txt) {
+      const wrap = el.closest('label');
+      if (wrap) txt = norm(wrap.textContent || '');
+    }
+    if (!txt && el.parentElement) txt = norm(el.parentElement.textContent || '');
+    return txt;
+  };
+  const groupLabel = (r) => {
+    const fs = r.closest('fieldset');
+    if (fs) {
+      const lg = fs.querySelector('legend');
+      if (lg) return norm(lg.textContent || '');
+    }
+    let cur = r.parentElement;
+    for (let i = 0; i < 4 && cur; i++, cur = cur.parentElement) {
+      const l = cur.querySelector('label, .label, [class*="label" i], .title');
+      if (l) return norm(l.textContent || '');
+    }
+    return '';
+  };
+  const map = new Map();
+  const radios = Array.from(document.querySelectorAll('input[type="radio"]'));
+  for (const r of radios) {
+    const name = r.name || '';
+    if (!name) continue;
+    const item = map.get(name) || {
+      name: name,
+      label: groupLabel(r),
+      required: false,
+      selected: false,
+      options: [],
+    };
+    item.required = item.required || Boolean(r.required || r.getAttribute('aria-required') === 'true');
+    item.selected = item.selected || Boolean(r.checked);
+    item.options.push({
+      label: labelForRadio(r),
+      value: r.value || '',
+      checked: Boolean(r.checked),
+    });
+    map.set(name, item);
+  }
+  return Array.from(map.values()).slice(0, 80);
+}
+"""
+
+
 _CLICK_BUTTON_BY_TEXT_JS = r"""
 (args) => {
   const { patterns, formRootSelector } = args;
@@ -1622,6 +1677,26 @@ def _auto_check_submit_gates() -> dict[str, Any]:
     }
 
 
+def _auto_select_submit_radios() -> dict[str, Any]:
+    """Select likely radio gates (法人/提案系/その他) to unblock submit."""
+    res = _evaluate(_LIST_RADIO_GATES_JS)
+    groups = res if isinstance(res, list) else []
+    actions = core_submit_progress.pick_radio_gate_actions(groups)
+    selected_count = 0
+    selected_items: list[str] = []
+    for act in actions:
+        out = _apply_field_action(act["name"], "select_radio", act["value"])
+        if out and out.get("ok"):
+            selected_count += 1
+            selected_items.append(f"{act['name']}={act['value']}")
+    return {
+        "selected_count": selected_count,
+        "selected_items": selected_items,
+        "candidates": len(actions),
+        "total_groups": len(groups),
+    }
+
+
 def _click_button(patterns: list[str],
                    form_root_selector: str | None = None) -> dict[str, Any] | None:
     args = {"patterns": patterns, "formRootSelector": form_root_selector}
@@ -1641,19 +1716,23 @@ def _click_button_with_gate_retry(
     form_root_selector: str | None = None,
     retries: int = 2,
 ) -> dict[str, Any] | None:
-    """Try clicking submit; if blocked by gate checkboxes, auto-check then retry."""
+    """Try clicking submit; if blocked by gate fields, auto-fill then retry."""
     last = _click_button(patterns, form_root_selector=form_root_selector)
     if last and last.get("clicked"):
         return last
     for _ in range(max(1, retries)):
         gate = _auto_check_submit_gates()
-        if gate.get("checked_count", 0) <= 0:
+        radios = _auto_select_submit_radios()
+        changed = gate.get("checked_count", 0) + radios.get("selected_count", 0)
+        if changed <= 0:
             break
         time.sleep(0.4)
         last = _click_button(patterns, form_root_selector=form_root_selector)
         if last and last.get("clicked"):
             last["gate_auto_checked"] = gate.get("checked_count", 0)
             last["gate_labels"] = gate.get("checked_labels") or []
+            last["radio_auto_selected"] = radios.get("selected_count", 0)
+            last["radio_items"] = radios.get("selected_items") or []
             return last
     return last
 
@@ -3230,6 +3309,8 @@ def stage_send(
             )
             continue
         print(f"  [send] clicked: {click_res.get('text')}")
+        if click_res.get("radio_auto_selected"):
+            print(f"  [send]    ↳ auto-selected radios: {(click_res.get('radio_items') or [])[:3]}")
         _emit_event(
             "send.button.clicked",
             stage="send",
@@ -3237,6 +3318,7 @@ def stage_send(
             payload={
                 "pattern_matched": True,
                 "text": (click_res.get("text") or "")[:80],
+                "radio_auto_selected": int(click_res.get("radio_auto_selected") or 0),
             },
             trace_dir=trace,
         )
@@ -3295,11 +3377,16 @@ def stage_send(
                     )
                     continue
             print(f"  [send] clicked final: {click2.get('text')}")
+            if click2.get("radio_auto_selected"):
+                print(f"  [send]    ↳ auto-selected radios: {(click2.get('radio_items') or [])[:3]}")
             _emit_event(
                 "send.final.clicked",
                 stage="send",
                 target_id=tid,
-                payload={"text": (click2.get("text") or "")[:80]},
+                payload={
+                    "text": (click2.get("text") or "")[:80],
+                    "radio_auto_selected": int(click2.get("radio_auto_selected") or 0),
+                },
                 trace_dir=trace,
             )
             time.sleep(5)

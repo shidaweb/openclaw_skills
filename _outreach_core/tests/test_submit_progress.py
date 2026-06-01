@@ -31,6 +31,50 @@ class TestSubmitProgress(unittest.TestCase):
         picked = sp.pick_checkboxes_to_check(boxes)
         self.assertEqual([b.get("name") for b in picked], ["a", "c"])
 
+    def test_pick_radio_gate_actions_prefers_business_option(self) -> None:
+        groups = [
+            {
+                "name": "contact_kind",
+                "label": "お問い合わせ種別",
+                "required": True,
+                "selected": False,
+                "options": [
+                    {"label": "個人のお問い合わせ", "value": "personal", "checked": False},
+                    {"label": "法人のお問い合わせ", "value": "corp", "checked": False},
+                ],
+            }
+        ]
+        actions = sp.pick_radio_gate_actions(groups)
+        self.assertEqual(actions, [{"name": "contact_kind", "value": "法人のお問い合わせ"}])
+
+    def test_pick_radio_gate_actions_skips_selected_group(self) -> None:
+        groups = [
+            {
+                "name": "kind",
+                "label": "お問い合わせ種別",
+                "required": True,
+                "selected": True,
+                "options": [{"label": "法人", "value": "corp", "checked": True}],
+            }
+        ]
+        self.assertEqual(sp.pick_radio_gate_actions(groups), [])
+
+    def test_pick_radio_gate_actions_uses_other_when_safe(self) -> None:
+        groups = [
+            {
+                "name": "topic",
+                "label": "カテゴリ",
+                "required": True,
+                "selected": False,
+                "options": [
+                    {"label": "その他", "value": "other", "checked": False},
+                    {"label": "採用", "value": "recruit", "checked": False},
+                ],
+            }
+        ]
+        actions = sp.pick_radio_gate_actions(groups)
+        self.assertEqual(actions, [{"name": "topic", "value": "その他"}])
+
 
 if __name__ == "__main__":
     unittest.main()
