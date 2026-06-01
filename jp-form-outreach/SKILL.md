@@ -336,6 +336,9 @@ Do NOT use for:
 | **「承認」/「OK 進めて」**（事前承認待ち中） | `run.py approve-autonomy --brief <id>` → 再度 `run.py campaign`（全件自動送信） |
 | **「自律状態どう？」** | `run.py autonomy-status --brief <id>`（mode/承認状態）。送信結果は `report send-funnel --brief <id>` の **autonomous (v5)** 節（自己採点 送信/ゲート・auto-skip 理由内訳）を要約 |
 | **「自律やめて／戻して」** | `run.py approve-autonomy --brief <id> --revoke`（supervised ゲートに戻す） |
+| **「保留（ブロッカー）どれ？」** | `run.py resolve-queue --brief <id> --status`（候補ボタン付きで一覧） |
+| **「詰まった分を片付けて」/ ブロッカー再試行** | `./job start jp-form-outreach resolve-queue --brief <id>`（別プロセスで深掘り再試行） |
+| **「<id> skip」**（ブロッカー通知に対して） | 当該ターゲットを `skip_history` 登録（リゾルバ対象から除外） |
 
 ## Autonomous mode（v5 §12） — 人にいちいち確認しない運用
 
@@ -352,8 +355,12 @@ Do NOT use for:
    - **reCAPTCHA は warmup で出さない**方針（§11-A-8 v3 passthrough_with_warmup）。それでも v2 が可視化された
      ターゲットは**自動スキップ＋記録**（CAPTCHA は突破しない）。
    - 想定外フォーム / 送信ボタン不明 / 確認画面 submit 不明 も**自動スキップ＋記録**して次へ。
-4. **停止の自己復旧**: gateway の死活・hung・チャンネル切断は watchdog が自動再起動（§15）。run は
-   冪等＝再実行で送信済みを除外して再開できる。
+   - **本文の文字／URL拒否**（「使用できない文字」「URLは記載できません」等）を送信後ページで検知したら、
+     **本文からURLを除去して自動再送**（§3.6 URLは送らないルート）。拒否したドメインは `url_unfriendly`
+     として学習し、次回以降は最初からURL除去で送る。`send.content_rejected` / `send.url_fallback_ok` を emit。
+4. **停止の自己復旧**: gateway の死活・hung・チャンネル切断は watchdog が自動再起動（§15）。run の
+   stall（draft 長時間無出力）や異常終了は run_supervisor が**冪等に自動再起動**（上限付き、§15-B）。
+   keepalive が長い Opus 呼び出し中も stdout を出すので false stall kill を防ぐ。
 5. **承認後にリストや brief を大きく変えたら** `--revoke` で再度 事前承認に戻すこと。
 6. **結果の可視化**: `report send-funnel --brief <id>` の **autonomous (v5)** 節で、自己採点の
    送信/ゲート件数・平均スコア・auto-skip 理由内訳（captcha/wrong-form/submit 不明 等）を確認できる。

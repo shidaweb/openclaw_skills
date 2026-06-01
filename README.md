@@ -10,10 +10,13 @@ Approve → Send → Log）を実装し、`_outreach_core/` の共通ロジッ�
 
 | Skill | Channel | Status |
 |---|---|---|
-| [`jp-form-outreach`](./jp-form-outreach) | 日本企業の問い合わせフォーム | v4 |
+| [`jp-form-outreach`](./jp-form-outreach) | 日本企業の問い合わせフォーム | v6 |
 | [`linkedin-outreach`](./linkedin-outreach) | LinkedIn Sales Navigator InMail | v4 |
 
-各スキルの仕様・使い方は `SKILL.md` を参照。
+各スキルの仕様・使い方は `SKILL.md` を参照。jp-form-outreach は v5（自律運用）・v6（送信
+レジリエンス：captcha精緻化 / 回避エンジン / URL拒否フォールバック / リゾルバ / タブ分離 /
+run 自己復旧）まで実装済み。次期 v7 仕様は
+[`CURSOR_INSTRUCTIONS_v7_submit_resilience.md`](./CURSOR_INSTRUCTIONS_v7_submit_resilience.md)。
 
 ## ランチャー（リポジトリ直下から実行）
 
@@ -68,13 +71,21 @@ cd ~/.openclaw/skills
 
 ## 信頼性レイヤー（§15）— Slack 応答と稼働を保証
 
-「Slack で指示しても反応しない / タスクが動いているか不明」を解消する 3 層。
+「Slack で指示しても反応しない / タスクが動いているか不明 / run が止まる」を解消する 4 層。
 
 | Layer | 役割 | 実装 |
 |---|---|---|
 | 1. Auto-ack + detached 起動 | ターンを即返し、長時間処理は別プロセスへ | `./job start` / `_outreach_core/helpers/run_job.py` |
 | 2. Healthcheck | 「生きてる？」に即答、heartbeat 更新 | `./healthcheck` / `_outreach_core/helpers/healthcheck.py` |
-| 3. Watchdog | gateway の死活・無応答・チャンネル切断を検知し自動復旧 | `_outreach_core/helpers/watchdog.py` + launchd |
+| 3. Gateway watchdog | gateway の死活・無応答・チャンネル切断を検知し自動復旧 | `_outreach_core/helpers/watchdog.py` + launchd |
+| 4. Run 自己復旧（v6） | run の stall/異常終了を検知し、冪等に自動再開（上限付き） | `_outreach_core/run_supervisor.py` + keepalive |
+
+- **Run 自己復旧（v6 §15-B）**: 過去に draft フェーズが「600 秒 STDOUT 無出力 → stall 判定で強制 kill」
+  された問題に対処。①`HeartbeatSession` が**常時 keepalive 行を stdout に出力**（既定 60 秒毎・
+  `DOORMAN_KEEPALIVE_SEC`）し、長い Opus 呼び出し中も「無出力」にならない。②`run_job` の supervisor が
+  子 run を **poll 監視**し、ログ/heartbeat が一定時間（既定 420 秒・`DOORMAN_RUN_STALL_SEC`）進まなければ
+  stall とみなして kill→**冪等に再起動**（送信済みは除外して再開）。③異常終了も同様に自動再開。
+  いずれも `MAX_RESTARTS`/ウィンドウで上限管理（再起動ループ防止）。`exit=3`（別 run 進行中）は再起動しない。
 
 - **detached job runner**: `run.py` を別プロセスで起動。Python が 🚀開始 / …心拍（約5分毎、
   `HeartbeatSession`）/ ✅❌終了 を Slack に直接投稿するため、エージェントが無言でも届く。
@@ -112,6 +123,32 @@ python run.py autonomy-status --brief <id>           # mode / 承認状態を確
 
 設定は `sender_brief.yaml` の `autonomy:` ブロック（brief で上書き可）。詳細は
 [`CURSOR_INSTRUCTIONS.md`](./CURSOR_INSTRUCTIONS.md) §12。
+
+## 送信レジリエンス（v6, jp-form-outreach）
+
+実運用ログの障害を潰すために追加された、フォーム送信まわりの堅牢化レイヤー群（すべて
+`sender_brief.yaml` で調整可。共通ロジックは純関数モジュール＋ユニットテストに分離）。
+
+| 機能 | 役割 | 実装 |
+|---|---|---|
+| **reCAPTCHA ライブ判定** | enrich の「要素存在」ではなく送信直前に**実際に可視・ブロッキングか**を再判定し、submit 失敗の captcha 誤ラベルを撲滅 | `_outreach_core/captcha.py` |
+| **回避エンジン** | warmup（v3 スコア健全化）＋ドメイン別 captcha 遭遇率学習（`unviable` 自動スキップ）＋適応 warmup ＋人間的ペーシング | `_outreach_core/avoidance.py`, `warmup.py` |
+| **URL拒否フォールバック** | 「使用できない文字 / URLは記載できません」検知時に本文から URL を除去して自動再送、ドメインを `url_unfriendly` 学習 | `_outreach_core/content_guard.py` |
+| **リゾルバキュー** | submit 未検出 / 誤フォームを**止めずにキュー化**し、別プロセス（`resolve-queue`）で深掘り再試行。Slack には候補ボタン＋スクショ付きの**正直な指示**（「進めて」廃止） | `_outreach_core/resolve_queue.py` |
+| **タブ分離** | ターゲットごとに専用タブ。成功→閉じる / エラー→残して証拠保持、リゾルバが `focus` でその場解決（same-site ガードで誤送信防止） | `_outreach_core/tab_utils.py` |
+| **run 自己復旧** | stall（無出力）/ 異常終了を検知し冪等に自動再起動。keepalive が長い LLM 呼び出し中も stdout を出す | `_outreach_core/run_supervisor.py`, `progress.py` |
+
+```bash
+cd jp-form-outreach
+python run.py resolve-queue --brief <id> --status    # 保留ブロッカー一覧（候補ボタン付き）
+python run.py resolve-queue --brief <id>             # 深掘り再試行（別プロセスでも可: ./job start … resolve-queue）
+```
+
+- **正直なメッセージ**: ブロッカー通知は実原因を表示（例「送信ボタンがDOMで特定できず停止（captchaではない）」）。
+  reCAPTCHA は**突破しない**方針（warmup で出させない＋出たら迂回）。
+- 関連環境変数: `DOORMAN_KEEPALIVE_SEC`（既定 60）, `DOORMAN_RUN_STALL_SEC`（既定 420）,
+  `DOORMAN_RUN_MAX_RESTARTS`（既定 3）。`browser.tab_isolation: false` で従来挙動に即戻せる。
+- 外販（オンデバイス）アーキテクチャ構想は [`docs/ARCHITECTURE_EXTERNAL.md`](./docs/ARCHITECTURE_EXTERNAL.md)。
 
 ## モデル方針（v4）
 
@@ -175,8 +212,24 @@ openclaw gateway restart            # 反映
 
 ## Docs
 
-- [`docs/OPENCLAW_AGENT.md`](./docs/OPENCLAW_AGENT.md) — エージェント運用（ack / detached / 進捗保証）
+- [`docs/OPENCLAW_AGENT.md`](./docs/OPENCLAW_AGENT.md) — エージェント運用（ack / detached / 進捗保証 / 自律 / リゾルバ / タブ分離）
+- [`docs/ARCHITECTURE_EXTERNAL.md`](./docs/ARCHITECTURE_EXTERNAL.md) — 外販（オンデバイス）アーキテクチャ構想
 - [`docs/SCHEDULING.md`](./docs/SCHEDULING.md) — cron スケジューリング
 - [`_outreach_core/README.md`](./_outreach_core/README.md) — 共通ロジック
 - [`briefs/README.md`](./briefs/README.md) — brief の構造
-- [`CURSOR_INSTRUCTIONS.md`](./CURSOR_INSTRUCTIONS.md) — v4 仕様（設計の正典）
+- [`CURSOR_INSTRUCTIONS.md`](./CURSOR_INSTRUCTIONS.md) — v4 仕様（設計の正典）＋ §12 自律運用（v5）
+- [`CURSOR_INSTRUCTIONS_v7_submit_resilience.md`](./CURSOR_INSTRUCTIONS_v7_submit_resilience.md) — v7 仕様（送信ボタン進行性 / ドラフト堅牢化、未実装）
+
+## コアモジュール（`_outreach_core/`）
+
+主要な共通ロジック（v5/v6 追加分を含む）:
+
+- `autonomy.py` — 自律運用プロファイル（自己採点 / 事前承認 / blocker 方針）
+- `avoidance.py` — reCAPTCHA 回避エンジン（warmup / ドメイン学習 / ペーシング）
+- `captcha.py` — ライブ reCAPTCHA 判定・分類
+- `content_guard.py` — 本文の文字/URL 拒否検知＋URL 除去
+- `resolve_queue.py` — ブロッカーキュー＋実行可能メッセージ
+- `tab_utils.py` — ブラウザタブ管理（純関数）
+- `run_supervisor.py` — run の stall 検知＋上限付き自動再起動
+- `progress.py` — heartbeat ＋ stdout keepalive
+- `verify.py` / `draft.py` / `prompt.py` / `infer.py` / `warmup.py` ほか（既存）

@@ -46,3 +46,18 @@ data/job_logs/
 **/data/events.jsonl
 **/data/traces/
 **/data/verify_snapshot_*.txt
+
+# --- v6 hardening: keep runtime data, real target lists, and backups out of git ---
+# All per-skill/per-brief runtime data dirs (drafts, histories, snapshots, stats,
+# resolve_queue, run_supervisor state). These contain prospect contact info and
+# drafted message bodies — never commit.
+**/data/
+data/run_supervisor.json
+# Filled-in target lists (per-brief). Commit only the *.example.* templates.
+*/targets/*.yaml
+*/targets/*.csv
+!*/targets/*.example.yaml
+!*/targets/*.example.csv
+# Editor/script backups and stray local scripts
+**/*.backup.*
+linkedin-outreach/loop_until_10.sh

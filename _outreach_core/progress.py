@@ -68,6 +68,19 @@ def _append_event(data_dir: Path, event: dict[str, Any]) -> None:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+# Always-on stdout keepalive interval. A long LLM phase (e.g. Opus drafting 30
+# companies sequentially) can be silent on stdout for many minutes, which made
+# supervising layers (subagent harness, run_job) kill the run as "stalled" even
+# though it was making progress. Emitting a heartbeat line well under any such
+# timeout keeps the run visibly alive. Override with DOORMAN_KEEPALIVE_SEC.
+def _keepalive_interval() -> int:
+    try:
+        v = int(os.environ.get("DOORMAN_KEEPALIVE_SEC", "60"))
+        return v if v > 0 else 60
+    except (ValueError, TypeError):
+        return 60
+
+
 class HeartbeatSession:
     """Context manager: progress events + optional 5-min Slack webhook pings."""
 
@@ -93,6 +106,8 @@ class HeartbeatSession:
         self._last_action = ""
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._keepalive_thread: threading.Thread | None = None
+        self._keepalive_interval = _keepalive_interval()
         try:
             cfg = load_merged_config(skill_dir, brief_id)
         except FileNotFoundError:
@@ -115,6 +130,10 @@ class HeartbeatSession:
             {"event": "start", "task": self.task, "total": self.total, "message": self._last_action},
         )
         self._sync_system_health()
+        # Always-on stdout keepalive (independent of Slack mode). Guarantees the
+        # process is never silent long enough to be mistaken for stalled.
+        self._keepalive_thread = threading.Thread(target=self._keepalive_loop, daemon=True)
+        self._keepalive_thread.start()
         if self.heartbeat_mode == "slack":
             from _outreach_core.notify import post
 
@@ -155,6 +174,8 @@ class HeartbeatSession:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=2.0)
+        if self._keepalive_thread:
+            self._keepalive_thread.join(timeout=2.0)
         elapsed_min = 0
         if self._started_at:
             elapsed_min = int((time.time() - self._started_at) / 60)
@@ -231,6 +252,26 @@ class HeartbeatSession:
             except Exception:
                 pass
             last_post = time.time()
+
+    def _keepalive_loop(self) -> None:
+        """Emit a stdout liveness line + refresh system_health every
+        keepalive interval. Runs regardless of Slack mode. This is what keeps a
+        long, legitimately-busy run from being killed as 'no output = stalled'."""
+        while not self._stop.wait(self._keepalive_interval):
+            if not self._started_at:
+                continue
+            self._refresh_from_log()
+            elapsed = int(time.time() - self._started_at)
+            try:
+                print(
+                    f"  [keepalive] {self.task} {self._current}/{self.total} · "
+                    f"{elapsed}s · {self._last_action}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+            # Advance the run heartbeat file so the supervisor sees liveness.
+            self._sync_system_health()
 
     def __enter__(self) -> HeartbeatSession:
         self.start()

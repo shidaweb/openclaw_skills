@@ -20,9 +20,26 @@ DEFAULT_MODEL = "claude-cli/claude-sonnet-4-6"
 BROWSER_PROFILE = "openclaw"
 
 
-def _run(cmd: list[str]) -> tuple[int, str, str]:
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    return res.returncode, res.stdout, res.stderr
+def _run(cmd: list[str], *, timeout: float | None = None) -> tuple[int, str, str]:
+    # Per-subprocess hard wall: prevents a hung `openclaw infer` (or any child)
+    # from stalling the whole pipeline. Override via OUTREACH_SUBPROC_TIMEOUT_SEC.
+    # (root cause of pigeon_corp draft-loop hang 2026-05-31)
+    if timeout is None:
+        env_val = os.environ.get("OUTREACH_SUBPROC_TIMEOUT_SEC", "").strip()
+        if env_val:
+            try:
+                timeout = float(env_val)
+            except ValueError:
+                timeout = 240.0
+        else:
+            timeout = 240.0
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return res.returncode, res.stdout, res.stderr
+    except subprocess.TimeoutExpired as e:
+        partial_out = (e.stdout.decode("utf-8", "replace") if isinstance(e.stdout, (bytes, bytearray)) else (e.stdout or "")) if e.stdout else ""
+        partial_err = (e.stderr.decode("utf-8", "replace") if isinstance(e.stderr, (bytes, bytearray)) else (e.stderr or "")) if e.stderr else ""
+        return 124, partial_out, partial_err + f"\n[_run] timeout after {timeout}s: {' '.join(cmd[:4])}..."
 
 
 def browser_headless_preference() -> bool | None:
@@ -80,6 +97,44 @@ def oc_browser(*args: str, profile: str = BROWSER_PROFILE) -> str | None:
         print(f"[browser err] {' '.join(args)}: {err.strip()}", file=__import__("sys").stderr)
         return None
     return out
+
+
+def extract_json_payload(stdout: str | None) -> Any:
+    """Pull the JSON object/array out of `openclaw browser --json ...` stdout,
+    tolerating the 🦞 banner and box-drawing decoration lines. Pure + testable."""
+    if not stdout:
+        return None
+    body_lines: list[str] = []
+    for line in stdout.splitlines():
+        s = line.strip()
+        if not s or s.startswith("🦞"):
+            continue
+        if all(ch in "│◇└├─┃|" for ch in s):
+            continue
+        body_lines.append(line)
+    text = "\n".join(body_lines).strip()
+    if not text:
+        return None
+    # Find the first JSON object/array start (handles any leading prose).
+    starts = [i for i in (text.find("{"), text.find("[")) if i != -1]
+    if starts:
+        text = text[min(starts):]
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
+def oc_browser_json(*args: str, profile: str = BROWSER_PROFILE) -> Any:
+    """Run `openclaw browser --browser-profile <p> --json <args>` and return the
+    parsed JSON (dict/list) or None. Used for tab management (open/tabs)."""
+    cmd = ["openclaw", "browser", "--browser-profile", profile, "--json", *args]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        print(f"[browser json err] {' '.join(args)}: {res.stderr.strip()}",
+              file=__import__("sys").stderr)
+        return None
+    return extract_json_payload(res.stdout)
 
 
 def oc_evaluate(js: str, *, profile: str = BROWSER_PROFILE) -> Any:

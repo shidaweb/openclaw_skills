@@ -25,6 +25,9 @@ FORM_SUCCESS_KEYWORDS = (
     "完了しました",
     "完了画面",
     "送信が完了",
+    "送信されました",
+    "送信いたしました",
+    "メッセージは送信",
     "THANKS",
     "thank you",
     "thank you for",
@@ -80,10 +83,10 @@ FORM_ERROR_KEYWORDS = (
     "入力エラー",
     "未入力",
     "正しく入力してください",
-    "必須項目",
     "入力内容に誤り",
-    "error",
     "エラーがあります",
+    "送信できませんでした",
+    "送信に失敗",
 )
 
 PICK_TARGET_FORM_JS = r"""
@@ -319,6 +322,19 @@ def verify_send_completed(
     if snap:
         evidence["has_success_keyword"] = _text_has_keyword(snap, FORM_SUCCESS_KEYWORDS)
         evidence["has_error_keyword"] = _text_has_keyword(snap, FORM_ERROR_KEYWORDS)
+
+    # Success keyword wins over error keyword: many JP forms keep error-like
+    # labels (e.g. 必須項目, 入力エラー再表示) visible alongside the success
+    # confirmation message. If we see a clear "送信されました" type marker,
+    # trust it. (GENDA 2026-05-31 false-positive.)
+    if evidence.get("has_success_keyword"):
+        return {
+            "status": "ok",
+            "reason": f"{name}: 送信完了画面を確認",
+            "evidence": evidence,
+            "snapshot_path": str(snapshot_path) if snapshot_path else None,
+            "unresolved_fields": None,
+        }
 
     if evidence.get("has_error_keyword"):
         return {

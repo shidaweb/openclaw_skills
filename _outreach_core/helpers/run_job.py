@@ -139,42 +139,107 @@ def start(
     return {"run_id": run_id, "pid": proc.pid, "log": str(log_path)}
 
 
+def _health_files() -> list[Path]:
+    """system_health/*.json — the child run's heartbeat advances these."""
+    d = SKILLS_ROOT / "data" / "system_health"
+    try:
+        return list(d.glob("*.json"))
+    except OSError:
+        return []
+
+
 def _supervise(skill: str, run_id: str, log_path: str, run_args: list[str]) -> int:
-    """Run run.py as a child; guarantee a terminal Slack post on any exit."""
+    """Run run.py as a child with **stall detection + bounded auto-restart**.
+
+    The campaign is idempotent (already-sent excluded, stale lock auto-cleared),
+    so a stalled or crashed run is recovered by relaunching the same command,
+    bounded by run_supervisor's restart budget. Guarantees a terminal Slack post.
+    """
+    from _outreach_core import run_supervisor as RS
+
     thread_ts = os.environ.get("DOORMAN_SLACK_THREAD_TS", "").strip() or None
     cmd = build_child_command(skill, run_args)
     cmd_label = " ".join(run_args) or "(no args)"
-    code = 1
-    try:
-        result = subprocess.run(cmd, cwd=str(_skill_dir(skill)), check=False)  # noqa: S603
-        code = result.returncode
-    except Exception as exc:  # noqa: BLE001 - must still post terminal message
-        _post(
-            f"❌ 異常終了: {skill} `{cmd_label}` (run_id={run_id})\n"
-            f"例外: {exc!s}\nログ: {log_path}",
-            level="error",
-            thread_ts=thread_ts,
-        )
-        return 1
-    finally:
-        # Best-effort: clear any orphaned active_run.lock for this skill is the
-        # job's own responsibility inside run.py; we only report status here.
-        pass
+    state_dir = SKILLS_ROOT / "data"
+    state = RS.load_state(state_dir)
+    activity_paths = [Path(log_path)] + _health_files()
 
-    if code == 0:
-        _post(
-            f"✅ 完了: {skill} `{cmd_label}` (run_id={run_id})",
-            level="info",
-            thread_ts=thread_ts,
-        )
-    else:
-        _post(
-            f"❌ 異常終了: {skill} `{cmd_label}` (run_id={run_id}, exit={code})\n"
-            f"ログ末尾を確認してください: {log_path}",
-            level="error",
-            thread_ts=thread_ts,
-        )
-    return code
+    while True:
+        try:
+            proc = subprocess.Popen(  # noqa: S603 - trusted internal command
+                cmd, cwd=str(_skill_dir(skill)), stdin=subprocess.DEVNULL,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _post(f"❌ 異常終了: {skill} `{cmd_label}` (run_id={run_id})\n例外: {exc!s}",
+                  level="error", thread_ts=thread_ts)
+            return 1
+
+        killed_for_stall = False
+        code: int | None = None
+        while True:
+            try:
+                code = proc.wait(timeout=RS.POLL_SEC)
+                break  # child exited
+            except subprocess.TimeoutExpired:
+                age = RS.latest_activity_age_sec([Path(log_path)] + _health_files())
+                action = RS.decide(child_alive=True, exit_code=None,
+                                   activity_age_sec=age, state=state)
+                if action == RS.ACTION_RESTART_STALLED:
+                    RS.record_restart(state, "stalled")
+                    RS.save_state(state_dir, state)
+                    _post(f"♻️ stall検知（{int(age or 0)}s 無進捗）→ 自動再開: {skill} "
+                          f"`{cmd_label}` (run_id={run_id})。データは保全されています。",
+                          level="warn", thread_ts=thread_ts)
+                    _kill(proc)
+                    killed_for_stall = True
+                    break
+                if action == RS.ACTION_GIVE_UP_STALLED:
+                    _kill(proc)
+                    _post(f"❌ stall が再試行上限に到達（{RS.MAX_RESTARTS}回/{RS.RESTART_WINDOW_MIN}分）"
+                          f"。中断します: {skill} `{cmd_label}`。ログ: {log_path}",
+                          level="error", thread_ts=thread_ts)
+                    return 1
+                # ACTION_CONTINUE → keep polling
+
+        if killed_for_stall:
+            continue  # relaunch (idempotent resume)
+
+        # Child exited on its own.
+        if code == 0:
+            _post(f"✅ 完了: {skill} `{cmd_label}` (run_id={run_id})",
+                  level="info", thread_ts=thread_ts)
+            return 0
+        if code == 3:
+            # ActiveRunError — another LIVE run holds the lock; restarting won't help.
+            _post(f"⏸ 別の run が進行中のため起動できませんでした: {skill} `{cmd_label}`。",
+                  level="warn", thread_ts=thread_ts)
+            return 3
+
+        action = RS.decide(child_alive=False, exit_code=code, activity_age_sec=None, state=state)
+        if action == RS.ACTION_RESTART_CRASH:
+            RS.record_restart(state, "crash")
+            RS.save_state(state_dir, state)
+            _post(f"♻️ 異常終了 (exit={code}) → 自動再開: {skill} `{cmd_label}` "
+                  f"(run_id={run_id})。データは保全されています。",
+                  level="warn", thread_ts=thread_ts)
+            continue
+        _post(f"❌ 異常終了 (exit={code})。再試行上限に到達したため中断します: "
+              f"{skill} `{cmd_label}`。ログ末尾を確認してください: {log_path}",
+              level="error", thread_ts=thread_ts)
+        return code
+
+
+def _kill(proc: "subprocess.Popen") -> None:
+    """Terminate a child process, escalating to kill, swallowing errors."""
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def cmd_start(args: argparse.Namespace) -> int:
