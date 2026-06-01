@@ -51,6 +51,7 @@ _NOISE_SUBMIT_TEXT_RE = re.compile(
 )
 _FIRST_STEP_TEXT_RE = re.compile(r"(入力内容を確認|内容(を|の)?確認|確認画面|同意して次へ|^次へ$)", re.I)
 _FINAL_STEP_TEXT_RE = re.compile(r"(送信|submit|完了|確定|問い合わせを送信|お問い合わせを送信)", re.I)
+_ROUTE_GROUP_RE = re.compile(r"(お客様|個人|法人|企業|一般|取引|お問い合わせ対象|お問い合わせ区分)", re.I)
 
 
 def is_agreement_label(label: str | None) -> bool:
@@ -376,3 +377,96 @@ def rank_submit_candidates(
         return []
     filtered = [c for c in ranked if _score(c) >= 0]
     return (filtered or ranked)[:30]
+
+
+def pick_route_radio_action(
+    groups: list[dict[str, Any]] | None,
+    override_value: str | None = None,
+) -> dict[str, str] | None:
+    """Pick a route-choice radio (personal/company toggle), preferring B2B side."""
+    if not isinstance(groups, list):
+        return None
+    if override_value:
+        ov = str(override_value).strip()
+        if not ov:
+            return None
+        for g in groups:
+            if not isinstance(g, dict):
+                continue
+            name = str(g.get("name") or "").strip()
+            if not name or bool(g.get("selected")):
+                continue
+            options = _normalize_options(g.get("options") or [])
+            for opt in options:
+                if bool(opt.get("selected")) or bool(opt.get("disabled")):
+                    continue
+                label = str(opt.get("label") or "").strip()
+                value = str(opt.get("value") or "").strip()
+                if ov in {label, value}:
+                    return {"name": name, "value": label or value}
+    best: dict[str, str] | None = None
+    best_score = -9999
+    for g in groups:
+        if not isinstance(g, dict):
+            continue
+        name = str(g.get("name") or "").strip()
+        if not name or bool(g.get("selected")):
+            continue
+        label = str(g.get("label") or "")
+        blob = f"{name} {label}"
+        options = _normalize_options(g.get("options") or [])
+        if len(options) < 2 and not _ROUTE_GROUP_RE.search(blob):
+            continue
+        picked = choose_b2b_option(options)
+        if not picked:
+            continue
+        score = int(picked.get("score") or 0)
+        if _ROUTE_GROUP_RE.search(blob):
+            score += 2
+        if score > best_score:
+            best_score = score
+            best = {"name": name, "value": str(picked.get("value") or "")}
+    return best
+
+
+def summarize_remaining_submit_gates(
+    checkboxes: list[dict[str, Any]] | None,
+    radios: list[dict[str, Any]] | None,
+    selects: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Return unresolved gate candidates after auto-fix attempts."""
+    boxes = checkboxes if isinstance(checkboxes, list) else []
+    radio_groups = radios if isinstance(radios, list) else []
+    select_groups = selects if isinstance(selects, list) else []
+    unresolved_boxes = []
+    for b in boxes:
+        if not isinstance(b, dict):
+            continue
+        if bool(b.get("checked")):
+            continue
+        if should_auto_check_checkbox(b):
+            unresolved_boxes.append(str(b.get("label") or b.get("name") or b.get("id") or "?"))
+    unresolved_radios = []
+    for g in radio_groups:
+        if not isinstance(g, dict):
+            continue
+        if bool(g.get("selected")):
+            continue
+        picked = _pick_radio_option(g.get("options") or [])
+        if picked:
+            unresolved_radios.append(f"{g.get('name') or '?'}={picked}")
+    unresolved_selects = []
+    for g in select_groups:
+        if not isinstance(g, dict):
+            continue
+        if bool(g.get("selected")):
+            continue
+        picked = _pick_select_option(g.get("options") or [])
+        if picked:
+            unresolved_selects.append(f"{g.get('name') or g.get('id') or '?'}={picked}")
+    return {
+        "checkboxes": unresolved_boxes[:12],
+        "radios": unresolved_radios[:12],
+        "selects": unresolved_selects[:12],
+        "total": len(unresolved_boxes) + len(unresolved_radios) + len(unresolved_selects),
+    }

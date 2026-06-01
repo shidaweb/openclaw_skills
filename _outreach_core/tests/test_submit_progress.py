@@ -171,6 +171,52 @@ class TestSubmitProgress(unittest.TestCase):
         ranked = sp.rank_submit_candidates(candidates, phase="final")
         self.assertEqual(ranked, [])
 
+    def test_pick_route_radio_action_prefers_b2b_option(self) -> None:
+        groups = [
+            {
+                "name": "route",
+                "label": "お問い合わせ対象",
+                "selected": False,
+                "options": [
+                    {"label": "お客様", "value": "customer", "checked": False},
+                    {"label": "法人（新規提案）", "value": "corp", "checked": False},
+                ],
+            }
+        ]
+        act = sp.pick_route_radio_action(groups)
+        self.assertIsNotNone(act)
+        self.assertEqual(act["name"], "route")
+        self.assertIn("法人", act["value"])
+
+    def test_summarize_remaining_submit_gates_lists_unresolved(self) -> None:
+        out = sp.summarize_remaining_submit_gates(
+            [{"name": "agree", "label": "個人情報の取扱いに同意", "checked": False, "required": True}],
+            [
+                {
+                    "name": "route",
+                    "selected": False,
+                    "options": [
+                        {"label": "お客様", "value": "customer"},
+                        {"label": "法人", "value": "corp"},
+                    ],
+                }
+            ],
+            [
+                {
+                    "name": "kind",
+                    "selected": False,
+                    "options": [
+                        {"label": "選択してください", "value": ""},
+                        {"label": "お取引・ご提案", "value": "biz"},
+                    ],
+                }
+            ],
+        )
+        self.assertGreater(out["total"], 0)
+        self.assertTrue(out["checkboxes"])
+        self.assertTrue(out["radios"])
+        self.assertTrue(out["selects"])
+
 
 if __name__ == "__main__":
     unittest.main()

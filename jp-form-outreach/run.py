@@ -1831,6 +1831,203 @@ def _auto_select_submit_selects() -> dict[str, Any]:
     }
 
 
+def _snapshot_submit_gates() -> dict[str, Any]:
+    boxes = _evaluate(_LIST_CHECKBOX_GATES_JS)
+    radios = _evaluate(_LIST_RADIO_GATES_JS)
+    selects = _evaluate(_LIST_SELECT_GATES_JS)
+    box_rows = boxes if isinstance(boxes, list) else []
+    radio_rows = radios if isinstance(radios, list) else []
+    select_rows = selects if isinstance(selects, list) else []
+    remaining = core_submit_progress.summarize_remaining_submit_gates(
+        box_rows,
+        radio_rows,
+        select_rows,
+    )
+    return {
+        "checkboxes": box_rows,
+        "radios": radio_rows,
+        "selects": select_rows,
+        "remaining": remaining,
+    }
+
+
+def _rescan_form_fields(target: dict[str, Any]) -> dict[str, Any]:
+    fresh = _evaluate(_FORM_FIELDS_JS) or {}
+    if isinstance(fresh, dict):
+        target["form_fields"] = fresh
+        if fresh.get("form_root_selector"):
+            target["form_root_selector"] = fresh["form_root_selector"]
+        return fresh
+    return target.get("form_fields") or {}
+
+
+def _route_choice_action(
+    target: dict[str, Any],
+    plan: dict[str, Any] | None,
+    gate_snapshot: dict[str, Any],
+) -> dict[str, str] | None:
+    overrides = target.get("field_map_overrides", {}) or {}
+    override_value = str(
+        overrides.get("route_radio")
+        or overrides.get("category_radio")
+        or ""
+    ).strip()
+    radios = gate_snapshot.get("radios") if isinstance(gate_snapshot, dict) else []
+    act = core_submit_progress.pick_route_radio_action(
+        radios if isinstance(radios, list) else [],
+        override_value=override_value or None,
+    )
+    if act:
+        return act
+    route_choice = (plan or {}).get("route_choice")
+    if isinstance(route_choice, dict):
+        name = str(route_choice.get("name") or "").strip()
+        value = str(route_choice.get("value") or "").strip()
+        if name and value:
+            return {"name": name, "value": value}
+    return None
+
+
+def _drive_enable_sequence(
+    target: dict[str, Any],
+    plan: dict[str, Any] | None,
+    *,
+    body: str = "",
+    stage: str,
+    trace_dir: Path | None = None,
+    max_steps: int = 4,
+) -> dict[str, Any]:
+    """Observe->act->re-observe loop for pre-form gate activation."""
+    flow = (
+        target.get("flow")
+        or (plan or {}).get("next_step")
+        or (target.get("_llm_plan") or {}).get("next_step")
+        or "single"
+    )
+    patterns = (
+        [r"入力内容を確認", r"送信内容を確認", r"内容(を|の)?確認", r"確認画面", r"確認する", r"^次へ$"]
+        if flow == "confirm"
+        else [r"送信する", r"^送信$", r"submit", r"内容を送信"]
+    )
+    plan_first = str((plan or {}).get("first_button_pattern") or "").strip()
+    if plan_first and plan_first not in patterns:
+        patterns.append(plan_first)
+    seq = list((plan or {}).get("enable_sequence") or [])
+    seq_idx = 0
+
+    applied: list[str] = []
+    for step in range(max(1, max_steps)):
+        click_state = _click_button(patterns, form_root_selector=target.get("form_root_selector"))
+        if click_state and click_state.get("clicked"):
+            return {
+                "clicked": True,
+                "steps": step + 1,
+                "click_res": click_state,
+                "applied": applied,
+                "remaining": {"total": 0, "checkboxes": [], "radios": [], "selects": []},
+            }
+
+        snap = _snapshot_submit_gates()
+        route = _route_choice_action(target, plan, snap)
+        changed = 0
+
+        if seq_idx < len(seq):
+            step_item = seq[seq_idx]
+            seq_idx += 1
+            if isinstance(step_item, dict):
+                action = str(step_item.get("action") or "").strip()
+                name = str(step_item.get("name") or "").strip()
+                value = str(step_item.get("value") or "").strip()
+                label = str(step_item.get("label") or "").strip()
+                if value == "__BODY__":
+                    value = "__BODY__"
+                if action == "RESCAN":
+                    _rescan_form_fields(target)
+                    changed += 1
+                    applied.append("seq:RESCAN")
+                elif action in ("select_radio", "select_option", "set_text", "click") and name:
+                    if action == "click":
+                        out = _click_button([value or r"確認|送信"], form_root_selector=target.get("form_root_selector"))
+                        if out and out.get("clicked"):
+                            return {
+                                "clicked": True,
+                                "steps": step + 1,
+                                "click_res": out,
+                                "applied": applied + [f"seq:click:{value or name}"],
+                                "remaining": {"total": 0, "checkboxes": [], "radios": [], "selects": []},
+                            }
+                    else:
+                        v = value if value != "__BODY__" else body
+                        out = _apply_field_action(name, action, v, selector=name[len("selector:"):] if name.startswith("selector:") else None)
+                        if out and out.get("ok"):
+                            changed += 1
+                            applied.append(f"seq:{action}:{name}")
+                            _rescan_form_fields(target)
+                            snap = _snapshot_submit_gates()
+                elif action == "check" and (name or label):
+                    out = _check_by_name(name) if name else None
+                    if not (out and out.get("ok")) and label:
+                        out = _check_by_label(label)
+                    if out and out.get("ok"):
+                        changed += 1
+                        applied.append(f"seq:check:{name or label}")
+                        _rescan_form_fields(target)
+                        snap = _snapshot_submit_gates()
+
+        if route:
+            out = _apply_field_action(route["name"], "select_radio", route["value"])
+            if out and out.get("ok"):
+                changed += 1
+                applied.append(f"route:{route['name']}={route['value']}")
+                _rescan_form_fields(target)
+                snap = _snapshot_submit_gates()
+
+        inquiry = _ensure_inquiry_type_action(target, plan or {}, stage=stage, trace_dir=trace_dir)
+        if int(inquiry.get("selected") or 0) > 0:
+            changed += int(inquiry.get("selected") or 0)
+            applied.append(f"inquiry:{int(inquiry.get('selected') or 0)}")
+            _rescan_form_fields(target)
+            snap = _snapshot_submit_gates()
+
+        gate = _auto_check_submit_gates()
+        radios = _auto_select_submit_radios()
+        selects = _auto_select_submit_selects()
+        gate_changed = (
+            int(gate.get("checked_count") or 0)
+            + int(radios.get("selected_count") or 0)
+            + int(selects.get("selected_count") or 0)
+        )
+        if gate_changed > 0:
+            changed += gate_changed
+            applied.append(
+                f"gates:cb={gate.get('checked_count',0)},r={radios.get('selected_count',0)},s={selects.get('selected_count',0)}"
+            )
+            _rescan_form_fields(target)
+            snap = _snapshot_submit_gates()
+
+        _emit_event(
+            "send.enable_sequence.step",
+            stage=stage,
+            target_id=str(target.get("id") or target.get("name") or ""),
+            payload={
+                "step": step + 1,
+                "changed": changed,
+                "remaining_total": int((snap.get("remaining") or {}).get("total") or 0),
+            },
+            trace_dir=trace_dir,
+        )
+        if changed <= 0:
+            break
+
+    last = _snapshot_submit_gates()
+    return {
+        "clicked": False,
+        "steps": max(1, max_steps),
+        "applied": applied,
+        "remaining": last.get("remaining") or {"total": 0, "checkboxes": [], "radios": [], "selects": []},
+    }
+
+
 def _click_button(patterns: list[str],
                    form_root_selector: str | None = None) -> dict[str, Any] | None:
     args = {"patterns": patterns, "formRootSelector": form_root_selector}
@@ -2210,6 +2407,55 @@ def _native_submit_diag(native: dict[str, Any] | None) -> str:
     )
 
 
+def _post_form_llm_gate_action(
+    target: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    stage: str,
+    trace_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Confirm-page LLM pass: detect remaining consent gates before final submit."""
+    _rescan_form_fields(target)
+    plan = _llm_analyze_form(
+        target,
+        config,
+        phase="confirm",
+        force_refresh=True,
+        escalation_reason="post_form_confirm",
+    )
+    if not isinstance(plan, dict):
+        return {"checked": 0, "plan": None}
+    checked = 0
+    for cb in plan.get("checkboxes_to_check") or []:
+        cb_name = ""
+        cb_label = ""
+        if isinstance(cb, dict):
+            cb_name = str(cb.get("name") or "").strip()
+            cb_label = str(cb.get("label") or "").strip()
+        else:
+            cb_name = str(cb or "").strip()
+            cb_label = cb_name
+        res = _check_by_name(cb_name) if cb_name else None
+        if not (res and res.get("ok")) and cb_label:
+            res = _check_by_label(cb_label)
+        if res and res.get("ok"):
+            checked += 1
+    _emit_event(
+        "send.post_form.plan",
+        stage=stage,
+        target_id=str(target.get("id") or target.get("name") or ""),
+        payload={
+            "checked_boxes": checked,
+            "has_submit_gate": bool(plan.get("submit_gate")),
+            "warnings": (plan.get("warnings") or [])[:4],
+        },
+        trace_dir=trace_dir,
+    )
+    if checked > 0:
+        _rescan_form_fields(target)
+    return {"checked": checked, "plan": plan}
+
+
 def _click_by_exact_text(text: str,
                           form_root_selector: str | None = None) -> dict[str, Any] | None:
     pat = "^" + re.escape(text).replace(r"\ ", r"\s*") + "$"
@@ -2441,6 +2687,13 @@ The draft body will be ≤ {body_max_chars} characters. Use placeholder `__BODY_
 ```json
 {form_fields_json}```
 
+### Phase
+{phase_hint}
+
+### Confirm-page button candidates (for final submit phase)
+```json
+{confirm_buttons_json}```
+
 ## Output schema (STRICT JSON)
 
 ```json
@@ -2452,6 +2705,22 @@ The draft body will be ≤ {body_max_chars} characters. Use placeholder `__BODY_
       "reason": "<short why>"}}
   ],
   "inquiry_type_no_b2b": false,
+  "route_choice": {{
+    "name": "<routing radio group name>",
+    "value": "<法人/企業/取引側の既存option>"
+  }},
+  "enable_sequence": [
+    {{"action": "select_radio" | "select_option" | "set_text" | "check" | "click" | "RESCAN",
+      "name": "<field name/id or selector:...>",
+      "value": "<value or __BODY__>",
+      "label": "<optional label hint>",
+      "reason": "<short why>"}}
+  ],
+  "submit_gate": {{
+    "blocked": true,
+    "reason": "<why button is disabled>",
+    "missing": ["<required gate hints>"]
+  }},
   "checkboxes_to_check": [
     "<element name or id>",
     {{"name": "<element name or id>", "label": "<exact visible label text>"}}
@@ -2495,6 +2764,9 @@ The draft body will be ≤ {body_max_chars} characters. Use placeholder `__BODY_
 21. If the form has multiple submit-like buttons, the FIRST one (e.g. "入力内容を確認する") goes in `first_button_pattern`
 22. If the flow is single-step (just one Send button), set next_step="single", else "confirm"
 23. Add warnings for tricky cases (e.g. "postal code lookup may overwrite city field — fill postal LAST")
+24. For pre-form phase, emit route_choice and enable_sequence in the order needed to activate confirm/send button.
+25. If selecting route/category can change options/required fields, include RESCAN between steps.
+26. For final-confirm phase, prioritize is_submit_type && in_form candidates; if uncertain, leave text empty.
 
 Output the JSON only, no prose."""
 
@@ -2504,6 +2776,7 @@ def _llm_analyze_form(
     config: dict[str, Any],
     body_max_chars: int = 400,
     *,
+    phase: str = "prefill",
     force_refresh: bool = False,
     escalation_reason: str | None = None,
 ) -> dict[str, Any] | None:
@@ -2513,7 +2786,7 @@ def _llm_analyze_form(
     """
     selected_model = _form_analyzer_base_model(config)
     plan_meta = target.get("_llm_plan_meta") or {}
-    if target.get("_llm_plan") and not force_refresh:
+    if target.get("_llm_plan") and not force_refresh and phase == "prefill":
         cached_model = str(plan_meta.get("model") or "")
         if (not cached_model) or cached_model == selected_model:
             return target["_llm_plan"]
@@ -2528,23 +2801,36 @@ def _llm_analyze_form(
     sender = config.get("sender", {})
     overrides = target.get("field_map_overrides", {}) or {}
 
+    if phase == "confirm":
+        phase_hint = "final-confirm phase: identify final submit and remaining consent gates."
+        confirm_buttons = _enumerate_buttons(
+            form_root_selector=target.get("form_root_selector"),
+            filled_names=_filled_name_hints(target),
+        )
+    else:
+        phase_hint = "prefill phase: produce B2B-safe fill + enable sequence."
+        confirm_buttons = []
+
     prompt = _FORM_ANALYZER_PROMPT_TEMPLATE.format(
         sender_yaml=yaml.safe_dump(sender, allow_unicode=True, sort_keys=False),
         overrides_yaml=yaml.safe_dump(overrides, allow_unicode=True, sort_keys=False) if overrides else "{}\n",
         body_max_chars=body_max_chars,
         form_fields_json=json.dumps(form_fields, ensure_ascii=False, indent=2),
+        phase_hint=phase_hint,
+        confirm_buttons_json=json.dumps(confirm_buttons[:30], ensure_ascii=False, indent=2),
     )
 
     response = oc_infer(prompt, model=selected_model)
     plan = extract_first_json(response or "")
     if not plan or "fields" not in plan:
         return None
-    target["_llm_plan"] = plan
-    target["_llm_plan_meta"] = {
-        "model": selected_model,
-        "escalation_reason": escalation_reason or "",
-        "updated_at": datetime.utcnow().isoformat() + "Z",
-    }
+    if phase == "prefill":
+        target["_llm_plan"] = plan
+        target["_llm_plan_meta"] = {
+            "model": selected_model,
+            "escalation_reason": escalation_reason or "",
+            "updated_at": datetime.utcnow().isoformat() + "Z",
+        }
     return plan
 
 
@@ -3203,6 +3489,9 @@ def fill_form_for_target(
                 "checkboxes_count": len(plan.get("checkboxes_to_check") or []),
                 "flow": plan.get("next_step"),
                 "model": plan_model,
+                "has_route_choice": bool(plan.get("route_choice")),
+                "enable_steps": len(plan.get("enable_sequence") or []),
+                "has_submit_gate": bool(plan.get("submit_gate")),
             },
             trace_dir=trace_dir,
         )
@@ -3922,7 +4211,10 @@ def _deep_submit(
         patterns = [r"送信する", r"^送信$", r"submit", r"内容を送信"]
     if plan.get("first_button_pattern"):
         patterns = patterns + [plan["first_button_pattern"]]
-    cr = _click_button_with_gate_retry(patterns, form_root_selector=d.get("form_root_selector"))
+    drive = _drive_enable_sequence(d, plan, body=sanitized_body, stage="send", trace_dir=trace, max_steps=4)
+    cr = (drive.get("click_res") or {}) if drive.get("clicked") else None
+    if not cr:
+        cr = _click_button_with_gate_retry(patterns, form_root_selector=d.get("form_root_selector"))
     if not cr or not cr.get("clicked"):
         buttons = _enumerate_buttons(
             form_root_selector=d.get("form_root_selector"),
@@ -3949,6 +4241,12 @@ def _deep_submit(
             r"上記の内容で送信", r"submit", r"完了", r"確定", r"問い合わせを送信",
         ])
         if not c2 or not c2.get("clicked"):
+            post = _post_form_llm_gate_action(d, config or {}, stage="send", trace_dir=trace)
+            if int(post.get("checked") or 0) > 0:
+                c2 = _click_button_with_gate_retry([
+                    r"^送信する$", r"^送信$", r"この内容で送信", r"内容を送信する",
+                    r"上記の内容で送信", r"submit", r"完了", r"確定", r"問い合わせを送信",
+                ], form_root_selector=d.get("form_root_selector"))
             buttons = _enumerate_buttons(
                 form_root_selector=d.get("form_root_selector"),
                 filled_names=_filled_name_hints(d),
@@ -4279,11 +4577,32 @@ def stage_send(
         plan_first = plan.get("first_button_pattern")
         if plan_first and plan_first not in patterns:
             patterns = patterns + [plan_first]
-
-        click_res = _click_button_with_gate_retry(
-            patterns,
-            form_root_selector=d.get("form_root_selector"),
+        drive = _drive_enable_sequence(
+            d,
+            plan,
+            body=send_body,
+            stage="send",
+            trace_dir=trace,
+            max_steps=4,
         )
+        click_res = (drive.get("click_res") or {}) if drive.get("clicked") else None
+        if click_res:
+            click_res["enable_steps"] = int(drive.get("steps") or 0)
+            _emit_event(
+                "send.enable_sequence.completed",
+                stage="send",
+                target_id=tid,
+                payload={
+                    "steps": int(drive.get("steps") or 0),
+                    "applied": (drive.get("applied") or [])[:8],
+                },
+                trace_dir=trace,
+            )
+        if not click_res:
+            click_res = _click_button_with_gate_retry(
+                patterns,
+                form_root_selector=d.get("form_root_selector"),
+            )
         first_native: dict[str, Any] | None = None
         first_noise_only = False
         if not click_res or not click_res.get("clicked"):
@@ -4349,6 +4668,7 @@ def stage_send(
                     "native_submit_method": (first_native or {}).get("method"),
                     "native_submit_reason": (first_native or {}).get("reason"),
                     "noise_only_candidates": first_noise_only,
+                    "remaining_gate_total": int((drive.get("remaining") or {}).get("total") or 0),
                 },
                 trace_dir=trace,
             )
@@ -4356,10 +4676,13 @@ def stage_send(
             if cur_tab_id:
                 resolver_tab_ids.add(cur_tab_id)
             _queue_for_resolver(
-                d, "first_submit_not_found",
+                d,
+                "submit_gate_unsatisfied" if int((drive.get("remaining") or {}).get("total") or 0) > 0 else "first_submit_not_found",
                 (
                     f"first submit button not found (flow={flow}); "
-                    f"noise_only_candidates={first_noise_only}; {_native_submit_diag(first_native)}"
+                    f"noise_only_candidates={first_noise_only}; "
+                    f"remaining_gates={json.dumps((drive.get('remaining') or {}), ensure_ascii=False)[:240]}; "
+                    f"{_native_submit_diag(first_native)}"
                 ),
                 trace=trace, autonomous=autonomous, tab_id=cur_tab_id,
             )
@@ -4404,6 +4727,20 @@ def stage_send(
             final_noise_only = False
             if not click2 or not click2.get("clicked"):
                 print(f"  [send] ⚠ final submit not matched by patterns — falling back to LLM picker")
+                post = _post_form_llm_gate_action(
+                    d,
+                    config or {},
+                    stage="send",
+                    trace_dir=trace,
+                )
+                if int(post.get("checked") or 0) > 0:
+                    click2 = _click_button_with_gate_retry([
+                        r"^送信する$", r"^送信$", r"この内容で送信",
+                        r"内容を送信する", r"上記の内容で送信", r"^回答送信$",
+                        r"^送る$", r"submit", r"完了", r"確定",
+                        r"内容で.*送信", r"^以上の内容", r"内容を以上で",
+                        r"上記内容を送信", r"問い合わせを送信", r"お問い合わせを送信",
+                    ], form_root_selector=d.get("form_root_selector"))
                 buttons = _enumerate_buttons(
                     form_root_selector=d.get("form_root_selector"),
                     filled_names=_filled_name_hints(d),

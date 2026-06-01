@@ -245,6 +245,43 @@ class TestInquiryTypeSelect(unittest.TestCase):
         self.assertTrue(out.get("clicked"))
         self.assertEqual(out.get("method"), "requestSubmit")
 
+    def test_drive_enable_sequence_returns_unsatisfied_with_remaining_gates(self) -> None:
+        target = {"id": 1, "name": "Acme", "form_root_selector": None, "flow": "confirm", "form_fields": {}}
+        plan = {"next_step": "confirm", "enable_sequence": []}
+        with (
+            patch.object(self.run_mod, "_click_button", return_value={"clicked": False, "found_but_disabled": True}),
+            patch.object(
+                self.run_mod,
+                "_snapshot_submit_gates",
+                return_value={"remaining": {"total": 2, "checkboxes": ["同意"], "radios": ["route=法人"], "selects": []}, "radios": []},
+            ),
+            patch.object(self.run_mod, "_route_choice_action", return_value=None),
+            patch.object(self.run_mod, "_ensure_inquiry_type_action", return_value={"selected": 0}),
+            patch.object(self.run_mod, "_auto_check_submit_gates", return_value={"checked_count": 0}),
+            patch.object(self.run_mod, "_auto_select_submit_radios", return_value={"selected_count": 0}),
+            patch.object(self.run_mod, "_auto_select_submit_selects", return_value={"selected_count": 0}),
+            patch.object(self.run_mod, "_emit_event"),
+        ):
+            out = self.run_mod._drive_enable_sequence(target, plan, stage="send", max_steps=2)
+        self.assertFalse(out.get("clicked"))
+        self.assertEqual((out.get("remaining") or {}).get("total"), 2)
+
+    def test_post_form_llm_gate_action_checks_checkbox_from_plan(self) -> None:
+        target = {"id": 1, "name": "Acme", "form_fields": {}}
+        with (
+            patch.object(self.run_mod, "_rescan_form_fields", return_value={}),
+            patch.object(
+                self.run_mod,
+                "_llm_analyze_form",
+                return_value={"checkboxes_to_check": [{"name": "", "label": "個人情報の取扱いに同意"}], "submit_gate": {"blocked": True}},
+            ),
+            patch.object(self.run_mod, "_check_by_name", return_value={"ok": False}),
+            patch.object(self.run_mod, "_check_by_label", return_value={"ok": True}),
+            patch.object(self.run_mod, "_emit_event"),
+        ):
+            out = self.run_mod._post_form_llm_gate_action(target, {}, stage="send")
+        self.assertEqual(out.get("checked"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
