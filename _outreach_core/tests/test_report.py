@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import unittest
 
 from _outreach_core.helpers.report import (
+    inquiry_type_summary,
     _skip_reason_bucket,
     autonomous_summary,
     period_bounds,
@@ -171,6 +172,39 @@ class TestResearchQualitySummary(unittest.TestCase):
         self.assertEqual(summary["sent_successes"], 1)
         self.assertAlmostEqual(summary["wrong_url_rate"], round(1 / 3, 4))
         self.assertEqual(summary["non_contact_by_kind"]["recruit"], 1)
+
+
+class TestInquiryTypeSummary(unittest.TestCase):
+    def test_counts_confidence_source_and_no_b2b(self):
+        events = [
+            {
+                "kind": "send.inquiry_type",
+                "payload": {"confidence": "high", "src": "llm"},
+            },
+            {
+                "kind": "send.inquiry_type",
+                "payload": {"confidence": "low", "src": "fallback"},
+            },
+            {
+                "kind": "enrich.inquiry_type_selected",
+                "payload": {
+                    "confidence_counts": {"high": 2, "low": 1},
+                    "src_counts": {"llm": 1, "fallback": 2},
+                },
+            },
+            {
+                "kind": "enrich.form.screen_skipped",
+                "payload": {"reason": "no_b2b_inquiry_type"},
+            },
+        ]
+        s = inquiry_type_summary(events)
+        self.assertEqual(s["selected_send"], 2)
+        self.assertEqual(s["selected_enrich"], 1)
+        self.assertEqual(s["no_b2b_inquiry_type"], 1)
+        self.assertEqual(s["confidence_counts"]["high"], 3)
+        self.assertEqual(s["confidence_counts"]["low"], 2)
+        self.assertEqual(s["source_counts"]["llm"], 2)
+        self.assertEqual(s["source_counts"]["fallback"], 3)
 
 
 if __name__ == "__main__":

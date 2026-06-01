@@ -663,7 +663,7 @@ def stage_enrich(
 
         inquiry_fields = _extract_inquiry_type_fields(fields)
         if inquiry_fields:
-            llm_no_b2b = False
+            probe_plan = None
             if config:
                 probe = {
                     "id": t_work.get("id"),
@@ -672,12 +672,21 @@ def stage_enrich(
                     "field_map_overrides": t_work.get("field_map_overrides", {}) or {},
                 }
                 probe_plan = _llm_analyze_form(probe, config, body_max_chars=400)
-                llm_no_b2b = bool((probe_plan or {}).get("inquiry_type_no_b2b"))
-            fallback_no_b2b = all(
-                core_submit_progress.choose_b2b_option(f.get("options") or []) is None
-                for f in inquiry_fields
-            )
-            if llm_no_b2b or fallback_no_b2b:
+            sel = _summarize_inquiry_type_selection(inquiry_fields, probe_plan)
+            if sel["count"] > 0:
+                _emit_event(
+                    "enrich.inquiry_type_selected",
+                    stage="enrich",
+                    target_id=str(t_work.get("id") or ""),
+                    payload={
+                        "count": sel["count"],
+                        "items": sel["items"],
+                        "confidence_counts": sel["confidence_counts"],
+                        "src_counts": sel["src_counts"],
+                    },
+                )
+            llm_no_b2b, fallback_no_b2b, no_b2b = _inquiry_type_no_b2b_flags(inquiry_fields, probe_plan)
+            if no_b2b:
                 reason = "no_b2b_inquiry_type"
                 print(
                     f"[enrich] ({i}/{len(targets)}) {t_work.get('name')}: "
@@ -2485,6 +2494,63 @@ def _extract_inquiry_type_fields(form_fields: dict[str, Any]) -> list[dict[str, 
         if field["name"] and core_submit_progress.is_inquiry_type_field(field):
             out.append(field)
     return out
+
+
+def _inquiry_type_no_b2b_flags(
+    inquiry_fields: list[dict[str, Any]],
+    probe_plan: dict[str, Any] | None = None,
+) -> tuple[bool, bool, bool]:
+    llm_no_b2b = bool((probe_plan or {}).get("inquiry_type_no_b2b"))
+    fallback_no_b2b = bool(inquiry_fields) and all(
+        core_submit_progress.choose_b2b_option(f.get("options") or []) is None
+        for f in inquiry_fields
+    )
+    return llm_no_b2b, fallback_no_b2b, bool(llm_no_b2b or fallback_no_b2b)
+
+
+def _summarize_inquiry_type_selection(
+    inquiry_fields: list[dict[str, Any]],
+    probe_plan: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    items: list[dict[str, Any]] = []
+    for field in inquiry_fields:
+        name = str(field.get("name") or "").strip()
+        action = str(field.get("kind") or "")
+        if not name or not action:
+            continue
+        options = field.get("options") or []
+        llm_entry = _plan_entry_for_name(probe_plan or {}, name, action) if probe_plan else None
+        llm_value = str((llm_entry or {}).get("value") or "").strip()
+        if llm_value and core_submit_progress.validate_choice(options, llm_value):
+            fallback = core_submit_progress.choose_b2b_option(options)
+            conf = "high"
+            if fallback and str(fallback.get("value") or "") and str(fallback.get("value")) != llm_value:
+                conf = "low"
+            items.append({"name": name, "value": llm_value[:120], "src": "llm", "confidence": conf})
+            continue
+        fallback = core_submit_progress.choose_b2b_option(options)
+        if fallback:
+            items.append(
+                {
+                    "name": name,
+                    "value": str(fallback.get("value") or "")[:120],
+                    "src": "fallback",
+                    "confidence": str(fallback.get("confidence") or "low"),
+                }
+            )
+    conf_counts = {"high": 0, "low": 0}
+    src_counts = {"llm": 0, "fallback": 0}
+    for it in items:
+        if it["confidence"] in conf_counts:
+            conf_counts[it["confidence"]] += 1
+        if it["src"] in src_counts:
+            src_counts[it["src"]] += 1
+    return {
+        "count": len(items),
+        "items": items[:8],
+        "confidence_counts": conf_counts,
+        "src_counts": src_counts,
+    }
 
 
 def _plan_entry_for_name(plan: dict[str, Any], name: str, action: str) -> dict[str, Any] | None:

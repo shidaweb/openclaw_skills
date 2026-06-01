@@ -312,6 +312,40 @@ def autonomous_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def inquiry_type_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarise v10 inquiry-type auto-selection quality/volume."""
+    send_selected = [e for e in events if e.get("kind") == "send.inquiry_type"]
+    enrich_selected = [e for e in events if e.get("kind") == "enrich.inquiry_type_selected"]
+    no_b2b = [
+        e for e in events
+        if e.get("kind") == "enrich.form.screen_skipped"
+        and str((e.get("payload") or {}).get("reason") or "") == "no_b2b_inquiry_type"
+    ]
+    conf = Counter()
+    src = Counter()
+    for e in send_selected:
+        p = e.get("payload") or {}
+        c = str(p.get("confidence") or "").strip().lower()
+        s = str(p.get("src") or "").strip().lower()
+        if c:
+            conf[c] += 1
+        if s:
+            src[s] += 1
+    for e in enrich_selected:
+        p = e.get("payload") or {}
+        for k, v in ((p.get("confidence_counts") or {}).items()):
+            conf[str(k)] += int(v or 0)
+        for k, v in ((p.get("src_counts") or {}).items()):
+            src[str(k)] += int(v or 0)
+    return {
+        "selected_send": len(send_selected),
+        "selected_enrich": len(enrich_selected),
+        "no_b2b_inquiry_type": len(no_b2b),
+        "confidence_counts": dict(conf.most_common()),
+        "source_counts": dict(src.most_common()),
+    }
+
+
 def cmd_send_funnel(args: argparse.Namespace) -> int:
     data_dir = _skill_data_dir(args.skill, getattr(args, "brief", None))
     since = parse_since(args.since)
@@ -363,6 +397,21 @@ def cmd_send_funnel(args: argparse.Namespace) -> int:
         lines.append(f"- auto-skipped: {auto['auto_skipped']}")
         for reason, n in auto["skip_reasons"].items():
             lines.append(f"    · {reason}: {n}")
+        lines.append("")
+
+    iq = inquiry_type_summary(events)
+    if iq["selected_send"] or iq["selected_enrich"] or iq["no_b2b_inquiry_type"]:
+        lines.append("## inquiry type (v10)")
+        lines.append(
+            f"- selected: send={iq['selected_send']} / enrich={iq['selected_enrich']}"
+        )
+        lines.append(f"- no_b2b_inquiry_type: {iq['no_b2b_inquiry_type']}")
+        if iq["confidence_counts"]:
+            parts = ", ".join(f"{k}:{v}" for k, v in iq["confidence_counts"].items())
+            lines.append(f"- confidence: {parts}")
+        if iq["source_counts"]:
+            parts = ", ".join(f"{k}:{v}" for k, v in iq["source_counts"].items())
+            lines.append(f"- source: {parts}")
         lines.append("")
 
     if not kinds and not auto.get("active"):

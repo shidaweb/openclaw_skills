@@ -157,6 +157,25 @@ class TestInquiryTypeSelect(unittest.TestCase):
         self.assertTrue(cs.called)
         self.assertFalse(ct.called)
 
+    def test_inquiry_type_no_b2b_flags_true_when_llm_or_fallback_true(self) -> None:
+        inquiry_fields = [
+            {
+                "name": "kind",
+                "kind": "select_option",
+                "options": [
+                    {"label": "個人のお客様", "value": "personal"},
+                    {"label": "採用", "value": "recruit"},
+                ],
+            }
+        ]
+        llm, fallback, no_b2b = self.run_mod._inquiry_type_no_b2b_flags(
+            inquiry_fields,
+            {"inquiry_type_no_b2b": True},
+        )
+        self.assertTrue(llm)
+        self.assertTrue(no_b2b)
+        self.assertTrue(fallback)
+
 
 if __name__ == "__main__":
     unittest.main()
