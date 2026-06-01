@@ -605,7 +605,7 @@ browser:
 
 #### B-3. 自己紹介段のバリエーション増（30 分）
 
-**現状**: 全 11 件の自己紹介段が「株式会社トラーナの志田と申します。オンライン診療 MDOnline ... ソニーグローバルエデュケーション ...」のほぼコピペ。
+**現状**: 全 11 件の自己紹介段が「サンプル株式会社の山田と申します。オンライン診療 MDOnline ... ソニーグローバルエデュケーション ...」のほぼコピペ。
 
 **修正**: `prompts/examples.md` の末尾に **新セクション「自己紹介 5 バリエーション」**を追加:
 
@@ -1085,26 +1085,26 @@ brief:
   display_name: "トラーナ — LINE×CRM コンサル"
   active_since: "2026-05-26"
   notes: |
-    志田典道（相談役）のメイン業務。
+    山田太郎（相談役）のメイン業務。
 
 sender:
-  name: "志田典道"
+  name: "山田太郎"
   name_kana: "シダノリミツ"
   name_furigana: "しだのりみつ"
   role: "相談役"
-  company: "株式会社トラーナ"
+  company: "サンプル株式会社"
   company_short: "トラーナ"
-  email: "shida@torana.co.jp"
-  phone: "09016501629"
-  phone_hyphenated: "090-1650-1629"
+  email: "you@example.com"
+  phone: "0312345678"
+  phone_hyphenated: "03-1234-5678"
   postal_code: "260-0003"
   postal_code_no_hyphen: "2600003"
-  prefecture: "千葉県"
-  city: "千葉市中央区"
-  address_line: "鶴沢町20-16"
-  building: "ユニバース千葉ビル1階"
-  full_address: "千葉県千葉市中央区鶴沢町20-16 ユニバース千葉ビル1階"
-  calendar_url: "https://tenbin.link/book/u-1302066f5d4f/torana-norimitsu-shida"
+  prefecture: "東京都"
+  city: "千代田区"
+  address_line: "1-1-1"
+  building: "サンプルビル1階"
+  full_address: "東京都千代田区1-1-1 サンプルビル1階"
+  calendar_url: "https://example.com/your-booking-url"
   founded_year_month: "2015年3月"
   annual_revenue_band: "5億円"
   employee_count_band: "10名"
@@ -1419,7 +1419,7 @@ Doorman の brief を作成します。10 問くらい聞きますね。
 1) あなたの会社名は？
 ```
 
-ユーザー: 「株式会社トラーナ」
+ユーザー: 「サンプル株式会社」
 
 エージェント:
 

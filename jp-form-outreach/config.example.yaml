@@ -9,43 +9,39 @@
 # across runs gives ~95% prompt cache hits and minimal Claude credit usage.
 
 sender:
-  name: "志田典道"
-  name_kana: "シダノリミツ"
-  name_furigana: "しだのりみつ"
-  role: "相談役"           # 役職名 used in form 役職 fields
-  company: "株式会社トラーナ"
-  company_short: "トラーナ"
-  email: "shida@torana.co.jp"
-  phone: "09016501629"      # No hyphens (most JP forms accept either)
-  phone_hyphenated: "090-1650-1629"
-  postal_code: "260-0003"   # ハイフンあり
-  postal_code_no_hyphen: "2600003"
-  prefecture: "千葉県"
-  city: "千葉市中央区"
-  address_line: "鶴沢町20-16"
-  building: "ユニバース千葉ビル1階"
-  full_address: "千葉県千葉市中央区鶴沢町20-16 ユニバース千葉ビル1階"
-  calendar_url: "https://tenbin.link/book/u-1302066f5d4f/torana-norimitsu-shida"
-  founded_year_month: "2018年04月"   # for forms requiring 設立年月 (e.g. 北の達人)
+  name: "山田 太郎"
+  name_kana: "ヤマダタロウ"
+  name_furigana: "やまだたろう"
+  role: "代表"             # 役職名 used in form 役職 fields
+  company: "サンプル株式会社"
+  company_short: "サンプル"
+  email: "you@example.com"
+  phone: "0312345678"       # No hyphens (most JP forms accept either)
+  phone_hyphenated: "03-1234-5678"
+  postal_code: "100-0001"   # ハイフンあり
+  postal_code_no_hyphen: "1000001"
+  prefecture: "東京都"
+  city: "千代田区"
+  address_line: "1-1-1"
+  building: "サンプルビル1階"
+  full_address: "東京都千代田区1-1-1 サンプルビル1階"
+  calendar_url: "https://example.com/your-booking-url"
+  founded_year_month: "2020年04月"   # for forms requiring 設立年月
   annual_revenue_band: "1〜3億円"   # for 年商 fields
   employee_count_band: "1〜9名"     # for 従業員数 fields
 
 # What you're selling / why you're reaching out.
 pitch:
-  one_liner: "LINE公式アカウント運用×CRMコンサルを提供しております"
+  one_liner: "（あなたの商材を1文で。例：◯◯運用×CRMコンサルを提供しております）"
   problem: |
-    日本企業のLINE公式アカウントは、運用が「友達追加クーポン止まり」または
-    CS対応に偏重しており、購買頻度向上やLTV最大化、ライフサイクル別シナリオ
-    配信などCRM視点の運用設計ができていないケースが多い。
+    （見込み客が抱えがちな課題を2〜3行で。固有名詞は入れない。）
   solution: |
-    LINE公式アカウントを「売上ドライバー」として機能させる設計（セグメント
-    配信／解約予兆検知／クロスセル動線／本部×店舗の二層運用／メール・アプリ
-    通知との補完関係設計など）を、業界特性に合わせて支援する。
+    （あなたの解決策を2〜3行で。どの業界のどんな論点に効くかを簡潔に。）
   proof_points:
-    - "ソニーグローバルエデュケーション様（こども向け学習領域）のCRM支援実績"
-    - "オンライン診療MDOnline創業者として医療系CRMの設計知見"
-    - "教育・ヘルスケア・D2C・メディアなど業界横断の継続率改善ノウハウ"
-  call_to_action: "30分のオンラインでご相談いただけませんでしょうか。\nご都合よろしければ：https://tenbin.link/book/u-1302066f5d4f/torana-norimitsu-shida"
+    - "（実績・事例1：自社の実クライアント／領域に置き換える）"
+    - "（実績・事例2）"
+    - "（実績・事例3）"
+  call_to_action: "30分のオンラインでご相談いただけませんでしょうか。\nご都合よろしければ：https://example.com/your-booking-url"
 
 # 想定ターゲットペルソナ。LLMがどう該当するかを判断する材料。
 target_persona:

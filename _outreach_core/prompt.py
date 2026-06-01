@@ -12,6 +12,18 @@ except ImportError:
     yaml = None  # type: ignore
 
 
+def _prefer_local(prompts_dir: Path, name: str) -> Path:
+    """Prefer a gitignored per-client override (e.g. system_persona.local.md) over
+    the shared, neutral template that ships in git. This is how each client keeps
+    its OWN persona / few-shot examples (sender identity, case studies, calendar
+    URL) locally without ever committing them. Falls back to the shared file."""
+    stem, _, ext = name.rpartition(".")
+    local = prompts_dir / f"{stem}.local.{ext}"
+    if local.is_file():
+        return local
+    return prompts_dir / name
+
+
 def resolve_prompts_dir(skill_dir: Path, config: dict[str, Any]) -> Path:
     """Skill default prompts, or brief-specific override from prompts_overrides."""
     overrides = config.get("prompts_overrides") or {}
@@ -30,8 +42,8 @@ def build_system_block(config: dict[str, Any], prompts_dir: Path) -> str:
     """
     if yaml is None:
         raise RuntimeError("pyyaml required for build_system_block")
-    persona_path = prompts_dir / "system_persona.md"
-    examples_path = prompts_dir / "examples.md"
+    persona_path = _prefer_local(prompts_dir, "system_persona.md")
+    examples_path = _prefer_local(prompts_dir, "examples.md")
     if not persona_path.is_file():
         raise FileNotFoundError(persona_path)
     persona = persona_path.read_text(encoding="utf-8")

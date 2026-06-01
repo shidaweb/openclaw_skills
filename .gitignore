@@ -62,6 +62,14 @@ data/run_supervisor.json
 **/*.backup.*
 linkedin-outreach/loop_until_10.sh
 
+# --- Per-client local overrides (distribution: keep client identity out of git) ---
+# Real persona / few-shot examples with sender identity, case studies, calendar URL.
+# Ship only the neutral templates (system_persona.md / examples.md); each client
+# keeps its tuned copy as *.local.md (loader prefers it automatically).
+**/prompts/*.local.md
+# Active-brief pointer is per-client (which brief this install runs).
+briefs/_active.txt
+
 # --- Local-only operational assets (never commit) ---
 # API keys / tokens / local env
 .env

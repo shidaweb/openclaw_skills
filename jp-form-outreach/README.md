@@ -129,7 +129,7 @@ python run.py send --ids 1,2,3 --no-confirm    # fill-only, manual click
 - Auto-detect form flow on first enrich (currently you encode it in
   targets.yaml manually)
 - iframe handlers for common form hosts (BowNow, kintone)
-- Reply detection from `shida@torana.co.jp` inbox
+- Reply detection from `you@example.com` inbox
 - Slack approval flow
 
 ## State files
