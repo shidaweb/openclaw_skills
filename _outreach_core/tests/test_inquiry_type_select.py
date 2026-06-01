@@ -124,6 +124,39 @@ class TestInquiryTypeSelect(unittest.TestCase):
             diag = self.run_mod.fill_form_with_plan(plan, "body", target=None, evaluate_fn=lambda _js: {})
         self.assertTrue(any(x.startswith("checkbox:") for x in diag.get("filled") or []))
 
+    def test_apply_plan_entry_accepts_selector_only_field(self) -> None:
+        diag = {"filled": [], "errors": [], "skipped": []}
+        entry = {
+            "name": "",
+            "selector": "form > input[type='text']",
+            "action": "set_text",
+            "value": "abc",
+        }
+        with patch.object(self.run_mod, "_apply_field_action", return_value={"ok": True, "value": "abc"}) as ap:
+            ok = self.run_mod._apply_plan_entry(entry, "body", diag)
+        self.assertTrue(ok)
+        self.assertTrue(ap.called)
+
+    def test_llm_click_submit_prefers_selector_click(self) -> None:
+        buttons = [{"text": "入力内容を確認する", "selector": "button.confirm"}]
+        with (
+            patch.object(
+                self.run_mod,
+                "_llm_pick_final_submit",
+                return_value={"text": "入力内容を確認する", "selector": "button.confirm"},
+            ),
+            patch.object(
+                self.run_mod,
+                "_click_by_selector",
+                return_value={"clicked": True, "text": "入力内容を確認する"},
+            ) as cs,
+            patch.object(self.run_mod, "_click_by_exact_text", return_value=None) as ct,
+        ):
+            out = self.run_mod._llm_click_submit_candidate(buttons, {}, phase="final")
+        self.assertTrue(out and out.get("clicked"))
+        self.assertTrue(cs.called)
+        self.assertFalse(ct.called)
+
 
 if __name__ == "__main__":
     unittest.main()

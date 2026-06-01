@@ -2037,17 +2037,33 @@ _FINAL_SUBMIT_PICKER_PROMPT = """あなたは日本語B2B問い合わせフォ�
 ## ボタン一覧（JSON）
 {buttons_json}
 
+## クリック対象フェーズ
+{phase_hint}
+
 ## 出力（JSONのみ）
 {{"text": "<選んだボタンの text（不明なら空）>", "selector": "<選んだボタンの selector（不明なら空）>", "reason": "<簡潔な根拠>"}}
 """
 
 
 def _llm_pick_final_submit(buttons: list[dict[str, Any]],
-                            config: dict[str, Any]) -> dict[str, Any] | None:
+                            config: dict[str, Any],
+                            *,
+                            phase: str = "final") -> dict[str, Any] | None:
     if not buttons:
         return None
+    if phase == "first":
+        phase_hint = (
+            "first: 入力画面で「確認画面へ進む/入力内容を確認する」等を選ぶ。"
+            " 「送信する」は通常この段階では押さない。"
+        )
+    else:
+        phase_hint = (
+            "final: 確認画面で「送信する/上記の内容で送信/問い合わせを送信」等の最終確定のみ。"
+            " 「入力内容を確認する/修正する/戻る」は選ばない。"
+        )
     prompt = _FINAL_SUBMIT_PICKER_PROMPT.format(
         buttons_json=json.dumps(buttons, ensure_ascii=False, indent=2),
+        phase_hint=phase_hint,
     )
     model_cfg = config.get("model", {}) or {}
     model = model_cfg.get("form_analyzer_name") or model_cfg.get("name", DEFAULT_MODEL)
@@ -2116,8 +2132,9 @@ def _llm_click_submit_candidate(
     config: dict[str, Any],
     *,
     form_root_selector: str | None = None,
+    phase: str = "final",
 ) -> dict[str, Any] | None:
-    pick = _llm_pick_final_submit(buttons, config or {})
+    pick = _llm_pick_final_submit(buttons, config or {}, phase=phase)
     if not pick:
         return None
     selector = str(pick.get("selector") or "").strip()
@@ -2172,6 +2189,7 @@ The draft body will be ≤ {body_max_chars} characters. Use placeholder `__BODY_
   "fields": [
     {{"name": "<element name or id>", "action": "set_text" | "select_option" | "select_radio" | "skip",
       "value": "<value to set, or __BODY__ for the message body>",
+      "selector": "<optional CSS selector when name/id is unavailable>",
       "reason": "<short why>"}}
   ],
   "inquiry_type_no_b2b": false,
@@ -2212,10 +2230,12 @@ The draft body will be ≤ {body_max_chars} characters. Use placeholder `__BODY_
     via {{"name":"", "label":"..."}}.
 17. For optional fields like FAX, ニュースレター, 当社をどこで知ったか when no override: action="skip"
 18. For 従業員数 select with override.employee_count_required: use sender.employee_count_band
-19. Prefer `name` attribute as the field identifier; fall back to `id`
-20. If the form has multiple submit-like buttons, the FIRST one (e.g. "入力内容を確認する") goes in `first_button_pattern`
-21. If the flow is single-step (just one Send button), set next_step="single", else "confirm"
-22. Add warnings for tricky cases (e.g. "postal code lookup may overwrite city field — fill postal LAST")
+19. Prefer `name` as the field identifier; fall back to `id`.
+    If neither exists, use "name": "selector:<css>" AND set `selector` to the same CSS selector.
+20. Never emit pseudo placeholders (e.g. "<sender.name>", "<field>", "<name>") in `name`.
+21. If the form has multiple submit-like buttons, the FIRST one (e.g. "入力内容を確認する") goes in `first_button_pattern`
+22. If the flow is single-step (just one Send button), set next_step="single", else "confirm"
+23. Add warnings for tricky cases (e.g. "postal code lookup may overwrite city field — fill postal LAST")
 
 Output the JSON only, no prose."""
 
@@ -2393,7 +2413,11 @@ _CHECK_BY_LABEL_JS = r"""
 def _apply_field_action(
     name: str, action: str, value: str, selector: str | None = None
 ) -> dict[str, Any] | None:
-    args = {"name": name, "action": action, "value": value, "selector": selector or ""}
+    n = str(name or "")
+    s = str(selector or "")
+    if n.startswith("selector:") and not s:
+        s = n[len("selector:"):]
+    args = {"name": n, "action": action, "value": value, "selector": s}
     js = f"""
     (() => {{
       const fn = {_APPLY_PLAN_FIELD_JS};
@@ -2682,11 +2706,15 @@ def _apply_plan_entry(
 ) -> bool:
     """Apply one plan field entry. Returns True on success."""
     BODY_TOKEN = "__BODY__"
-    name = entry.get("name")
+    name = str(entry.get("name") or "").strip()
     action = entry.get("action")
     value = entry.get("value", "")
-    selector = entry.get("selector")
-    if not name or not action:
+    selector = str(entry.get("selector") or "").strip()
+    if not action:
+        return False
+    if not name and selector:
+        name = f"selector:{selector}"
+    if not name:
         return False
     if action == "skip":
         diag["skipped"].append(name)
@@ -3472,7 +3500,12 @@ def _resolve_in_open_tab(
     if not cr or not cr.get("clicked"):
         buttons = _enumerate_buttons()
         if buttons:
-            cr = _llm_click_submit_candidate(buttons, config or {}, form_root_selector=d.get("form_root_selector"))
+            cr = _llm_click_submit_candidate(
+                buttons,
+                config or {},
+                form_root_selector=d.get("form_root_selector"),
+                phase="first" if flow == "confirm" else "final",
+            )
     if not cr or not cr.get("clicked"):
         return {"vresult": None, "page_text": "", "status": "no_button"}
     time.sleep(3)
@@ -3553,7 +3586,10 @@ def _deep_submit(
         buttons = _enumerate_buttons(form_root_selector=d.get("form_root_selector"))
         if buttons:
             cr = _llm_click_submit_candidate(
-                buttons, config or {}, form_root_selector=d.get("form_root_selector")
+                buttons,
+                config or {},
+                form_root_selector=d.get("form_root_selector"),
+                phase="first" if flow == "confirm" else "final",
             )
     if not cr or not cr.get("clicked"):
         return {"vresult": None, "page_text": ""}
@@ -3567,7 +3603,7 @@ def _deep_submit(
         if not c2 or not c2.get("clicked"):
             buttons = _enumerate_buttons()
             if buttons:
-                c2 = _llm_click_submit_candidate(buttons, config or {})
+                c2 = _llm_click_submit_candidate(buttons, config or {}, phase="final")
         time.sleep(5)
 
     time.sleep(2)
@@ -3897,7 +3933,10 @@ def stage_send(
             buttons = _enumerate_buttons(form_root_selector=d.get("form_root_selector"))
             if buttons:
                 click_res = _llm_click_submit_candidate(
-                    buttons, config or {}, form_root_selector=d.get("form_root_selector")
+                    buttons,
+                    config or {},
+                    form_root_selector=d.get("form_root_selector"),
+                    phase="first",
                 )
                 pick = (click_res or {}).get("picked") or {}
                 if click_res and click_res.get("clicked"):
@@ -3977,7 +4016,7 @@ def stage_send(
                 print(f"  [send] ⚠ final submit not matched by patterns — falling back to LLM picker")
                 buttons = _enumerate_buttons()
                 if buttons:
-                    click2 = _llm_click_submit_candidate(buttons, config or {})
+                    click2 = _llm_click_submit_candidate(buttons, config or {}, phase="final")
                     pick = (click2 or {}).get("picked") or {}
                     if click2 and click2.get("clicked"):
                         picked_label = pick.get("text") or pick.get("selector") or click2.get("text")

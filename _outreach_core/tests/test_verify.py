@@ -107,6 +107,17 @@ class TestVerify(unittest.TestCase):
         )
         self.assertEqual(result["status"], "ok")
 
+    def test_jp_form_error_banner_beats_weak_success_keyword(self) -> None:
+        target = {"id": "b1", "name": "Benesse", "form_fields": {"inputs": []}}
+        snap = "ご入力 ご確認 完了\n入力内容にエラーがあります。内容をご確認ください。"
+        result = verify_send_completed(
+            target,
+            "jp_form",
+            snapshot=snap,
+            browser_verify={"url": "https://www.example.co.jp/entry/inquiry", "text": snap},
+        )
+        self.assertEqual(result["status"], "needs_attention")
+
 
 if __name__ == "__main__":
     unittest.main()
