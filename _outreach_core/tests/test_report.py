@@ -7,6 +7,7 @@ from _outreach_core.helpers.report import (
     _skip_reason_bucket,
     autonomous_summary,
     period_bounds,
+    research_quality_summary,
     send_period_summary,
 )
 
@@ -142,6 +143,34 @@ class TestSendPeriodSummary(unittest.TestCase):
         summary = send_period_summary(sent_rows, [], [], period="all")
         self.assertEqual(summary["successes"], 1)
         self.assertEqual(summary["sent_companies"][0]["company"], "古い会社")
+
+
+class TestResearchQualitySummary(unittest.TestCase):
+    def test_research_quality_kpis(self):
+        events = [
+            {"kind": "enrich.form.completed", "ts": "2026-06-01T00:00:00Z"},
+            {"kind": "enrich.form.completed", "ts": "2026-06-01T00:01:00Z"},
+            {
+                "kind": "enrich.form.skipped_non_contact",
+                "ts": "2026-06-01T00:02:00Z",
+                "payload": {"kind": "recruit", "correction_attempts": 1},
+            },
+            {
+                "kind": "enrich.form.url_corrected",
+                "ts": "2026-06-01T00:03:00Z",
+                "payload": {"attempt_no": 1},
+            },
+        ]
+        sent_rows = [
+            {"id": "a", "sent_at": "2026-06-01T00:05:00Z"},
+        ]
+        summary = research_quality_summary(events, sent_rows, since=datetime(2026, 5, 31, tzinfo=timezone.utc))
+        self.assertEqual(summary["enrich_attempts"], 3)
+        self.assertEqual(summary["contact_classified"], 2)
+        self.assertEqual(summary["non_contact"], 1)
+        self.assertEqual(summary["sent_successes"], 1)
+        self.assertAlmostEqual(summary["wrong_url_rate"], round(1 / 3, 4))
+        self.assertEqual(summary["non_contact_by_kind"]["recruit"], 1)
 
 
 if __name__ == "__main__":

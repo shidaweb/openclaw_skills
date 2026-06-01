@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 import sys
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
@@ -31,6 +32,29 @@ class TestHelpers(unittest.TestCase):
             n2 = append_jp_form(items, ypath)
             self.assertEqual(n1, 1)
             self.assertEqual(n2, 0)
+
+    def test_append_targets_keeps_contact_url_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ypath = Path(tmp) / "targets.yaml"
+            ypath.write_text("companies: []\n", encoding="utf-8")
+            items = [
+                {
+                    "id": "cand_co",
+                    "name": "候補株式会社",
+                    "contact_url_candidates": [
+                        "https://example.co.jp/recruit",
+                        "https://example.co.jp/contact",
+                    ],
+                }
+            ]
+            n = append_jp_form(items, ypath)
+            self.assertEqual(n, 1)
+            data = yaml.safe_load(ypath.read_text(encoding="utf-8"))
+            row = (data.get("companies") or [])[0]
+            self.assertEqual(
+                row.get("contact_url_candidates"),
+                ["https://example.co.jp/recruit", "https://example.co.jp/contact"],
+            )
 
 
 if __name__ == "__main__":

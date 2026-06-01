@@ -445,6 +445,93 @@ def cmd_send_summary(args: argparse.Namespace) -> int:
     return 0
 
 
+def research_quality_summary(
+    events: list[dict[str, Any]],
+    sent_rows: list[dict[str, Any]],
+    *,
+    since: datetime | None = None,
+) -> dict[str, Any]:
+    """Aggregate research quality KPIs (v8 §R4)."""
+    enrich_completed = 0
+    non_contact = 0
+    corrected = 0
+    correction_attempted = 0
+    by_kind: Counter[str] = Counter()
+    success_sent = 0
+
+    for e in events:
+        kind = str(e.get("kind") or "")
+        if kind == "enrich.form.completed":
+            enrich_completed += 1
+        elif kind == "enrich.form.skipped_non_contact":
+            non_contact += 1
+            p = e.get("payload") or {}
+            by_kind[str(p.get("kind") or "unknown")] += 1
+            if int(p.get("correction_attempts") or 0) > 0:
+                correction_attempted += 1
+        elif kind == "enrich.form.url_corrected":
+            corrected += 1
+            correction_attempted += 1
+
+    for r in sent_rows:
+        ts = _parse_ts(r.get("sent_at"))
+        if since and (ts is None or ts < since.replace(tzinfo=timezone.utc)):
+            continue
+        success_sent += 1
+
+    enrich_attempts = enrich_completed + non_contact
+    form_url_valid_rate = (enrich_completed / enrich_attempts) if enrich_attempts else 0.0
+    wrong_url_rate = (non_contact / enrich_attempts) if enrich_attempts else 0.0
+    correction_success_rate = (corrected / correction_attempted) if correction_attempted else 0.0
+    hit_rate = (success_sent / enrich_attempts) if enrich_attempts else 0.0
+    return {
+        "enrich_attempts": enrich_attempts,
+        "contact_classified": enrich_completed,
+        "non_contact": non_contact,
+        "non_contact_by_kind": dict(by_kind.most_common()),
+        "correction_attempted": correction_attempted,
+        "correction_succeeded": corrected,
+        "form_url_valid_rate": round(form_url_valid_rate, 4),
+        "wrong_url_rate": round(wrong_url_rate, 4),
+        "correction_success_rate": round(correction_success_rate, 4),
+        "hit_rate": round(hit_rate, 4),
+        "sent_successes": success_sent,
+    }
+
+
+def cmd_research_quality(args: argparse.Namespace) -> int:
+    data_dir = _skill_data_dir(args.skill, getattr(args, "brief", None))
+    since = parse_since(args.since)
+    events = load_events(data_dir, since=since, skill=args.skill)
+    sent_path, _skip_path = _history_paths(args.skill, getattr(args, "brief", None))
+    sent_rows = _read_jsonl(sent_path)
+    summary = research_quality_summary(events, sent_rows, since=since)
+    lines = [
+        f"# Research Quality — since {args.since}",
+        "",
+        f"skill: {args.skill}",
+        "",
+        "## KPIs",
+        f"- enrich attempts: {summary['enrich_attempts']}",
+        f"- form_url valid rate: {summary['form_url_valid_rate']:.2%}",
+        f"- wrong-url rate: {summary['wrong_url_rate']:.2%}",
+        f"- correction success rate: {summary['correction_success_rate']:.2%}",
+        f"- hit rate (sent/new targets): {summary['hit_rate']:.2%}",
+        f"- sent successes: {summary['sent_successes']}",
+        "",
+        "## non-contact categories",
+    ]
+    if summary["non_contact_by_kind"]:
+        for k, v in summary["non_contact_by_kind"].items():
+            lines.append(f"- {k}: {v}")
+    else:
+        lines.append("_No non-contact skips in range._")
+    print("\n".join(lines))
+    if args.json:
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_needs_attention(args: argparse.Namespace) -> int:
     path = _needs_path(args.skill, getattr(args, "brief", None))
     if not path.is_file():
@@ -558,6 +645,12 @@ def main() -> None:
     p.add_argument("--since", default="7d")
     p.add_argument("--skill", default="jp-form-outreach")
 
+    p = sub.add_parser("research-quality", help="Research/list quality KPIs for form_url accuracy")
+    _add_brief_arg(p)
+    p.add_argument("--since", default="7d")
+    p.add_argument("--skill", default="jp-form-outreach")
+    p.add_argument("--json", action="store_true")
+
     p = sub.add_parser(
         "send-summary",
         help="Period summary: attempts/success/failure + company/content + failure reasons",
@@ -598,6 +691,8 @@ def main() -> None:
         sys.exit(cmd_draft_quality(args))
     if args.cmd == "send-funnel":
         sys.exit(cmd_send_funnel(args))
+    if args.cmd == "research-quality":
+        sys.exit(cmd_research_quality(args))
     if args.cmd == "send-summary":
         sys.exit(cmd_send_summary(args))
     if args.cmd == "needs-attention":

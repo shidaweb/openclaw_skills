@@ -77,6 +77,8 @@ def append_jp_form(companies: list[dict[str, Any]], yaml_path: Path) -> int:
             "hook_context": c.get("hook_context") or c.get("hook_seed", ""),
             "notes": c.get("notes") or c.get("why_fit", ""),
         }
+        if isinstance(c.get("contact_url_candidates"), list):
+            row["contact_url_candidates"] = [str(x) for x in c.get("contact_url_candidates") if str(x or "").strip()]
         if c.get("field_map_overrides"):
             row["field_map_overrides"] = c["field_map_overrides"]
         bucket.append(row)

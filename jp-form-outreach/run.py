@@ -31,6 +31,7 @@ from _outreach_core import autonomy as core_autonomy
 from _outreach_core import avoidance as core_avoidance
 from _outreach_core import captcha as core_captcha
 from _outreach_core import content_guard as core_content_guard
+from _outreach_core import contact_url as core_contact_url
 from _outreach_core import resolve_queue as core_resolve_queue
 from _outreach_core import submit_progress as core_submit_progress
 from _outreach_core import tab_utils as core_tab_utils
@@ -407,6 +408,19 @@ _FORM_FIELDS_JS = r"""
 }
 """
 
+_PAGE_LINKS_JS = r"""
+() => {
+  const out = [];
+  for (const el of document.querySelectorAll('a[href], button, [role="button"]')) {
+    const href = (el.getAttribute('href') || '').trim();
+    const txt = (el.textContent || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+    if (!href && !txt) continue;
+    out.push({ href: href, text: txt.slice(0, 120) });
+  }
+  return out.slice(0, 500);
+}
+"""
+
 
 def _emit_event(kind: str, *, stage: str, target_id: str | None = None, **kwargs: Any) -> None:
     from _outreach_core import events as ev
@@ -414,49 +428,63 @@ def _emit_event(kind: str, *, stage: str, target_id: str | None = None, **kwargs
     ev.emit(kind, stage=stage, target_id=target_id, **kwargs)
 
 
-_NON_CONTACT_HEADING_KW = {
-    "register": ("会員登録", "新規登録", "アカウント作成", "アカウント登録", "ユーザー登録"),
-    "login": ("ログイン",),
-    "recruit": ("採用", "応募", "求人", "履歴書", "エントリーシート", "ES提出"),
-    "reservation": ("予約フォーム", "来店予約", "ご予約", "施術予約", "見学予約"),
-    "estimate_consumer": ("無料相談", "無料カウンセリング", "施術に関する相談"),
-}
+def _list_page_links() -> list[dict[str, str]]:
+    res = _evaluate(_PAGE_LINKS_JS)
+    return res if isinstance(res, list) else []
+
+
+def _seed_form_urls(target: dict[str, Any]) -> list[str]:
+    seeds: list[str] = []
+    direct = str(target.get("form_url") or "").strip()
+    if direct:
+        seeds.append(direct)
+    cands = target.get("contact_url_candidates")
+    if isinstance(cands, list):
+        seeds.extend(str(c or "").strip() for c in cands if str(c or "").strip())
+    # Same-domain guard: when form_url exists, keep only that registrable domain.
+    # (For no form_url, fallback to first candidate's domain.)
+    anchor = direct or (seeds[0] if seeds else "")
+    if anchor:
+        seeds = [s for s in seeds if core_contact_url.same_registrable_domain(s, anchor)]
+
+    # dedupe while preserving order
+    out: list[str] = []
+    seen: set[str] = set()
+    for s in seeds:
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _build_contact_candidates(target: dict[str, Any], current_url: str, page_links: list[dict[str, str]]) -> list[str]:
+    candidates: list[str] = []
+    user_cands = target.get("contact_url_candidates")
+    if isinstance(user_cands, list):
+        candidates.extend(str(x) for x in user_cands if str(x or "").strip())
+    candidates.extend(core_contact_url.contact_link_candidates(page_links, current_url))
+    candidates.extend(core_contact_url.common_contact_paths(current_url))
+
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for c in candidates:
+        u = core_contact_url.absolutize_url(c, current_url)
+        if not u:
+            continue
+        if not core_contact_url.same_registrable_domain(u, current_url):
+            continue
+        if u == current_url or u in seen:
+            continue
+        seen.add(u)
+        uniq.append(u)
+    return uniq[:5]
 
 
 def _classify_form_type(
     fields: dict[str, Any], snapshot: str | None
 ) -> tuple[str, str | None]:
-    """Classify the page as 'contact' (B2B inquiry) or one of the non-contact
-    categories. Returns (kind, reason_if_non_contact).
-    """
-    inputs = fields.get("inputs") or []
-    textareas = fields.get("textareas") or []
-
-    for inp in inputs:
-        if str(inp.get("type", "")).lower() == "password":
-            return ("register", "password field present")
-
-    name_blob = " ".join(
-        str(x.get("name") or x.get("label") or "")
-        for x in inputs
-    ).lower()
-    if "birth" in name_blob and "year" in name_blob:
-        return ("register", "birth-year field present")
-    if "生年月日" in name_blob:
-        return ("register", "生年月日 field present")
-
-    snap_head = (snapshot or "")[:2000]
-    for kind, kws in _NON_CONTACT_HEADING_KW.items():
-        for kw in kws:
-            if kw in snap_head:
-                if textareas:
-                    continue
-                return (kind, f"heading mentions '{kw}'")
-
-    if not textareas:
-        return ("unknown_no_textarea", "no textarea on page (not a typical contact form)")
-
-    return ("contact", None)
+    return core_contact_url.classify_form_type(fields, snapshot)
 
 
 def stage_enrich(
@@ -474,8 +502,9 @@ def stage_enrich(
 
     enriched: list[dict[str, Any]] = []
     for i, t in enumerate(targets, 1):
-        if not t.get("form_url"):
-            print(f"[enrich] ({i}/{len(targets)}) {t.get('name')}: no form_url, skipping")
+        seed_urls = _seed_form_urls(t)
+        if not seed_urls:
+            print(f"[enrich] ({i}/{len(targets)}) {t.get('name')}: no form_url/contact_url_candidates, skipping")
             enriched.append({**t, "_enrich_skipped": "no form_url"})
             continue
 
@@ -485,38 +514,112 @@ def stage_enrich(
             enriched.append({**t, "_enrich_skipped": f"category={cat}"})
             continue
 
-        print(f"[enrich] ({i}/{len(targets)}) {t.get('name')} -> {t['form_url']}")
-        oc_browser("open", t["form_url"])
-        time.sleep(RATE_LIMIT_SECONDS)
-
         from _outreach_core.cookie_dismiss import apply_cookie_dismiss
 
-        apply_cookie_dismiss(
-            _evaluate,
-            config,
-            stage="enrich",
-            target_id=t.get("id"),
-            emit_event=lambda kind, **kw: _emit_event(kind, **kw),
-        )
+        t_work = dict(t)
+        fields: dict[str, Any] = {}
+        snap = ""
+        form_kind = "unknown_no_textarea"
+        form_reason = "no form analyzed"
+        correction_attempts = 0
+        corrected_emitted = False
+        chosen_url = ""
+        original_url = str(t.get("form_url") or "").strip()
 
-        # Try clicking through any "法人" / "業務提携" entry-point links
-        # if the target hints at it (e.g. carradanote routes via #bloc-7)
-        if t.get("entry_click_text"):
-            for txt in t["entry_click_text"] if isinstance(t["entry_click_text"], list) else [t["entry_click_text"]]:
-                _evaluate(f"""
-                    () => {{
-                      for (const a of document.querySelectorAll('a, button')) {{
-                        if ((a.textContent || '').trim().includes({json.dumps(txt)})) {{
-                          a.click(); return true;
+        # Seed candidates: explicit form_url first, then contact_url_candidates.
+        for seed_idx, seed_url in enumerate(seed_urls[:5], 1):
+            print(f"[enrich] ({i}/{len(targets)}) {t.get('name')} -> seed {seed_idx}: {seed_url}")
+            oc_browser("open", seed_url)
+            time.sleep(RATE_LIMIT_SECONDS)
+            apply_cookie_dismiss(
+                _evaluate,
+                config,
+                stage="enrich",
+                target_id=t_work.get("id"),
+                emit_event=lambda kind, **kw: _emit_event(kind, **kw),
+            )
+            # Try clicking through any "法人" / "業務提携" entry-point links.
+            if t_work.get("entry_click_text"):
+                for txt in t_work["entry_click_text"] if isinstance(t_work["entry_click_text"], list) else [t_work["entry_click_text"]]:
+                    _evaluate(f"""
+                        () => {{
+                          for (const a of document.querySelectorAll('a, button')) {{
+                            if ((a.textContent || '').trim().includes({json.dumps(txt)})) {{
+                              a.click(); return true;
+                            }}
+                          }}
+                          return false;
                         }}
-                      }}
-                      return false;
-                    }}
-                """)
-                time.sleep(2)
+                    """)
+                    time.sleep(2)
 
-        fields = _evaluate(_FORM_FIELDS_JS) or {}
-        snap = oc_browser("snapshot")
+            fields = _evaluate(_FORM_FIELDS_JS) or {}
+            snap = oc_browser("snapshot") or ""
+            form_kind, form_reason = _classify_form_type(fields, snap)
+            chosen_url = seed_url
+            if form_kind == "contact":
+                break
+
+            links = _list_page_links()
+            candidates = _build_contact_candidates(t_work, seed_url, links)
+            if candidates:
+                print(
+                    f"[enrich] ({i}/{len(targets)}) {t_work.get('name')}: "
+                    f"non-contact ({form_kind}) -> try correcting URL ({len(candidates)} candidates)"
+                )
+            for cand in candidates:
+                correction_attempts += 1
+                print(f"[enrich]    ↳ candidate {correction_attempts}/{len(candidates)}: {cand}")
+                oc_browser("open", cand)
+                time.sleep(RATE_LIMIT_SECONDS)
+                apply_cookie_dismiss(
+                    _evaluate,
+                    config,
+                    stage="enrich",
+                    target_id=t_work.get("id"),
+                    emit_event=lambda kind, **kw: _emit_event(kind, **kw),
+                )
+                fields2 = _evaluate(_FORM_FIELDS_JS) or {}
+                snap2 = oc_browser("snapshot") or ""
+                kind2, reason2 = _classify_form_type(fields2, snap2)
+                if kind2 == "contact":
+                    fields, snap = fields2, snap2
+                    form_kind, form_reason = kind2, reason2
+                    chosen_url = cand
+                    _emit_event(
+                        "enrich.form.url_corrected",
+                        stage="enrich",
+                        target_id=str(t_work.get("id") or ""),
+                        payload={
+                            "original_url": (seed_url or "")[:200],
+                            "corrected_url": cand[:200],
+                            "attempt_no": correction_attempts,
+                        },
+                    )
+                    corrected_emitted = True
+                    print(f"[enrich]    ✅ corrected form_url -> {cand}")
+                    break
+            if form_kind == "contact":
+                break
+
+        t_work["form_url"] = chosen_url or (seed_urls[0] if seed_urls else "")
+        if original_url and chosen_url and chosen_url != original_url:
+            t_work["form_url_original"] = original_url
+            t_work["form_url_corrected"] = True
+        elif not original_url and chosen_url:
+            t_work["form_url_original"] = ""
+            t_work["form_url_corrected"] = True
+        if t_work.get("form_url_corrected") and not corrected_emitted:
+            _emit_event(
+                "enrich.form.url_corrected",
+                stage="enrich",
+                target_id=str(t_work.get("id") or ""),
+                payload={
+                    "original_url": original_url[:200],
+                    "corrected_url": str(chosen_url or "")[:200],
+                    "attempt_no": correction_attempts,
+                },
+            )
 
         # Save first form snapshot for debugging
         if i == 1:
@@ -525,39 +628,41 @@ def stage_enrich(
                 sample.write_text(snap)
                 print(f"[enrich] saved first form snapshot -> {sample}")
 
-        form_kind, form_reason = _classify_form_type(fields, snap)
         if form_kind != "contact":
+            reason = form_reason or "non_contact"
+            if correction_attempts:
+                reason = f"{reason} (correction_attempts={correction_attempts}, all_failed)"
             print(
-                f"[enrich] ({i}/{len(targets)}) {t.get('name')}: "
-                f"NON-CONTACT form ({form_kind}: {form_reason}) — adding to skip_history"
+                f"[enrich] ({i}/{len(targets)}) {t_work.get('name')}: "
+                f"NON-CONTACT form ({form_kind}: {reason}) — adding to skip_history"
             )
             append_skip_history([
                 {
-                    "id": t.get("id"),
-                    "name": t.get("name"),
-                    "industry": t.get("industry"),
+                    "id": t_work.get("id"),
+                    "name": t_work.get("name"),
+                    "industry": t_work.get("industry"),
                     "draft": {
-                        "body": f"non_contact_form: {form_kind} ({form_reason})"
+                        "body": f"non_contact_form: {form_kind} ({reason})"
                     },
                 }
             ])
             enriched.append(
                 {
-                    **t,
+                    **t_work,
                     "_enrich_skipped": f"non_contact_form:{form_kind}",
-                    "_enrich_skip_reason": form_reason,
+                    "_enrich_skip_reason": reason,
                 }
             )
             _emit_event(
                 "enrich.form.skipped_non_contact",
                 stage="enrich",
-                target_id=str(t.get("id") or ""),
-                payload={"kind": form_kind, "reason": form_reason},
+                target_id=str(t_work.get("id") or ""),
+                payload={"kind": form_kind, "reason": reason, "correction_attempts": correction_attempts},
             )
             continue
 
         if fields.get("form_root_selector"):
-            t = {**t, "form_root_selector": fields["form_root_selector"]}
+            t_work = {**t_work, "form_root_selector": fields["form_root_selector"]}
         field_count = (
             len(fields.get("inputs") or [])
             + len(fields.get("selects") or [])
@@ -568,7 +673,7 @@ def stage_enrich(
             ml = (ta or {}).get("max_length")
             if ml:
                 max_chars = max(max_chars, int(ml))
-        tid = str(t.get("id") or t.get("name") or i)
+        tid = str(t_work.get("id") or t_work.get("name") or i)
         trace = None
         from _outreach_core import events as ev
 
@@ -587,7 +692,7 @@ def stage_enrich(
             trace_dir=trace,
         )
         enriched_entry = {
-            **t,
+            **t_work,
             "form_fields": fields,
             "_enriched_at": datetime.utcnow().isoformat() + "Z",
         }

@@ -325,6 +325,7 @@ Do NOT use for:
 | **"全部止めて"** | `pkill -f "run.py send"` |
 | **「品質ポイント教えて」/「draft 品質どう？」** | `python3 -m _outreach_core.helpers.report draft-quality --since 7d` |
 | **「送信ファネル見せて」** | `python3 -m _outreach_core.helpers.report send-funnel --since 7d` |
+| **「リサーチ品質どう？」/「form_url の質見せて」** | `python3 -m _outreach_core.helpers.report research-quality --since 7d`（誤URL率・補正成功率・打率） |
 | **「今月は何件送りましたか？」/「今週・先月・累計の送信サマリ」** | `python3 -m _outreach_core.helpers.report send-summary --period this_month`（必要に応じて `--period this_week/last_month/all` or `--all-periods`）。会社/内容・試行/成功/失敗・失敗理由を要約返信 |
 | **「needs_attention まとめて」** | `python3 -m _outreach_core.helpers.report needs-attention` |
 | **「<会社>のトレース見たい」** | `python3 -m _outreach_core.helpers.report inspect --target-id <id>` |
@@ -466,6 +467,32 @@ cd ~/.openclaw/skills/jp-form-outreach
 （linkedin-outreach/SKILL.md と同手順。`append_targets --skill jp_form` / `linkedin` を使い分け）
 
 **禁止:** 実在しない企業の捏造。PR TIMES / IR / 公式サイトで検証してから採用。
+**必須:** `form_url` は「B2B 営業/取引/提携/取材向け問い合わせフォーム（自由記述 textarea あり）」のみ。
+
+### form_url 採用基準（v8）
+
+- 採用してよい:
+  - `お問い合わせ` / `法人のお問い合わせ` / `取材・提携` 等の B2B 連絡窓口
+  - 本文 textarea（お問い合わせ内容）がある
+- form_url に使わない（該当しか無い場合は `category` を立てる）:
+  - 採用/recruit/career/entry
+  - IR/投資家
+  - B2Cサポート（お客様相談室、修理、返品等）
+  - 予約フォーム
+  - 資料請求・DLゲート、会員登録、ログイン
+- URL ヒューリスティック:
+  - 望ましい: `/contact`, `/inquiry`, `/toiawase`, `/otoiawase`, `/company/contact`, `/business/contact`, `/form`
+  - 避ける: `/recruit`, `/career`, `/entry`, `/ir`, `/support`, `/faq`, `/reserve`, `/yoyaku`
+
+### 実ページ検証（必須）
+
+targets に書く前に必ず form_url を開き、次を確認:
+
+1. 自由記述 textarea がある
+2. 採用/IR/B2C/予約ページではない
+3. 会社名・窓口文脈が一致している
+
+確認できたら `form_url_verified: true` を付ける。確認できなければ `form_url` は空にして `category` で理由を残す。
 
 > Sonnet エージェントでは候補品質が落ちるため、リスト生成は Opus 4.7 前提。
 
