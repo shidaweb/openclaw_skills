@@ -61,3 +61,30 @@ data/run_supervisor.json
 # Editor/script backups and stray local scripts
 **/*.backup.*
 linkedin-outreach/loop_until_10.sh
+
+# --- Local-only operational assets (never commit) ---
+# API keys / tokens / local env
+.env
+.env.*
+*.env
+**/secrets*.yaml
+**/credentials*.json
+**/service-account*.json
+
+# Filled sender/runtime configs (examples are tracked)
+**/config.yaml
+**/sender_brief.yaml
+
+# Real briefs are local-only; keep only template/example in git
+briefs/*.yaml
+!briefs/_template.yaml
+!briefs/*.example.yaml
+
+# Target lists are local-only; keep only example templates
+**/targets/*.yaml
+**/targets/*.csv
+!**/targets/*.example.yaml
+!**/targets/*.example.csv
+
+# Slack channel binding/state is local-only
+**/data/channel_state/*.json
