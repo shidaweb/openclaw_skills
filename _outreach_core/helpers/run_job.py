@@ -29,12 +29,16 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from _outreach_core.config import SKILLS_ROOT
+from _outreach_core.config import resolve_brief_id
+from _outreach_core.history import load_sent_set
+from _outreach_core.paths import brief_data_dir
 
 _SKILLS = ("jp-form-outreach", "linkedin-outreach")
 
@@ -56,6 +60,39 @@ def _logs_dir() -> Path:
     d = SKILLS_ROOT / "data" / "job_logs"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _sent_count(skill: str, brief_id: str) -> int:
+    skill_dir = _skill_dir(skill)
+    data_dir = brief_data_dir(skill_dir, brief_id)
+    return len(load_sent_set(data_dir))
+
+
+def _has_flag(args: list[str], flag: str) -> bool:
+    return any(a == flag or a.startswith(f"{flag}=") for a in args)
+
+
+def build_campaign_args(
+    *,
+    brief_id: str,
+    remaining: int,
+    per_run_limit: int,
+    extra_args: list[str] | None = None,
+) -> list[str]:
+    """Build one campaign invocation for drive mode.
+
+    Ensures `campaign --brief <id>` and injects `--limit` unless caller already
+    set one in extra args.
+    """
+    args = ["campaign", "--brief", brief_id]
+    if extra_args:
+        args.extend(extra_args)
+    if not _has_flag(args, "--brief"):
+        args.extend(["--brief", brief_id])
+    if not _has_flag(args, "--limit"):
+        run_limit = max(1, min(int(per_run_limit), max(1, int(remaining))))
+        args.extend(["--limit", str(run_limit)])
+    return args
 
 
 def _post(text: str, *, level: str = "info", thread_ts: str | None = None) -> bool:
@@ -254,6 +291,100 @@ def cmd_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_drive(args: argparse.Namespace) -> int:
+    """Run campaign repeatedly until target sends or max runtime is reached.
+
+    This is an ops wrapper for "8 hours / 50 sends" style unattended operation.
+    Each pass still runs through `_supervise`, so stall/crash auto-restart
+    semantics are preserved.
+    """
+    skill = args.skill
+    if skill not in _SKILLS:
+        raise ValueError(f"unknown skill {skill!r}; expected one of {_SKILLS}")
+
+    brief_id = resolve_brief_id(args.brief)
+    target_sends = max(1, int(args.target_sends))
+    max_hours = float(args.max_hours)
+    max_runtime_sec = max(60, int(max_hours * 3600))
+    per_run_limit = max(1, int(args.per_run_limit))
+    sleep_sec = max(0, int(args.sleep_sec))
+    extra_args = list(args.run_args or [])
+    if extra_args and extra_args[0] == "--":
+        extra_args = extra_args[1:]
+
+    start_mono = time.monotonic()
+    baseline_sent = _sent_count(skill, brief_id)
+    no_progress_passes = 0
+    pass_no = 0
+    thread_ts = os.environ.get("DOORMAN_SLACK_THREAD_TS", "").strip() or None
+
+    _post(
+        f"🕒 長時間運転を開始: {skill} brief={brief_id}\n"
+        f"目標: +{target_sends}件送信 / 上限: {max_hours:g}h / "
+        f"1周あたりlimit: {per_run_limit}",
+        level="info",
+        thread_ts=thread_ts,
+    )
+
+    while True:
+        current = _sent_count(skill, brief_id)
+        delta = max(0, current - baseline_sent)
+        elapsed = int(time.monotonic() - start_mono)
+        if delta >= target_sends:
+            _post(
+                f"✅ 目標到達: +{delta}件送信（目標 +{target_sends}）"
+                f" / 経過 {elapsed // 60}分",
+                level="info",
+                thread_ts=thread_ts,
+            )
+            print(f"[drive] done: reached target (+{delta})")
+            return 0
+        if elapsed >= max_runtime_sec:
+            _post(
+                f"⏹ 時間上限に到達: +{delta}件送信 / 目標 +{target_sends}件 "
+                f"(max {max_hours:g}h)",
+                level="warn",
+                thread_ts=thread_ts,
+            )
+            print(f"[drive] stop: time limit reached (+{delta}/{target_sends})")
+            return 0
+
+        remaining = target_sends - delta
+        run_args = build_campaign_args(
+            brief_id=brief_id,
+            remaining=remaining,
+            per_run_limit=per_run_limit,
+            extra_args=extra_args,
+        )
+        pass_no += 1
+        run_id = f"{_now_id()}-p{pass_no}"
+        log_path = _logs_dir() / f"{skill}-{run_id}.log"
+        print(
+            f"[drive] pass {pass_no}: sent +{delta}/{target_sends}, "
+            f"remaining={remaining}, cmd={' '.join(run_args)}"
+        )
+        code = _supervise(skill, run_id, str(log_path), run_args)
+
+        after = _sent_count(skill, brief_id)
+        progressed = after > current
+        if progressed:
+            no_progress_passes = 0
+        else:
+            no_progress_passes += 1
+
+        if code != 0 and no_progress_passes >= 3:
+            _post(
+                f"❌ 3周連続で送信進捗なし（現在 +{max(0, after - baseline_sent)}件）。"
+                "安全のため停止します。ログを確認してください。",
+                level="error",
+                thread_ts=thread_ts,
+            )
+            return code
+
+        if sleep_sec > 0:
+            time.sleep(sleep_sec)
+
+
 def main() -> None:
     # Internal supervisor dispatch (bypasses argparse subcommands for `--` passthrough).
     if len(sys.argv) >= 5 and sys.argv[1] == "__supervise__":
@@ -274,12 +405,35 @@ def main() -> None:
     p.add_argument("--slack-channel-id", default=None)
     p.add_argument("--slack-thread-ts", default=None)
     p.add_argument("run_args", nargs=argparse.REMAINDER, help="Args passed to run.py")
+    p = sub.add_parser(
+        "drive",
+        help="Repeat campaign until target sends reached or max runtime elapsed",
+    )
+    p.add_argument("skill", choices=list(_SKILLS))
+    p.add_argument("--brief", required=True, help="Brief id")
+    p.add_argument("--target-sends", type=int, default=50,
+                   help="Stop when this many NEW sends are added (default: 50)")
+    p.add_argument("--max-hours", type=float, default=8.0,
+                   help="Stop after this many hours even if target not reached (default: 8)")
+    p.add_argument("--per-run-limit", type=int, default=10,
+                   help="`campaign --limit` per pass if not supplied in --run-args")
+    p.add_argument("--sleep-sec", type=int, default=30,
+                   help="Pause between passes in seconds (default: 30)")
+    p.add_argument(
+        "run_args",
+        nargs=argparse.REMAINDER,
+        help="Optional extra args appended to `campaign` (e.g. --skip-enrich)",
+    )
     args = ap.parse_args()
     if args.cmd == "start":
         # Strip a leading '--' if the caller used `job start <skill> -- <args>`
         if args.run_args and args.run_args[0] == "--":
             args.run_args = args.run_args[1:]
         sys.exit(cmd_start(args))
+    if args.cmd == "drive":
+        if args.run_args and args.run_args[0] == "--":
+            args.run_args = args.run_args[1:]
+        sys.exit(cmd_drive(args))
     ap.print_help()
     sys.exit(1)
 

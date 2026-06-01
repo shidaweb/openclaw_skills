@@ -19,6 +19,30 @@ class TestRunJob(unittest.TestCase):
         self.assertTrue(cmd[1].endswith("run.py"))
         self.assertEqual(cmd[-3:], ["campaign", "--limit", "5"])
 
+    def test_build_campaign_args_injects_brief_and_limit(self) -> None:
+        args = run_job.build_campaign_args(
+            brief_id="torana-line-crm",
+            remaining=7,
+            per_run_limit=10,
+            extra_args=None,
+        )
+        self.assertEqual(
+            args,
+            ["campaign", "--brief", "torana-line-crm", "--limit", "7"],
+        )
+
+    def test_build_campaign_args_respects_existing_limit(self) -> None:
+        args = run_job.build_campaign_args(
+            brief_id="torana-line-crm",
+            remaining=50,
+            per_run_limit=10,
+            extra_args=["--limit", "3", "--skip-enrich"],
+        )
+        self.assertEqual(
+            args,
+            ["campaign", "--brief", "torana-line-crm", "--limit", "3", "--skip-enrich"],
+        )
+
     def test_start_rejects_unknown_skill(self) -> None:
         with self.assertRaises(ValueError):
             run_job.start("nope-outreach", ["campaign"])
@@ -121,6 +145,54 @@ class TestRunJob(unittest.TestCase):
             code = run_job._supervise("jp-form-outreach", "rid", "/tmp/x.log", ["send"])
         self.assertEqual(code, 1)
         self.assertTrue(any(lvl == "error" for lvl, _t in posts))
+
+    def test_drive_stops_on_target(self) -> None:
+        args = mock.Mock(
+            skill="jp-form-outreach",
+            brief="torana-line-crm",
+            target_sends=2,
+            max_hours=8.0,
+            per_run_limit=10,
+            sleep_sec=0,
+            run_args=[],
+        )
+        sent_counts = [0, 0, 2, 2]  # baseline, first check, after pass, next check
+        posts: list[tuple[str, str]] = []
+        with mock.patch.object(run_job, "resolve_brief_id", return_value="torana-line-crm"), \
+                mock.patch.object(run_job, "_sent_count", side_effect=lambda *a, **k: sent_counts.pop(0)), \
+                mock.patch.object(run_job, "_supervise", return_value=0) as sup, \
+                mock.patch.object(run_job, "_post", side_effect=lambda t, level="info", **k: posts.append((level, t))):
+            code = run_job.cmd_drive(args)
+        self.assertEqual(code, 0)
+        sup.assert_called_once()
+        self.assertTrue(any("目標到達" in t for _lvl, t in posts))
+
+    def test_drive_stops_on_time_limit(self) -> None:
+        args = mock.Mock(
+            skill="jp-form-outreach",
+            brief="torana-line-crm",
+            target_sends=50,
+            max_hours=0.0001,  # clamped to >=60s internally
+            per_run_limit=10,
+            sleep_sec=0,
+            run_args=[],
+        )
+        t = {"n": 0}
+        posts: list[tuple[str, str]] = []
+
+        def fake_mono():
+            t["n"] += 1
+            return 0 if t["n"] == 1 else 65  # over 60s clamp
+
+        with mock.patch.object(run_job, "resolve_brief_id", return_value="torana-line-crm"), \
+                mock.patch.object(run_job, "_sent_count", return_value=0), \
+                mock.patch.object(run_job.time, "monotonic", side_effect=fake_mono), \
+                mock.patch.object(run_job, "_supervise", return_value=0) as sup, \
+                mock.patch.object(run_job, "_post", side_effect=lambda t, level="info", **k: posts.append((level, t))):
+            code = run_job.cmd_drive(args)
+        self.assertEqual(code, 0)
+        sup.assert_not_called()
+        self.assertTrue(any("時間上限" in t for _lvl, t in posts))
 
 
 if __name__ == "__main__":
