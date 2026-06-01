@@ -1641,7 +1641,9 @@ _LIST_SELECT_GATES_JS = r"""
 _CLICK_BUTTON_BY_TEXT_JS = r"""
 (args) => {
   const { patterns, formRootSelector } = args;
-  const selector = 'button, input[type="submit"], input[type="button"], a, [role="button"]';
+  const selector =
+    'button, input[type="submit"], input[type="button"], input[type="image"], a, [role="button"], ' +
+    '[onclick], .btn, [class*="btn" i], [class*="submit" i], [class*="confirm" i]';
   let scopes = [];
   if (formRootSelector) {
     try {
@@ -1655,9 +1657,15 @@ _CLICK_BUTTON_BY_TEXT_JS = r"""
   for (const scope of scopes) {
     const buttons = Array.from(scope.querySelectorAll(selector));
     for (const pat of patterns) {
-      const re = new RegExp(pat);
+      const re = new RegExp(pat, 'i');
       for (const b of buttons) {
-        const rawTxt = ((b.textContent || b.value || '') + ' ' + (b.getAttribute('aria-label') || '')).trim();
+        const rawTxt = (
+          (b.textContent || b.value || '') + ' ' +
+          (b.getAttribute('aria-label') || '') + ' ' +
+          (b.getAttribute('title') || '') + ' ' +
+          (b.getAttribute('alt') || '') + ' ' +
+          (b.getAttribute('name') || '')
+        ).trim();
         const txt = rawTxt.replace(/\s+/g, ' ');
         // Skip elements with too much text (likely a wrapper, not a button)
         if (txt.length > 80) continue;
@@ -1869,7 +1877,29 @@ def _try_open_pre_form_gate() -> dict[str, Any] | None:
 _ENUMERATE_BUTTONS_JS = r"""
 (args) => {
   const { formRootSelector } = args;
-  const selector = 'button, input[type="submit"], input[type="button"], a, [role="button"]';
+  const selector =
+    'button, input[type="submit"], input[type="button"], input[type="image"], a, [role="button"], ' +
+    '[onclick], .btn, [class*="btn" i], [class*="submit" i], [class*="confirm" i]';
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const stableSelector = (el) => {
+    if (el.id) return `#${CSS.escape(el.id)}`;
+    const name = el.getAttribute('name');
+    if (name) return `${el.tagName.toLowerCase()}[name="${CSS.escape(name)}"]`;
+    const role = el.getAttribute('role');
+    if (role) return `${el.tagName.toLowerCase()}[role="${CSS.escape(role)}"]`;
+    let cur = el;
+    const path = [];
+    for (let depth = 0; cur && depth < 6 && cur !== document.body; depth += 1) {
+      let part = cur.tagName.toLowerCase();
+      if (cur.parentElement) {
+        const sibs = Array.from(cur.parentElement.children).filter((x) => x.tagName === cur.tagName);
+        if (sibs.length > 1) part += `:nth-of-type(${sibs.indexOf(cur) + 1})`;
+      }
+      path.unshift(part);
+      cur = cur.parentElement;
+    }
+    return path.join(' > ');
+  };
   let scope = document;
   if (formRootSelector) {
     try {
@@ -1880,20 +1910,75 @@ _ENUMERATE_BUTTONS_JS = r"""
   const buttons = Array.from(scope.querySelectorAll(selector));
   const out = [];
   buttons.forEach((b, idx) => {
-    if (b.disabled || b.offsetParent === null) return;
-    const rawTxt = ((b.textContent || b.value || '') + ' ' + (b.getAttribute('aria-label') || '')).trim();
-    const txt = rawTxt.replace(/\s+/g, ' ');
-    if (!txt || txt.length > 80) return;
+    const style = window.getComputedStyle(b);
+    const blocked = Boolean(
+      b.disabled ||
+      b.getAttribute('aria-disabled') === 'true' ||
+      style.pointerEvents === 'none' ||
+      style.visibility === 'hidden' ||
+      style.display === 'none'
+    );
+    if (blocked || b.offsetParent === null) return;
+    const txt = norm(
+      (b.textContent || b.value || '') + ' ' +
+      (b.getAttribute('aria-label') || '') + ' ' +
+      (b.getAttribute('title') || '') + ' ' +
+      (b.getAttribute('alt') || '') + ' ' +
+      (b.getAttribute('name') || '')
+    );
+    const btnType = String(b.getAttribute('type') || '').toLowerCase();
+    if (!txt && !['submit', 'button', 'image'].includes(btnType)) return;
+    if (txt.length > 120) return;
+    const className = norm(b.className || '');
     out.push({
       idx,
       text: txt,
       tag: b.tagName.toLowerCase(),
       type: b.getAttribute('type') || '',
       role: b.getAttribute('role') || '',
+      name: b.getAttribute('name') || '',
+      id: b.id || '',
+      class_name: className.slice(0, 120),
       href: b.getAttribute('href') || '',
+      selector: stableSelector(b),
+      intent_hint: norm(
+        (b.getAttribute('type') || '') + ' ' +
+        (b.getAttribute('onclick') || '') + ' ' +
+        className
+      ).slice(0, 160),
     });
   });
   return { scope: scope === document ? 'document' : 'form', buttons: out };
+}
+"""
+
+
+_CLICK_BY_SELECTOR_JS = r"""
+(args) => {
+  const { selector } = args;
+  if (!selector) return { ok: false, reason: "empty_selector" };
+  let el = null;
+  try {
+    el = document.querySelector(selector);
+  } catch (e) {
+    return { ok: false, reason: "invalid_selector", selector };
+  }
+  if (!el) return { ok: false, reason: "not_found", selector };
+  const style = window.getComputedStyle(el);
+  const blocked = Boolean(
+    el.disabled ||
+    el.getAttribute('aria-disabled') === 'true' ||
+    style.pointerEvents === 'none' ||
+    style.visibility === 'hidden' ||
+    style.display === 'none'
+  );
+  if (blocked || el.offsetParent === null) return { ok: false, reason: "blocked", selector };
+  el.click();
+  return {
+    ok: true,
+    selector,
+    text: ((el.textContent || el.value || '') + ' ' + (el.getAttribute('aria-label') || '')).trim().slice(0, 80),
+  };
 }
 """
 
@@ -1918,6 +2003,25 @@ def _click_by_exact_text(text: str,
     return _click_button([pat], form_root_selector=form_root_selector)
 
 
+def _click_by_selector(selector: str) -> dict[str, Any] | None:
+    args = {"selector": selector}
+    js = f"""
+    (() => {{
+      const fn = {_CLICK_BY_SELECTOR_JS};
+      return fn({json.dumps(args, ensure_ascii=False)});
+    }})()
+    """
+    res = _evaluate(js)
+    if isinstance(res, dict) and res.get("ok"):
+        return {
+            "clicked": True,
+            "text": (res.get("text") or "")[:80],
+            "selector": selector,
+            "scope": "selector",
+        }
+    return None
+
+
 _FINAL_SUBMIT_PICKER_PROMPT = """あなたは日本語B2B問い合わせフォームの確認画面で「最終送信ボタン」を1つ選ぶ役割です。
 
 ## 状況
@@ -1934,7 +2038,7 @@ _FINAL_SUBMIT_PICKER_PROMPT = """あなたは日本語B2B問い合わせフォ�
 {buttons_json}
 
 ## 出力（JSONのみ）
-{{"text": "<選んだボタンの text フィールドをそのまま>", "reason": "<簡潔な根拠>"}}
+{{"text": "<選んだボタンの text（不明なら空）>", "selector": "<選んだボタンの selector（不明なら空）>", "reason": "<簡潔な根拠>"}}
 """
 
 
@@ -1949,8 +2053,32 @@ def _llm_pick_final_submit(buttons: list[dict[str, Any]],
     model = model_cfg.get("form_analyzer_name") or model_cfg.get("name", DEFAULT_MODEL)
     response = oc_infer(prompt, model=model)
     result = extract_first_json(response or "")
-    if isinstance(result, dict) and result.get("text"):
+    if isinstance(result, dict) and (result.get("text") or result.get("selector")):
         return result
+    return None
+
+
+def _llm_click_submit_candidate(
+    buttons: list[dict[str, Any]],
+    config: dict[str, Any],
+    *,
+    form_root_selector: str | None = None,
+) -> dict[str, Any] | None:
+    pick = _llm_pick_final_submit(buttons, config or {})
+    if not pick:
+        return None
+    selector = str(pick.get("selector") or "").strip()
+    text = str(pick.get("text") or "").strip()
+    if selector:
+        res = _click_by_selector(selector)
+        if res and res.get("clicked"):
+            res["picked"] = pick
+            return res
+    if text:
+        res = _click_by_exact_text(text, form_root_selector=form_root_selector)
+        if res and res.get("clicked"):
+            res["picked"] = pick
+            return res
     return None
 
 
@@ -2028,7 +2156,7 @@ The draft body will be ≤ {body_max_chars} characters. Use placeholder `__BODY_
 15. For 連絡可能な時間帯 radios: use overrides.contact_time_radio
 16. For 同意 / プライバシー / 利用規約 / 個人情報 checkboxes:
     add to checkboxes_to_check. If name/id is unclear, include exact label text
-    via {"name":"", "label":"..."}.
+    via {{"name":"", "label":"..."}}.
 17. For optional fields like FAX, ニュースレター, 当社をどこで知ったか when no override: action="skip"
 18. For 従業員数 select with override.employee_count_required: use sender.employee_count_band
 19. Prefer `name` attribute as the field identifier; fall back to `id`
@@ -3240,9 +3368,7 @@ def _resolve_in_open_tab(
     if not cr or not cr.get("clicked"):
         buttons = _enumerate_buttons()
         if buttons:
-            pick = _llm_pick_final_submit(buttons, config or {})
-            if pick and pick.get("text"):
-                cr = _click_by_exact_text(pick["text"])
+            cr = _llm_click_submit_candidate(buttons, config or {}, form_root_selector=d.get("form_root_selector"))
     if not cr or not cr.get("clicked"):
         return {"vresult": None, "page_text": "", "status": "no_button"}
     time.sleep(3)
@@ -3322,9 +3448,9 @@ def _deep_submit(
     if not cr or not cr.get("clicked"):
         buttons = _enumerate_buttons(form_root_selector=d.get("form_root_selector"))
         if buttons:
-            pick = _llm_pick_final_submit(buttons, config or {})
-            if pick and pick.get("text"):
-                cr = _click_by_exact_text(pick["text"])
+            cr = _llm_click_submit_candidate(
+                buttons, config or {}, form_root_selector=d.get("form_root_selector")
+            )
     if not cr or not cr.get("clicked"):
         return {"vresult": None, "page_text": ""}
     time.sleep(3)
@@ -3337,9 +3463,7 @@ def _deep_submit(
         if not c2 or not c2.get("clicked"):
             buttons = _enumerate_buttons()
             if buttons:
-                pick = _llm_pick_final_submit(buttons, config or {})
-                if pick and pick.get("text"):
-                    _click_by_exact_text(pick["text"])
+                c2 = _llm_click_submit_candidate(buttons, config or {})
         time.sleep(5)
 
     time.sleep(2)
@@ -3668,14 +3792,18 @@ def stage_send(
             print(f"  [send] first submit button regex miss — LLM picker fallback")
             buttons = _enumerate_buttons(form_root_selector=d.get("form_root_selector"))
             if buttons:
-                pick = _llm_pick_final_submit(buttons, config or {})
-                if pick and pick.get("text"):
-                    print(f"  [send] LLM picked first: {pick.get('text')} ({pick.get('reason','')[:60]})")
-                    click_res = _click_by_exact_text(pick["text"])
+                click_res = _llm_click_submit_candidate(
+                    buttons, config or {}, form_root_selector=d.get("form_root_selector")
+                )
+                pick = (click_res or {}).get("picked") or {}
+                if click_res and click_res.get("clicked"):
+                    picked_label = pick.get("text") or pick.get("selector") or click_res.get("text")
+                    print(f"  [send] LLM picked first: {picked_label} ({pick.get('reason','')[:60]})")
                     _emit_event(
                         "send.first.llm_pick", stage="send", target_id=tid,
                         payload={
-                            "picked_text": pick.get("text"),
+                            "picked_text": (pick.get("text") or "")[:120],
+                            "picked_selector": (pick.get("selector") or "")[:160],
                             "clicked": bool(click_res and click_res.get("clicked")),
                             "candidates": len(buttons),
                         },
@@ -3745,14 +3873,16 @@ def stage_send(
                 print(f"  [send] ⚠ final submit not matched by patterns — falling back to LLM picker")
                 buttons = _enumerate_buttons()
                 if buttons:
-                    pick = _llm_pick_final_submit(buttons, config or {})
-                    if pick and pick.get("text"):
-                        print(f"  [send] LLM picked: {pick.get('text')} ({pick.get('reason','')[:60]})")
-                        click2 = _click_by_exact_text(pick["text"])
+                    click2 = _llm_click_submit_candidate(buttons, config or {})
+                    pick = (click2 or {}).get("picked") or {}
+                    if click2 and click2.get("clicked"):
+                        picked_label = pick.get("text") or pick.get("selector") or click2.get("text")
+                        print(f"  [send] LLM picked: {picked_label} ({pick.get('reason','')[:60]})")
                         _emit_event(
                             "send.final.llm_pick", stage="send", target_id=tid,
                             payload={
-                                "picked_text": pick.get("text"),
+                                "picked_text": (pick.get("text") or "")[:120],
+                                "picked_selector": (pick.get("selector") or "")[:160],
                                 "clicked": bool(click2 and click2.get("clicked")),
                                 "candidates": len(buttons),
                             },
