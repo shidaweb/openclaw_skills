@@ -188,6 +188,15 @@ class TestInquiryTypeSelect(unittest.TestCase):
         ):
             self.assertEqual(self.run_mod._infer_submit_flow_from_buttons(), "single")
 
+    def test_phase_filter_drops_noise_links_for_final(self) -> None:
+        buttons = [
+            {"text": "こちら", "tag": "a", "href": "https://example.com"},
+            {"text": "個人情報の取扱い", "tag": "a", "href": "#"},
+            {"text": "上記の内容で送信", "tag": "button", "href": ""},
+        ]
+        out = self.run_mod._phase_filter_submit_candidates(buttons, phase="final")
+        self.assertEqual(out[0]["text"], "上記の内容で送信")
+
     def test_inquiry_type_no_b2b_flags_true_when_llm_or_fallback_true(self) -> None:
         inquiry_fields = [
             {

@@ -2033,6 +2033,7 @@ def _click_by_selector(selector: str) -> dict[str, Any] | None:
 
 _FIRST_STEP_BTN_RE = re.compile(r"(入力内容を確認|内容(を|の)?確認|確認画面|同意して次へ|^次へ$)", re.I)
 _FINAL_STEP_BTN_RE = re.compile(r"(送信|submit|完了|確定|問い合わせを送信|お問い合わせを送信)", re.I)
+_NOISE_BTN_RE = re.compile(r"^(こちら|個人情報の取扱い|プライバシー|詳細|トップ|戻る|一覧)$", re.I)
 
 
 def _looks_like_first_step_button(text: str) -> bool:
@@ -2060,6 +2061,43 @@ def _infer_submit_flow_from_buttons(form_root_selector: str | None = None) -> st
     if final_like > 0 and first_like == 0:
         return "single"
     return None
+
+
+def _phase_filter_submit_candidates(
+    buttons: list[dict[str, Any]],
+    *,
+    phase: str,
+) -> list[dict[str, Any]]:
+    def score(btn: dict[str, Any]) -> int:
+        text = str(btn.get("text") or "").strip()
+        href = str(btn.get("href") or "").strip()
+        tag = str(btn.get("tag") or "").strip().lower()
+        s = 0
+        if not text:
+            s -= 2
+        if _NOISE_BTN_RE.search(text):
+            s -= 4
+        if "こちら" in text:
+            s -= 2
+        if tag == "a" and href and href != "#" and not href.lower().startswith("javascript:"):
+            s -= 2
+        if phase == "final":
+            if _looks_like_final_step_button(text):
+                s += 5
+            if _looks_like_first_step_button(text) and not _looks_like_final_step_button(text):
+                s -= 4
+        else:
+            if _looks_like_first_step_button(text):
+                s += 5
+            if _looks_like_final_step_button(text) and not _looks_like_first_step_button(text):
+                s -= 3
+        return s
+
+    ranked = sorted(buttons, key=score, reverse=True)
+    strong = [b for b in ranked if score(b) >= 0]
+    if strong:
+        return strong[:25]
+    return ranked[:25]
 
 
 _FINAL_SUBMIT_PICKER_PROMPT = """あなたは日本語B2B問い合わせフォームの確認画面で「最終送信ボタン」を1つ選ぶ役割です。
@@ -2174,7 +2212,8 @@ def _llm_click_submit_candidate(
     form_root_selector: str | None = None,
     phase: str = "final",
 ) -> dict[str, Any] | None:
-    pick = _llm_pick_final_submit(buttons, config or {}, phase=phase)
+    scoped_buttons = _phase_filter_submit_candidates(buttons, phase=phase)
+    pick = _llm_pick_final_submit(scoped_buttons, config or {}, phase=phase)
     if not pick:
         return None
     selector = str(pick.get("selector") or "").strip()
@@ -4122,9 +4161,14 @@ def stage_send(
             ])
             if not click2 or not click2.get("clicked"):
                 print(f"  [send] ⚠ final submit not matched by patterns — falling back to LLM picker")
-                buttons = _enumerate_buttons()
+                buttons = _enumerate_buttons(form_root_selector=d.get("form_root_selector"))
                 if buttons:
-                    click2 = _llm_click_submit_candidate(buttons, config or {}, phase="final")
+                    click2 = _llm_click_submit_candidate(
+                        buttons,
+                        config or {},
+                        form_root_selector=d.get("form_root_selector"),
+                        phase="final",
+                    )
                     pick = (click2 or {}).get("picked") or {}
                     if click2 and click2.get("clicked"):
                         picked_label = pick.get("text") or pick.get("selector") or click2.get("text")
