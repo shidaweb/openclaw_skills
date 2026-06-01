@@ -2058,6 +2058,59 @@ def _llm_pick_final_submit(buttons: list[dict[str, Any]],
     return None
 
 
+def _form_analyzer_base_model(config: dict[str, Any] | None) -> str:
+    model_cfg = (config or {}).get("model", {}) or {}
+    return str(model_cfg.get("form_analyzer_name") or model_cfg.get("name") or DEFAULT_MODEL)
+
+
+def _form_analyzer_escalation_model(config: dict[str, Any] | None) -> str:
+    model_cfg = (config or {}).get("model", {}) or {}
+    return str(
+        model_cfg.get("form_analyzer_escalation_name")
+        or model_cfg.get("opus_name")
+        or model_cfg.get("opus_model")
+        or ""
+    )
+
+
+def _has_form_analyzer_escalation(config: dict[str, Any] | None) -> bool:
+    base = _form_analyzer_base_model(config)
+    escalated = _form_analyzer_escalation_model(config)
+    return bool(escalated and escalated != base)
+
+
+def _config_with_form_analyzer_model(
+    config: dict[str, Any] | None,
+    model_name: str,
+) -> dict[str, Any]:
+    cfg = dict(config or {})
+    model_cfg = dict(cfg.get("model") or {})
+    model_cfg["form_analyzer_name"] = model_name
+    cfg["model"] = model_cfg
+    return cfg
+
+
+def _inquiry_guardrail_status(target: dict[str, Any]) -> dict[str, Any]:
+    fields = _extract_inquiry_type_fields(target.get("form_fields") or {})
+    if not fields:
+        return {"has_inquiry": False, "low_confidence": False, "no_b2b": False, "reason": "none"}
+    low = 0
+    no_b2b = 0
+    for field in fields:
+        picked = core_submit_progress.choose_b2b_option(field.get("options") or [])
+        if not picked:
+            no_b2b += 1
+            continue
+        if str(picked.get("confidence") or "") == "low":
+            low += 1
+    return {
+        "has_inquiry": True,
+        "low_confidence": low > 0,
+        "no_b2b": no_b2b >= len(fields),
+        "reason": "low_confidence" if low > 0 else ("no_b2b" if no_b2b >= len(fields) else "ok"),
+    }
+
+
 def _llm_click_submit_candidate(
     buttons: list[dict[str, Any]],
     config: dict[str, Any],
@@ -2167,14 +2220,24 @@ The draft body will be ≤ {body_max_chars} characters. Use placeholder `__BODY_
 Output the JSON only, no prose."""
 
 
-def _llm_analyze_form(target: dict[str, Any], config: dict[str, Any],
-                       body_max_chars: int = 400) -> dict[str, Any] | None:
+def _llm_analyze_form(
+    target: dict[str, Any],
+    config: dict[str, Any],
+    body_max_chars: int = 400,
+    *,
+    force_refresh: bool = False,
+    escalation_reason: str | None = None,
+) -> dict[str, Any] | None:
     """
     Use Sonnet to plan how to fill a target's form. Returns plan dict or None.
     Plan is cached on the target as `_llm_plan` once analyzed.
     """
-    if target.get("_llm_plan"):
-        return target["_llm_plan"]
+    selected_model = _form_analyzer_base_model(config)
+    plan_meta = target.get("_llm_plan_meta") or {}
+    if target.get("_llm_plan") and not force_refresh:
+        cached_model = str(plan_meta.get("model") or "")
+        if (not cached_model) or cached_model == selected_model:
+            return target["_llm_plan"]
 
     form_fields = target.get("form_fields") or {}
     if not form_fields or not (form_fields.get("inputs")
@@ -2193,13 +2256,16 @@ def _llm_analyze_form(target: dict[str, Any], config: dict[str, Any],
         form_fields_json=json.dumps(form_fields, ensure_ascii=False, indent=2),
     )
 
-    model_cfg = config.get("model", {}) or {}
-    model = model_cfg.get("form_analyzer_name") or model_cfg.get("name", DEFAULT_MODEL)
-    response = oc_infer(prompt, model=model)
+    response = oc_infer(prompt, model=selected_model)
     plan = extract_first_json(response or "")
     if not plan or "fields" not in plan:
         return None
     target["_llm_plan"] = plan
+    target["_llm_plan_meta"] = {
+        "model": selected_model,
+        "escalation_reason": escalation_reason or "",
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+    }
     return plan
 
 
@@ -2756,10 +2822,34 @@ def fill_form_for_target(
         extended_max=int(model_cfg.get("max_chars_extended", 400)),
     )
     plan = _llm_analyze_form(target, config, body_max_chars=char_limit)
+    guard = _inquiry_guardrail_status(target)
+    if plan and _has_form_analyzer_escalation(config):
+        if guard.get("low_confidence") or guard.get("no_b2b"):
+            escalated_model = _form_analyzer_escalation_model(config)
+            if escalated_model and str((target.get("_llm_plan_meta") or {}).get("model") or "") != escalated_model:
+                _emit_event(
+                    "send.plan.escalated",
+                    stage="send",
+                    target_id=str(target.get("id") or target.get("name") or ""),
+                    payload={
+                        "from_model": str((target.get("_llm_plan_meta") or {}).get("model") or _form_analyzer_base_model(config)),
+                        "to_model": escalated_model,
+                        "reason": f"inquiry_guard:{guard.get('reason')}",
+                    },
+                    trace_dir=trace_dir,
+                )
+                plan = _llm_analyze_form(
+                    target,
+                    _config_with_form_analyzer_model(config, escalated_model),
+                    body_max_chars=char_limit,
+                    force_refresh=True,
+                    escalation_reason=f"inquiry_guard:{guard.get('reason')}",
+                )
     plan_diag = None
     if plan:
         target["_llm_plan"] = plan
         tid = str(target.get("id") or "?")
+        plan_model = str((target.get("_llm_plan_meta") or {}).get("model") or _form_analyzer_base_model(config))
         _emit_event(
             "send.plan.generated",
             stage="send",
@@ -2768,6 +2858,7 @@ def fill_form_for_target(
                 "field_count": len(plan.get("fields") or []),
                 "checkboxes_count": len(plan.get("checkboxes_to_check") or []),
                 "flow": plan.get("next_step"),
+                "model": plan_model,
             },
             trace_dir=trace_dir,
         )
@@ -2831,7 +2922,20 @@ def fill_form_for_target(
                 if fresh.get("form_root_selector"):
                     target["form_root_selector"] = fresh["form_root_selector"]
             target.pop("_llm_plan", None)
-            plan2 = _llm_analyze_form(target, config, body_max_chars=char_limit)
+            target.pop("_llm_plan_meta", None)
+            iter_cfg = config
+            iter_reason = "iterative_retry"
+            if _has_form_analyzer_escalation(config):
+                escalated_model = _form_analyzer_escalation_model(config)
+                if escalated_model:
+                    iter_cfg = _config_with_form_analyzer_model(config, escalated_model)
+                    iter_reason = "iterative_retry_escalated"
+            plan2 = _llm_analyze_form(
+                target,
+                iter_cfg,
+                body_max_chars=char_limit,
+                escalation_reason=iter_reason,
+            )
             if plan2 and plan2.get("fields"):
                 already = set()
                 for x in plan_diag.get("filled") or []:
@@ -4003,8 +4107,66 @@ def stage_send(
                         print(f"  [send] ⚠ URL除去再送も不成立 — filled_only")
                         filled_only.append(d)
                 else:
-                    print(f"  [send] ⚠ verify: {vresult.get('status')} — {vresult.get('reason')}")
-                    filled_only.append(d)
+                    escalated_ok = False
+                    if mode in ("auto", "interactive") and _has_form_analyzer_escalation(config):
+                        escalated_model = _form_analyzer_escalation_model(config)
+                        cur_model = str(
+                            (d.get("_llm_plan_meta") or {}).get("model")
+                            or _form_analyzer_base_model(config)
+                        )
+                        if escalated_model and cur_model != escalated_model:
+                            print(
+                                f"  [send] verify failed → form analyzer escalation "
+                                f"{cur_model} -> {escalated_model}"
+                            )
+                            _emit_event(
+                                "send.verify.escalation_retry",
+                                stage="send",
+                                target_id=tid,
+                                payload={
+                                    "from_model": cur_model,
+                                    "to_model": escalated_model,
+                                    "verify_status": vresult.get("status"),
+                                    "verify_reason": (vresult.get("reason") or "")[:160],
+                                },
+                                trace_dir=trace,
+                            )
+                            d.pop("_llm_plan", None)
+                            d.pop("_llm_plan_meta", None)
+                            esc_cfg = _config_with_form_analyzer_model(config, escalated_model)
+                            retry = _deep_submit(
+                                d, send_body, esc_cfg, trace=trace, flow=flow,
+                                verify_strict=verify_strict, iterative_fill=True,
+                            )
+                            outcome2 = (
+                                handle_verify_result(d, retry["vresult"], DATA_DIR, channel="jp_form")
+                                if retry.get("vresult") else "failed"
+                            )
+                            if outcome2 == "sent_ok":
+                                print(f"  [send] ✅ escalated analyzer retry succeeded")
+                                core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SENT)
+                                if tab_isolation:
+                                    _close_tab(cur_tab_id)
+                                _emit_event(
+                                    "send.verify.escalation_ok",
+                                    stage="send",
+                                    target_id=tid,
+                                    payload={"model": escalated_model},
+                                    trace_dir=trace,
+                                )
+                                sent.append(d)
+                                escalated_ok = True
+                            else:
+                                _emit_event(
+                                    "send.verify.escalation_failed",
+                                    stage="send",
+                                    target_id=tid,
+                                    payload={"model": escalated_model},
+                                    trace_dir=trace,
+                                )
+                    if not escalated_ok:
+                        print(f"  [send] ⚠ verify: {vresult.get('status')} — {vresult.get('reason')}")
+                        filled_only.append(d)
         else:
             filled_only.append(d)
 
