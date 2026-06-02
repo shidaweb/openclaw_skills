@@ -178,6 +178,7 @@ def choose_b2b_option(options: list[Any] | None) -> dict[str, Any] | None:
     candidates = _normalize_options(options or [])
     scored: list[dict[str, Any]] = []
     prefer_hits = 0
+    sonota_candidate: dict[str, Any] | None = None
     for opt in candidates:
         if bool(opt.get("selected")) or bool(opt.get("disabled")):
             continue
@@ -203,6 +204,13 @@ def choose_b2b_option(options: list[Any] | None) -> dict[str, Any] | None:
             score -= 4
         if "その他" in text:
             score += 1
+            if sonota_candidate is None:
+                sonota_candidate = {
+                    "value": label or value,
+                    "score": 1,
+                    "confidence": "low",
+                    "reason": "fallback_sonota",
+                }
         if strong_prefer or weak_prefer:
             prefer_hits += 1
         scored.append(
@@ -214,8 +222,10 @@ def choose_b2b_option(options: list[Any] | None) -> dict[str, Any] | None:
                 "label": label,
             }
         )
-    if not scored or prefer_hits <= 0:
+    if not scored:
         return None
+    if prefer_hits <= 0:
+        return sonota_candidate
     scored.sort(key=lambda x: x["score"], reverse=True)
     top = scored[0]
     if top["score"] < 2:

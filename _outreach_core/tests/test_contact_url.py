@@ -53,8 +53,19 @@ class TestContactUrl(unittest.TestCase):
         fields = {
             "inputs": [{"name": "email", "label": "メールアドレス"}],
             "textareas": [{"name": "inquiry_body", "label": "お問い合わせ内容"}],
+            "submit_buttons": [{"text": "送信する", "disabled": False}],
         }
         kind, _reason = cu.classify_form_type(fields, "法人のお問い合わせ")
+        self.assertEqual(kind, "contact")
+
+    def test_classify_contact_with_placeholder_select_still_contact(self) -> None:
+        fields = {
+            "inputs": [{"name": "email", "label": "メールアドレス"}],
+            "textareas": [{"name": "details", "label": "詳細をお書きください"}],
+            "selects": [{"name": "kind", "label": "お問い合わせ種別", "options": ["選択してください", "個人のお客様", "その他"]}],
+            "submit_buttons": [{"text": "送信", "disabled": False}],
+        }
+        kind, _reason = cu.classify_form_type(fields, "お問い合わせ")
         self.assertEqual(kind, "contact")
 
     def test_classify_pre_form_gate_without_textarea_as_contact(self) -> None:
@@ -68,6 +79,11 @@ class TestContactUrl(unittest.TestCase):
         kind, reason = cu.classify_form_type(fields, snap)
         self.assertEqual(kind, "contact")
         self.assertEqual(reason, "pre_form_gate")
+
+    def test_is_error_page_detects_404_text(self) -> None:
+        self.assertTrue(cu.is_error_page("404 ページが見つかりません", url="https://example.co.jp/contact"))
+        self.assertTrue(cu.is_error_page("normal", http_status=404))
+        self.assertFalse(cu.is_error_page("お問い合わせフォーム", url="https://example.co.jp/inquiry"))
 
 
 if __name__ == "__main__":

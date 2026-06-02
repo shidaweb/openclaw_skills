@@ -525,6 +525,7 @@ def stage_enrich(
         corrected_emitted = False
         chosen_url = ""
         original_url = str(t.get("form_url") or "").strip()
+        best_known: dict[str, Any] | None = None
 
         # Seed candidates: explicit form_url first, then contact_url_candidates.
         for seed_idx, seed_url in enumerate(seed_urls[:5], 1):
@@ -555,9 +556,19 @@ def stage_enrich(
 
             fields = _evaluate(_FORM_FIELDS_JS) or {}
             snap = oc_browser("snapshot") or ""
+            if core_contact_url.is_error_page(snap, url=seed_url):
+                _emit_event(
+                    "enrich.nav.error_page",
+                    stage="enrich",
+                    target_id=str(t_work.get("id") or ""),
+                    payload={"url": seed_url[:200], "where": "seed"},
+                )
+                print(f"[enrich]    ↳ seed error page detected, skip: {seed_url}")
+                continue
             form_kind, form_reason = _classify_form_type(fields, snap)
             chosen_url = seed_url
             if form_kind == "contact":
+                best_known = {"url": seed_url, "fields": fields, "snap": snap}
                 break
 
             links = _list_page_links()
@@ -579,13 +590,25 @@ def stage_enrich(
                     target_id=t_work.get("id"),
                     emit_event=lambda kind, **kw: _emit_event(kind, **kw),
                 )
-                fields2 = _evaluate(_FORM_FIELDS_JS) or {}
                 snap2 = oc_browser("snapshot") or ""
+                if core_contact_url.is_error_page(snap2, url=cand):
+                    _emit_event(
+                        "enrich.nav.error_page",
+                        stage="enrich",
+                        target_id=str(t_work.get("id") or ""),
+                        payload={"url": cand[:200], "where": "candidate"},
+                    )
+                    if best_known and best_known.get("url"):
+                        oc_browser("open", str(best_known["url"]))
+                        time.sleep(RATE_LIMIT_SECONDS)
+                    continue
+                fields2 = _evaluate(_FORM_FIELDS_JS) or {}
                 kind2, reason2 = _classify_form_type(fields2, snap2)
                 if kind2 == "contact":
                     fields, snap = fields2, snap2
                     form_kind, form_reason = kind2, reason2
                     chosen_url = cand
+                    best_known = {"url": cand, "fields": fields2, "snap": snap2}
                     _emit_event(
                         "enrich.form.url_corrected",
                         stage="enrich",
@@ -599,8 +622,18 @@ def stage_enrich(
                     corrected_emitted = True
                     print(f"[enrich]    ✅ corrected form_url -> {cand}")
                     break
+                if best_known and best_known.get("url"):
+                    oc_browser("open", str(best_known["url"]))
+                    time.sleep(RATE_LIMIT_SECONDS)
             if form_kind == "contact":
                 break
+
+        if form_kind != "contact" and best_known:
+            chosen_url = str(best_known.get("url") or chosen_url)
+            fields = dict(best_known.get("fields") or fields)
+            snap = str(best_known.get("snap") or snap)
+            form_kind = "contact"
+            form_reason = "best_known_good_contact"
 
         t_work["form_url"] = chosen_url or (seed_urls[0] if seed_urls else "")
         if original_url and chosen_url and chosen_url != original_url:

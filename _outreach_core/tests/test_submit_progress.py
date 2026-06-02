@@ -94,7 +94,7 @@ class TestSubmitProgress(unittest.TestCase):
         actions = sp.pick_select_gate_actions(groups)
         self.assertEqual(actions, [{"name": "contact_category", "value": "業務用食材、備品、消耗品のご提案について"}])
 
-    def test_pick_select_gate_actions_returns_none_when_no_b2b_option(self) -> None:
+    def test_pick_select_gate_actions_falls_back_to_sonota_when_no_b2b_option(self) -> None:
         groups = [
             {
                 "name": "contact_category",
@@ -109,7 +109,7 @@ class TestSubmitProgress(unittest.TestCase):
             }
         ]
         actions = sp.pick_select_gate_actions(groups)
-        self.assertEqual(actions, [])
+        self.assertEqual(actions, [{"name": "contact_category", "value": "その他のお問い合わせ"}])
 
     def test_pick_select_gate_actions_skips_selected_group(self) -> None:
         groups = [
@@ -216,6 +216,17 @@ class TestSubmitProgress(unittest.TestCase):
         self.assertTrue(out["checkboxes"])
         self.assertTrue(out["radios"])
         self.assertTrue(out["selects"])
+
+    def test_choose_b2b_option_falls_back_to_sonota(self) -> None:
+        options = [
+            {"label": "選択してください", "value": "", "selected": True, "disabled": False},
+            {"label": "個人のお客様", "value": "personal", "selected": False, "disabled": False},
+            {"label": "その他", "value": "other", "selected": False, "disabled": False},
+        ]
+        picked = sp.choose_b2b_option(options)
+        self.assertIsNotNone(picked)
+        self.assertEqual(picked["value"], "その他")
+        self.assertEqual(picked["confidence"], "low")
 
 
 if __name__ == "__main__":

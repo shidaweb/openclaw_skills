@@ -79,6 +79,20 @@ _PRE_FORM_GATE_KW = (
     "上記に同意してお問い合わせする",
     "同意してお問い合わせ",
 )
+_ERROR_PAGE_KW = (
+    "404",
+    "not found",
+    "page not found",
+    "ページが見つかりません",
+    "お探しのページ",
+    "存在しません",
+    "forbidden",
+    "アクセスできません",
+    "アクセスが禁止",
+    "500",
+    "503",
+    "server error",
+)
 
 
 def registrable_domain(url_or_host: str) -> str:
@@ -188,10 +202,28 @@ def classify_form_type(fields: dict, snapshot: str | None) -> tuple[str, str | N
     if _looks_like_contact_gate(fields, snap_head):
         return ("contact", "pre_form_gate")
 
-    if not _has_contact_textarea(fields):
+    has_contact_textarea = _has_contact_textarea(fields)
+    has_submit = _has_submit_control(fields, snap_head)
+    if has_contact_textarea and has_submit:
+        return ("contact", "textarea_plus_submit")
+
+    if not has_contact_textarea:
         return ("unknown_no_textarea", "no valid inquiry textarea")
 
     return ("contact", None)
+
+
+def is_error_page(snapshot: str | None, url: str | None = None, http_status: int | None = None) -> bool:
+    if isinstance(http_status, int) and 400 <= http_status <= 599:
+        return True
+    snap = (snapshot or "").lower()
+    if any(k in snap for k in _ERROR_PAGE_KW):
+        return True
+    u = (url or "").lower()
+    if any(x in u for x in ("/404", "error", "notfound")):
+        if "inquiry" not in u and "contact" not in u:
+            return True
+    return False
 
 
 def _looks_like_contact_gate(fields: dict, snap_head: str) -> bool:
@@ -226,6 +258,16 @@ def _has_contact_textarea(fields: dict) -> bool:
         return False
     inp_blob = " ".join(str(i.get("name") or i.get("label") or "") for i in inputs).lower()
     return ("mail" in inp_blob or "email" in inp_blob or "氏名" in inp_blob or "name" in inp_blob)
+
+
+def _has_submit_control(fields: dict, snap_head: str) -> bool:
+    for btn in fields.get("submit_buttons") or []:
+        if not isinstance(btn, dict):
+            continue
+        text = str(btn.get("text") or "").lower()
+        if any(k in text for k in ("送信", "submit", "確認", "完了", "確定")):
+            return True
+    return any(k in snap_head.lower() for k in ("送信", "submit", "確認", "完了", "確定"))
 
 
 def _normalize_http_url(url: str) -> str:
