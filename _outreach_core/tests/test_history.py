@@ -37,6 +37,17 @@ class TestGlobalExclude(unittest.TestCase):
         self.assertEqual(a, b)
         self.assertTrue(a)
 
+    def test_canonical_company_key_handles_alias_like_holdings_vs_hd(self) -> None:
+        a = history.canonical_company_key("geo_holdings")
+        b = history.canonical_company_key("geo_hd")
+        self.assertEqual(a, "geo")
+        self.assertEqual(a, b)
+
+    def test_canonical_company_key_handles_qbnet_variants(self) -> None:
+        a = history.canonical_company_key("qbnet_holdings")
+        b = history.canonical_company_key("qb_net_holdings")
+        self.assertEqual(a, b)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -33,22 +33,46 @@ def canonical_company_id(company_name: str) -> str:
     return s[:120]
 
 
+_LOOSE_SUFFIX_RE = re.compile(
+    r"(kabushikigaisha|株式会社|有限会社|合同会社|holdings?|hd|group|inc|corp|co|ltd|llc|gk)$",
+    re.I,
+)
+
+
+def canonical_company_key(company_name_or_id: str) -> str:
+    """Loose dedupe key for near-duplicate name/id variants.
+
+    Used only for ingestion-time duplicate suppression (e.g. qbnet_holdings vs
+    qb_net_holdings, geo_hd vs geo_holdings).
+    """
+    base = canonical_company_id(company_name_or_id or "")
+    if not base:
+        return ""
+    parts = [p for p in re.split(r"[_\-]+", base) if p]
+    while parts and _LOOSE_SUFFIX_RE.fullmatch(parts[-1] or ""):
+        parts.pop()
+    if not parts:
+        return ""
+    return "".join(parts)[:120]
+
+
 def _load_id_set(path: Path) -> set[str]:
     if not path.exists():
         return set()
     ids: set[str] = set()
-    for line in path.open():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-            for key in _ID_FIELDS:
-                val = entry.get(key)
-                if val:
-                    ids.add(str(val))
-        except Exception:
-            continue
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                for key in _ID_FIELDS:
+                    val = entry.get(key)
+                    if val:
+                        ids.add(str(val))
+            except Exception:
+                continue
     return ids
 
 

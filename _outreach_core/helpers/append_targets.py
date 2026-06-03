@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime as dt
 import json
 import sys
 from pathlib import Path
@@ -17,54 +18,79 @@ from _outreach_core import history
 SKILLS_ROOT = history.SKILLS_ROOT
 
 
-def _read_input(path: str, fmt: str) -> list[dict[str, Any]]:
+def _read_input(path: str, fmt: str) -> tuple[str, list[dict[str, Any]]]:
     raw = sys.stdin.read() if path == "-" else Path(path).read_text()
     if fmt == "jsonl":
-        return [json.loads(line) for line in raw.splitlines() if line.strip()]
+        return raw, [json.loads(line) for line in raw.splitlines() if line.strip()]
     data = json.loads(raw)
     if isinstance(data, list):
-        return data
+        return raw, data
     if isinstance(data, dict) and "companies" in data:
-        return data["companies"]
+        return raw, data["companies"]
     if isinstance(data, dict) and "targets" in data:
-        return data["targets"]
+        return raw, data["targets"]
     raise ValueError("expected JSON array or {companies: [...]}")
 
 
-def _existing_jp_ids(yaml_path: Path) -> set[str]:
+def _existing_jp_ids(yaml_path: Path) -> tuple[set[str], set[str]]:
     try:
         import yaml
     except ImportError:
         raise RuntimeError("pyyaml required") from None
     if not yaml_path.exists():
-        return set()
+        return set(), set()
     raw = yaml.safe_load(yaml_path.read_text()) or {}
     companies = raw.get("companies") or []
     ids: set[str] = set()
+    loose: set[str] = set()
     for c in companies:
         if isinstance(c, dict):
             if c.get("id"):
-                ids.add(str(c["id"]))
+                sid = str(c["id"])
+                ids.add(sid)
+                lk = history.canonical_company_key(sid)
+                if lk:
+                    loose.add(lk)
             if c.get("name"):
-                ids.add(history.canonical_company_id(str(c["name"])))
-    return ids
+                name = str(c["name"])
+                ids.add(history.canonical_company_id(name))
+                lk = history.canonical_company_key(name)
+                if lk:
+                    loose.add(lk)
+    return ids, loose
 
 
-def append_jp_form(companies: list[dict[str, Any]], yaml_path: Path) -> int:
+def append_jp_form(
+    companies: list[dict[str, Any]],
+    yaml_path: Path,
+    *,
+    exclude_ids: set[str] | None = None,
+) -> int:
     import yaml
 
     raw = yaml.safe_load(yaml_path.read_text()) if yaml_path.exists() else {}
     if raw is None:
         raw = {}
-    existing = _existing_jp_ids(yaml_path)
+    existing, existing_loose = _existing_jp_ids(yaml_path)
+    excluded = exclude_ids or set()
+    excluded_loose = {
+        history.canonical_company_key(x) for x in excluded if str(x or "").strip()
+    }
     bucket = raw.get("companies") or []
     added = 0
+    skipped_dup = 0
+    skipped_excluded = 0
     for c in companies:
         if not isinstance(c, dict) or not c.get("name"):
             continue
         cid = c.get("id") or history.canonical_company_id(str(c["name"]))
         canon = history.canonical_company_id(str(c["name"]))
-        if cid in existing or canon in existing:
+        loose = history.canonical_company_key(str(c.get("id") or c["name"]))
+        if cid in excluded or canon in excluded or (loose and loose in excluded_loose):
+            skipped_excluded += 1
+            continue
+        if cid in existing or canon in existing or (loose and loose in existing_loose):
+            skipped_dup += 1
             continue
         row = {
             "id": cid,
@@ -84,12 +110,19 @@ def append_jp_form(companies: list[dict[str, Any]], yaml_path: Path) -> int:
         bucket.append(row)
         existing.add(str(cid))
         existing.add(canon)
+        if loose:
+            existing_loose.add(loose)
         added += 1
     raw["companies"] = bucket
     yaml_path.write_text(
         yaml.safe_dump(raw, allow_unicode=True, sort_keys=False),
         encoding="utf-8",
     )
+    if skipped_dup or skipped_excluded:
+        print(
+            f"[append_targets] jp_form dedup: skipped duplicate={skipped_dup}, excluded(sent/skip)={skipped_excluded}",
+            file=sys.stderr,
+        )
     return added
 
 
@@ -134,18 +167,37 @@ def append_linkedin(companies: list[dict[str, Any]], csv_path: Path) -> int:
     return added
 
 
+def _save_raw_ingest(skill: str, raw: str) -> Path | None:
+    if not raw.strip():
+        return None
+    base = SKILLS_ROOT / ("jp-form-outreach" if skill == "jp_form" else "linkedin-outreach")
+    intake_dir = base / "data" / "intake"
+    intake_dir.mkdir(parents=True, exist_ok=True)
+    stamp = dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    out = intake_dir / f"ingest_{stamp}.json"
+    out.write_text(raw, encoding="utf-8")
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--skill", required=True, choices=["linkedin", "jp_form"])
     ap.add_argument("--input", default="-")
     ap.add_argument("--format", default="jsonl", choices=["jsonl", "json"])
     ap.add_argument("--targets-path", default=None)
+    ap.add_argument("--brief", default=None, help="brief id for sent/skip exclude filtering")
+    ap.add_argument("--no-save-raw", action="store_true", help="do not persist raw ingestion payload")
     args = ap.parse_args(argv)
 
-    items = _read_input(args.input, args.format)
+    raw, items = _read_input(args.input, args.format)
+    if not args.no_save_raw:
+        saved = _save_raw_ingest(args.skill, raw)
+        if saved:
+            print(f"[append_targets] saved raw ingest -> {saved}", file=sys.stderr)
     if args.skill == "jp_form":
         path = Path(args.targets_path) if args.targets_path else SKILLS_ROOT / "jp-form-outreach" / "targets.yaml"
-        n = append_jp_form(items, path)
+        exclude = history.load_global_exclude_set(args.brief)
+        n = append_jp_form(items, path, exclude_ids=exclude)
         print(f"[append_targets] jp_form: added {n} → {path}")
     else:
         path = Path(args.targets_path) if args.targets_path else SKILLS_ROOT / "linkedin-outreach" / "targets.csv"
