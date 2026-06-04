@@ -287,6 +287,62 @@ def _recent_events(limit: int, skills_root: Path | None = None) -> list[str]:
     return [label for _, label in collected[:limit]] or ["(none)"]
 
 
+def read_watchdog_state(skills_root: Path | None = None) -> dict[str, Any] | None:
+    root = skills_root or SKILLS_ROOT
+    path = root / "data" / "watchdog.state.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def watchdog_liveness_line(skills_root: Path | None = None) -> str:
+    """One-line, subprocess-free view of whether the watchdog itself is ticking.
+
+    This makes a *dead watchdog* visible from a normal "ping" — the failure mode
+    where nothing else would ever tell you supervision has stopped."""
+    st = read_watchdog_state(skills_root)
+    last = (st or {}).get("last_tick_epoch")
+    if not last:
+        return "🐶 watchdog: ❓ 未確認（まだ tick されていないかも）"
+    import time as _time
+
+    age = int(_time.time() - float(last))
+    interval = 60
+    try:
+        from _outreach_core import gateway_config as _gw
+
+        interval = int(
+            _gw.watchdog_tuning(_gw.load_gateway_config(skills_root or SKILLS_ROOT)).get(
+                "interval_sec", 60
+            )
+        )
+    except Exception:
+        pass
+    age_txt = f"{age}s前" if age < 90 else f"{age // 60}分前"
+    if age <= interval * 4:
+        return f"🐶 watchdog: ✅ 稼働中（last tick {age_txt}）"
+    return (
+        f"🐶 watchdog: 🚨 停止疑い（last tick {age_txt}）"
+        " — 復旧: python3 -m _outreach_core.helpers.watchdog ensure"
+    )
+
+
+def _opportunistic_watchdog_ensure(skills_root: Path | None = None) -> None:
+    """Whenever a human pings, take the chance to re-ensure the watchdog is
+    installed+loaded. A second, independent recovery path for a dead watchdog.
+    Best-effort; never raises."""
+    try:
+        from _outreach_core.helpers import watchdog as _wd
+
+        _wd.ensure_watchdog_installed(skills_root)
+    except Exception:
+        pass
+
+
 def cmd_write_heartbeat(_args: argparse.Namespace) -> int:
     path = write_heartbeat()
     print(f"wrote {path}")
@@ -315,11 +371,16 @@ def _refresh_then_read() -> dict[str, Any] | None:
 
 def cmd_ping(_args: argparse.Namespace) -> int:
     print(format_ping_line(_refresh_then_read()))
+    print(watchdog_liveness_line())
+    _opportunistic_watchdog_ensure()
     return 0
 
 
 def cmd_status(_args: argparse.Namespace) -> int:
     print(format_status(_refresh_then_read()))
+    print("")
+    print(watchdog_liveness_line())
+    _opportunistic_watchdog_ensure()
     return 0
 
 

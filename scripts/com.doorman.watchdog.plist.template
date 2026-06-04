@@ -18,7 +18,17 @@
   <dict>
     <key>PYTHONPATH</key>
     <string>{{SKILLS_DIR}}</string>
+    <!-- launchd's default PATH is only /usr/bin:/bin:/usr/sbin:/sbin, which
+         hides `openclaw` (Homebrew/npm). Without this the health probe silently
+         no-ops and the watchdog never restarts a hung gateway. -->
+    <key>PATH</key>
+    <string>{{PATH}}</string>
   </dict>
+  <!-- Tick model: the watchdog runs one check and exits. StartInterval drives
+       periodic ticks and RunAtLoad fires one immediately on (re)load/boot.
+       KeepAlive is intentionally false here: a KeepAlive=true exit-per-tick job
+       would busy-loop. Missed ticks (e.g. sleep) are recovered by §W2 wake
+       detection inside the tick itself. -->
   <key>StartInterval</key>
   <integer>60</integer>
   <key>KeepAlive</key>

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -211,6 +212,9 @@ def _supervise(skill: str, run_id: str, log_path: str, run_args: list[str]) -> i
                   level="error", thread_ts=thread_ts)
             return 1
 
+        # Keep the machine awake while this run lives (auto-exits with the child).
+        caf = _start_caffeinate(proc.pid)
+
         killed_for_stall = False
         code: int | None = None
         while True:
@@ -232,12 +236,14 @@ def _supervise(skill: str, run_id: str, log_path: str, run_args: list[str]) -> i
                     break
                 if action == RS.ACTION_GIVE_UP_STALLED:
                     _kill(proc)
+                    _stop(caf)
                     _post(f"❌ stall が再試行上限に到達（{RS.MAX_RESTARTS}回/{RS.RESTART_WINDOW_MIN}分）"
                           f"。中断します: {skill} `{cmd_label}`。ログ: {log_path}",
                           level="error", thread_ts=thread_ts)
                     return 1
                 # ACTION_CONTINUE → keep polling
 
+        _stop(caf)
         if killed_for_stall:
             continue  # relaunch (idempotent resume)
 
@@ -264,6 +270,37 @@ def _supervise(skill: str, run_id: str, log_path: str, run_args: list[str]) -> i
               f"{skill} `{cmd_label}`。ログ末尾を確認してください: {log_path}",
               level="error", thread_ts=thread_ts)
         return code
+
+
+def _start_caffeinate(pid: int) -> "subprocess.Popen | None":
+    """Hold the Mac awake (no idle/disk sleep) for as long as the run lives.
+
+    A laptop sleeping mid-run is a top cause of stalls: launchd ticks stop and
+    the browser session can drop. ``caffeinate -w <pid>`` exits automatically
+    when the child exits, so it self-cleans even on crash. Best-effort: returns
+    None if caffeinate is unavailable.
+    """
+    exe = shutil.which("caffeinate")
+    if not exe:
+        return None
+    try:
+        return subprocess.Popen(  # noqa: S603 - trusted, fixed argv
+            [exe, "-i", "-m", "-w", str(pid)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+
+
+def _stop(proc: "subprocess.Popen | None") -> None:
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _kill(proc: "subprocess.Popen") -> None:

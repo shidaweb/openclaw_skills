@@ -84,22 +84,25 @@ class TestRunJob(unittest.TestCase):
             mock.patch.object(run_job, "_health_files", return_value=[]),
             mock.patch.object(RS, "save_state", lambda *a, **k: None),
             mock.patch.object(RS, "load_state", lambda *a, **k: RS.new_state()),
+            # Neutralize the caffeinate sibling so it doesn't consume the mocked
+            # subprocess.Popen side_effects used to model the child process.
+            mock.patch.object(run_job, "_start_caffeinate", return_value=None),
         )
 
     def test_supervise_posts_success(self) -> None:
         posts: list[tuple[str, str]] = []
-        p1, p2, p3, p4 = self._patches(posts)
-        with p1, p2, p3, p4, mock.patch("subprocess.Popen",
-                                        return_value=self._proc_returning(0)):
+        p1, p2, p3, p4, p5 = self._patches(posts)
+        with p1, p2, p3, p4, p5, mock.patch("subprocess.Popen",
+                                            return_value=self._proc_returning(0)):
             code = run_job._supervise("jp-form-outreach", "rid", "/tmp/x.log", ["draft"])
         self.assertEqual(code, 0)
         self.assertTrue(any("✅" in t for _lvl, t in posts))
 
     def test_supervise_exit3_means_other_run_no_restart(self) -> None:
         posts: list[tuple[str, str]] = []
-        p1, p2, p3, p4 = self._patches(posts)
-        with p1, p2, p3, p4, mock.patch("subprocess.Popen",
-                                        return_value=self._proc_returning(3)) as popen:
+        p1, p2, p3, p4, p5 = self._patches(posts)
+        with p1, p2, p3, p4, p5, mock.patch("subprocess.Popen",
+                                            return_value=self._proc_returning(3)) as popen:
             code = run_job._supervise("jp-form-outreach", "rid", "/tmp/x.log", ["send"])
         self.assertEqual(code, 3)
         self.assertEqual(popen.call_count, 1)  # never restarted
@@ -108,9 +111,9 @@ class TestRunJob(unittest.TestCase):
     def test_supervise_auto_restarts_on_crash_then_gives_up(self) -> None:
         posts: list[tuple[str, str]] = []
         import _outreach_core.run_supervisor as RS
-        p1, p2, p3, p4 = self._patches(posts)
-        with p1, p2, p3, p4, mock.patch("subprocess.Popen",
-                                        side_effect=lambda *a, **k: self._proc_returning(1)) as popen:
+        p1, p2, p3, p4, p5 = self._patches(posts)
+        with p1, p2, p3, p4, p5, mock.patch("subprocess.Popen",
+                                            side_effect=lambda *a, **k: self._proc_returning(1)) as popen:
             code = run_job._supervise("jp-form-outreach", "rid", "/tmp/x.log", ["send"])
         self.assertEqual(code, 1)
         # initial launch + MAX_RESTARTS relaunches
@@ -128,8 +131,8 @@ class TestRunJob(unittest.TestCase):
         stalled.terminate.return_value = None
         healthy = self._proc_returning(0)
 
-        p1, p2, p3, p4 = self._patches(posts)
-        with p1, p2, p3, p4, \
+        p1, p2, p3, p4, p5 = self._patches(posts)
+        with p1, p2, p3, p4, p5, \
                 mock.patch.object(RS, "latest_activity_age_sec", return_value=10 ** 6), \
                 mock.patch("subprocess.Popen", side_effect=[stalled, healthy]) as popen:
             code = run_job._supervise("jp-form-outreach", "rid", "/tmp/x.log", ["campaign"])
@@ -140,11 +143,27 @@ class TestRunJob(unittest.TestCase):
 
     def test_supervise_posts_failure_on_spawn_exception(self) -> None:
         posts: list[tuple[str, str]] = []
-        p1, p2, p3, p4 = self._patches(posts)
-        with p1, p2, p3, p4, mock.patch("subprocess.Popen", side_effect=OSError("spawn failed")):
+        p1, p2, p3, p4, p5 = self._patches(posts)
+        with p1, p2, p3, p4, p5, mock.patch("subprocess.Popen", side_effect=OSError("spawn failed")):
             code = run_job._supervise("jp-form-outreach", "rid", "/tmp/x.log", ["send"])
         self.assertEqual(code, 1)
         self.assertTrue(any(lvl == "error" for lvl, _t in posts))
+
+    def test_start_caffeinate_none_when_unavailable(self) -> None:
+        with mock.patch.object(run_job.shutil, "which", return_value=None):
+            self.assertIsNone(run_job._start_caffeinate(123))
+
+    def test_start_caffeinate_waits_on_pid(self) -> None:
+        with mock.patch.object(run_job.shutil, "which", return_value="/usr/bin/caffeinate"), \
+                mock.patch("subprocess.Popen") as popen:
+            run_job._start_caffeinate(4242)
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[0], "/usr/bin/caffeinate")
+        self.assertIn("-w", argv)
+        self.assertIn("4242", argv)
+
+    def test_stop_handles_none(self) -> None:
+        run_job._stop(None)  # must not raise
 
     def test_drive_stops_on_target(self) -> None:
         args = mock.Mock(

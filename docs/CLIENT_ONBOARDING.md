@@ -91,9 +91,28 @@ openclaw browser --browser-profile openclaw start            # 可視ウィン�
 openclaw browser --browser-profile openclaw open "https://accounts.google.com/"
 #   → 開いたウィンドウで営業用Googleアカウントにサインイン（パスワード/2FAはご本人が入力）
 
-# 7) （推奨）自動再起動 watchdog を有効化
+# 7) （推奨）自動再起動 watchdog を有効化（再実行しても安全・登録を自動検証）
 bash scripts/install-watchdog.sh
 ```
+
+> **ゲートウェイ監視（v14）**: watchdog は OpenClaw を fork せず、launchd 外部 supervisor として
+> 「死んでたら起動／スリープ復帰／自己修復／復帰不能なら Slack 通知」を行います。
+> 構成差がある場合は `data/gateway.json` で上書きできます（未設定でも既定値で動作）:
+>
+> ```json
+> {
+>   "gateway": {
+>     "label": "ai.openclaw.gateway",
+>     "health_cmd": "openclaw health",
+>     "start_cmd": "openclaw gateway start",
+>     "restart_cmd": "launchctl kickstart -k gui/{uid}/{label}",
+>     "watchdog": { "interval_sec": 60, "max_restarts": 3, "window_min": 10, "dead_alert_min": 15 },
+>     "vendor_ping": { "enabled": false, "url": "" }
+>   }
+> }
+> ```
+>
+> `vendor_ping` は**既定オフ**。opt-in 時のみ「死活のみ（install_id＋status＋時刻、PII/送信内容なし）」を送信します。
 
 ### 動作確認（本番前のスモークテスト）
 
@@ -132,7 +151,12 @@ bash scripts/install-watchdog.sh
 
 ## 6. 困ったときに見る場所
 
-- **進捗・稼働**: Slack で「ping」/「進捗どう？」。端末で `./healthcheck status`。
+- **進捗・稼働**: Slack で「ping」/「進捗どう？」。端末で `./healthcheck status`（watchdog の稼働状況も表示）。
+- **ゲートウェイ/監視の総合健全性**: `python3 -m _outreach_core.helpers.watchdog status`
+  （gateway loaded/healthy・watchdog liveness・最終正常時刻・再起動回数を1画面で。`--json` / `--notify` 可）。
+  状態が `正常` 以外なら exit code が非0になるので監視スクリプトから分岐可能。
+- **watchdog が止まっている疑い**: `python3 -m _outreach_core.helpers.watchdog ensure`
+  （LaunchAgent が消えていても再生成して再ロード。`ping` 実行時も自動で再確認します）。
 - **詰まった案件**: `cd jp-form-outreach && python run.py resolve-queue --brief <id> --status`（候補ボタン付きで一覧）。
 - **Slack 無反応時**: `openclaw channels status` / `openclaw plugins enable slack` / `openclaw gateway restart`。
 - **詳細**: [`../README.md`](../README.md) / [`OPENCLAW_AGENT.md`](./OPENCLAW_AGENT.md)。
