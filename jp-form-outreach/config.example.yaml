@@ -12,6 +12,13 @@ sender:
   name: "山田 太郎"
   name_kana: "ヤマダタロウ"
   name_furigana: "やまだたろう"
+  # Optional explicit 姓/名 splits. If omitted, the furigana guardrail splits
+  # name_kana / name_furigana with a 2-char heuristic (sei = first 2, mei = rest).
+  # Set these when the heuristic is wrong (e.g. a 1-char or 3-char surname).
+  # name_kana_sei: "ヤマダ"
+  # name_kana_mei: "タロウ"
+  # name_furigana_sei: "やまだ"
+  # name_furigana_mei: "たろう"
   role: "代表"             # 役職名 used in form 役職 fields
   company: "サンプル株式会社"
   company_short: "サンプル"

@@ -1800,6 +1800,225 @@ def _fill_textarea(value: str) -> dict[str, Any] | None:
     return res if isinstance(res, dict) else None
 
 
+# --- v15: form-validation guardrails (furigana script + required subject) ----
+# Read every visible text field with its label + current value so the pure
+# `_outreach_core.form_validation` logic can decide what is wrong, then write
+# corrected values back by *positional index* (stable for the lifetime of the
+# page — the DOM does not change between the read and the write).
+_READ_TEXT_FIELDS_JS = r"""
+() => {
+  const labelFor = (el) => {
+    if (el.id) {
+      const l = document.querySelector(`label[for="${el.id}"]`);
+      if (l) return (l.textContent || '').trim();
+    }
+    const wrap = el.closest('label');
+    if (wrap) return (wrap.textContent || '').trim();
+    let cur = el.parentElement;
+    for (let i = 0; i < 4 && cur; i++, cur = cur.parentElement) {
+      const l = cur.querySelector('label, .label, [class*="label" i]');
+      if (l && l !== el) return (l.textContent || '').trim();
+    }
+    return el.placeholder || el.name || '';
+  };
+  const isText = (el) => {
+    const t = (el.type || '').toLowerCase();
+    return t !== 'hidden' && t !== 'submit' && t !== 'button' && t !== 'radio'
+      && t !== 'checkbox' && t !== 'file' && t !== 'image';
+  };
+  const els = Array.from(document.querySelectorAll('input, textarea')).filter(isText);
+  return els.map((el, i) => ({
+    idx: i,
+    tag: el.tagName.toLowerCase(),
+    type: (el.type || '').toLowerCase(),
+    label: labelFor(el),
+    name: el.name || el.id || '',
+    value: el.value || '',
+    required: !!(el.required || el.getAttribute('aria-required') === 'true'),
+  }));
+}
+"""
+
+_SET_TEXT_FIELDS_JS = r"""
+(args) => {
+  const setVal = (el, v) => {
+    const proto = el.tagName === 'TEXTAREA'
+      ? window.HTMLTextAreaElement.prototype
+      : window.HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+    setter.call(el, v);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.dispatchEvent(new Event('blur', { bubbles: true }));
+  };
+  const isText = (el) => {
+    const t = (el.type || '').toLowerCase();
+    return t !== 'hidden' && t !== 'submit' && t !== 'button' && t !== 'radio'
+      && t !== 'checkbox' && t !== 'file' && t !== 'image';
+  };
+  const els = Array.from(document.querySelectorAll('input, textarea')).filter(isText);
+  let n = 0;
+  for (const fix of (args.fixes || [])) {
+    const el = els[fix.idx];
+    if (el) { setVal(el, fix.value); n++; }
+  }
+  return { set: n };
+}
+"""
+
+
+def _read_text_fields() -> list[dict[str, Any]]:
+    res = _evaluate(_READ_TEXT_FIELDS_JS)
+    return res if isinstance(res, list) else []
+
+
+def _set_text_fields(fixes: list[dict[str, Any]]) -> int:
+    if not fixes:
+        return 0
+    args = {"fixes": fixes}
+    js = f"""
+    (() => {{
+      const fn = {_SET_TEXT_FIELDS_JS};
+      return fn({json.dumps(args, ensure_ascii=False)});
+    }})()
+    """
+    res = _evaluate(js)
+    return int((res or {}).get("set", 0)) if isinstance(res, dict) else 0
+
+
+def _apply_fill_guardrails(
+    target: dict[str, Any],
+    sender: dict[str, Any],
+    body: str,
+    diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    """Deterministic post-fill corrections that prevent the two most common
+    Japanese-form validation rejections (observed on the YAMAHA form):
+
+      1. **Furigana script** — a フリガナ/カナ (or ふりがな) field that ended up with
+         kanji or the wrong kana is overwritten with the correct reading, split
+         姓/名 when the label asks for it.
+      2. **Required subject/title** — an empty 件名/お問い合わせタイトル field is
+         filled from the draft's subject (or a neutral B2B default).
+
+    Runs after both the LLM plan and the heuristic fill, so it corrects mistakes
+    regardless of which path produced them. Returns a small summary dict.
+    """
+    summary = {"kana_fixed": [], "subject_filled": None}
+    try:
+        from _outreach_core import form_validation as fv
+    except Exception:
+        return summary
+    try:
+        fields = _read_text_fields()
+    except Exception:
+        return summary
+    if not fields:
+        return summary
+
+    fixes: list[dict[str, Any]] = []
+    subject_value = fv.derive_subject((target.get("draft") or {}))
+    subject_done = False
+    for f in fields:
+        label = f.get("label") or ""
+        value = f.get("value") or ""
+        idx = f.get("idx")
+        if idx is None:
+            continue
+        # (1) furigana fields — correct wrong script AND wrong sei/mei split, and
+        #     fill required-but-empty kana fields. kana_field_correction returns
+        #     the value to write (or None when the field is already correct).
+        if fv.expected_kana_kind(label):
+            correct = fv.kana_field_correction(label, value, sender)
+            if not correct and (not value.strip()) and f.get("required"):
+                correct = fv.furigana_value_for_label(label, sender)
+            if correct and correct != value:
+                fixes.append({"idx": idx, "value": correct})
+                tag = "(empty)" if not value.strip() else ""
+                summary["kana_fixed"].append(f"{label[:24]}→{correct}{tag}")
+            continue
+        # (2) required-but-empty subject/title
+        if (not subject_done and not value.strip()
+                and f.get("tag") == "input" and fv.is_subject_label(label)):
+            fixes.append({"idx": idx, "value": subject_value})
+            summary["subject_filled"] = f"{label[:24]}={subject_value}"
+            subject_done = True
+
+    if fixes:
+        n = _set_text_fields(fixes)
+        for entry in summary["kana_fixed"]:
+            diagnostics.setdefault("filled", []).append(f"kana_guard:{entry}")
+        if summary["subject_filled"]:
+            diagnostics.setdefault("filled", []).append(f"subject_guard:{summary['subject_filled']}")
+        if n:
+            diagnostics.setdefault("warnings", []).append(
+                f"fill_guardrails corrected {n} field(s)"
+            )
+    return summary
+
+
+def _harvest_and_fix_validation_errors(
+    target: dict[str, Any],
+    config: dict[str, Any],
+    body: str,
+    *,
+    stage: str = "send",
+    trace_dir: Path | None = None,
+) -> dict[str, Any]:
+    """After a submit click, read the page's own inline validation errors and try
+    to fix them deterministically (furigana script, required subject), then report
+    whether a corrective re-submit is worth attempting.
+
+    Returns ``{"errors": [...], "fixed": <int>, "recoverable": bool}``. Never
+    raises — a failure here must not abort the send loop.
+    """
+    out: dict[str, Any] = {"errors": [], "fixed": 0, "recoverable": False}
+    try:
+        from _outreach_core import form_validation as fv
+        from _outreach_core.verify import PAGE_EVIDENCE_JS
+    except Exception:
+        return out
+    try:
+        ev_res = _evaluate(PAGE_EVIDENCE_JS)
+        page_text = ev_res.get("text", "") if isinstance(ev_res, dict) else ""
+        snap = oc_browser("snapshot") or ""
+        combined = f"{snap}\n{page_text}"
+    except Exception:
+        return out
+
+    errors = fv.parse_validation_errors(combined)
+    out["errors"] = errors
+    if not errors:
+        return out
+
+    sender = config.get("sender", {}) or {}
+    diagnostics: dict[str, Any] = {"filled": [], "warnings": []}
+    summary = _apply_fill_guardrails(target, sender, body, diagnostics)
+    fixed = len(summary.get("kana_fixed") or []) + (1 if summary.get("subject_filled") else 0)
+    out["fixed"] = fixed
+    # Recoverable if we fixed something, or if all errors are kinds our guardrails
+    # target (format on a kana field / a required subject). Even with fixed==0 the
+    # caller may still benefit from re-clicking once after a generic re-fill.
+    out["recoverable"] = fixed > 0
+    if trace_dir is not None:
+        try:
+            _emit_event(
+                f"{stage}.validation_errors",
+                stage=stage,
+                target_id=str(target.get("id") or target.get("name") or "?"),
+                payload={
+                    "errors": [{"field": e["field"][:40], "kind": e["kind"]} for e in errors][:8],
+                    "fixed": fixed,
+                    "kana_fixed": (summary.get("kana_fixed") or [])[:6],
+                    "subject_filled": summary.get("subject_filled"),
+                },
+                trace_dir=trace_dir,
+            )
+        except Exception:
+            pass
+    return out
+
+
 def _auto_check_submit_gates() -> dict[str, Any]:
     """Check required/agreement checkboxes that often block submit progression."""
     res = _evaluate(_LIST_CHECKBOX_GATES_JS)
@@ -3766,6 +3985,14 @@ def _heuristic_fill_fallback(target: dict[str, Any], config: dict[str, Any],
             f"gate_checkboxes={gate.get('checked_count')} ({', '.join((gate.get('checked_labels') or [])[:2])})"
         )
 
+    # v15 guardrails: correct furigana script + fill a required subject/title
+    # before any submit, so the form never bounces us with a format/required error.
+    guard = _apply_fill_guardrails(target, sender, body, diagnostics)
+    if guard.get("kana_fixed"):
+        print(f"  [fill] kana-guard: {', '.join(guard['kana_fixed'][:3])}")
+    if guard.get("subject_filled"):
+        print(f"  [fill] subject-guard: {guard['subject_filled']}")
+
     return diagnostics
 
 
@@ -4268,6 +4495,15 @@ def _deep_submit(
         return {"vresult": None, "page_text": ""}
     time.sleep(3)
 
+    # Validation-error recovery (mirrors stage_send §4b): fix furigana/required
+    # title errors that bounced us back, then re-click the first submit once.
+    vfix = _harvest_and_fix_validation_errors(d, config, sanitized_body, stage="send", trace_dir=trace)
+    if vfix.get("recoverable"):
+        time.sleep(0.5)
+        reclick = _click_button_with_gate_retry(patterns, form_root_selector=d.get("form_root_selector"))
+        if reclick and reclick.get("clicked"):
+            time.sleep(3)
+
     if flow == "confirm":
         c2 = _click_button_with_gate_retry([
             r"^送信する$", r"^送信$", r"この内容で送信", r"内容を送信する",
@@ -4739,6 +4975,27 @@ def stage_send(
             trace_dir=trace,
         )
         time.sleep(3)
+
+        # 4b. Validation-error recovery: if the form bounced us back to the input
+        # page with inline errors (e.g. furigana format / required title), harvest
+        # them, fix deterministically, and re-click the first submit ONCE. This is
+        # the general safety net beyond the proactive guardrails.
+        vfix = _harvest_and_fix_validation_errors(
+            d, config, send_body, stage="send", trace_dir=trace,
+        )
+        if vfix.get("errors"):
+            err_fields = ", ".join(
+                f"{e['field'][:16]}[{e['kind']}]" for e in vfix["errors"][:4]
+            )
+            print(f"  [send] ⚠ validation errors: {err_fields} → fixed={vfix.get('fixed')}")
+            if vfix.get("recoverable"):
+                time.sleep(0.5)
+                reclick = _click_button_with_gate_retry(
+                    patterns, form_root_selector=d.get("form_root_selector")
+                )
+                if reclick and reclick.get("clicked"):
+                    print(f"  [send] ↻ re-submitted after validation fix: {reclick.get('text')}")
+                    time.sleep(3)
 
         # 5. If confirm flow, click final submit
         if flow == "confirm":
