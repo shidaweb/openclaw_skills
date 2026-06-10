@@ -90,39 +90,89 @@ def oc_browser_start(*, headless: bool | None = None, profile: str = BROWSER_PRO
 
 
 def oc_browser(*args: str, profile: str = BROWSER_PROFILE) -> str | None:
-    """`openclaw browser ...` returning stdout text. None on error."""
+    """`openclaw browser ...` returning stdout text (CLI noise stripped).
+    None on error. Stripping keeps snapshots/evidence free of banner boxes
+    (Doctor warnings) that polluted traces and classify heads."""
     cmd = ["openclaw", "browser", "--browser-profile", profile, *args]
     rc, out, err = _run(cmd)
     if rc != 0:
         print(f"[browser err] {' '.join(args)}: {err.strip()}", file=__import__("sys").stderr)
         return None
-    return out
+    return _strip_cli_noise(out)
 
 
-def extract_json_payload(stdout: str | None) -> Any:
-    """Pull the JSON object/array out of `openclaw browser --json ...` stdout,
-    tolerating the 🦞 banner and box-drawing decoration lines. Pure + testable."""
+# CLI decoration / banner chars. Decoration lines (including banner boxes such
+# as `◇  Doctor warnings ──╮` / `│  - Left plugin install ...  │`) always START
+# with one of these; real payloads (JSON, snapshot trees) never do.
+_CLI_NOISE_CHARS = set("│┃|◇└├┌┐┘┤┬┴┼─━╮╯╰╭═║╔╗╚╝")
+
+
+def _strip_cli_noise(stdout: str | None) -> str:
+    """Remove OpenClaw CLI decoration from stdout: the 🦞 banner and any
+    box-drawing/banner lines (e.g. the 2026-06-10 `Doctor warnings` box that
+    broke every evaluate → 0 button candidates). Pure + testable."""
     if not stdout:
-        return None
-    body_lines: list[str] = []
+        return ""
+    kept: list[str] = []
     for line in stdout.splitlines():
         s = line.strip()
         if not s or s.startswith("🦞"):
             continue
-        if all(ch in "│◇└├─┃|" for ch in s):
+        if s[0] in _CLI_NOISE_CHARS:
             continue
-        body_lines.append(line)
-    text = "\n".join(body_lines).strip()
+        if all(ch in _CLI_NOISE_CHARS for ch in s):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
+def _decode_json_lenient(text: str) -> Any:
+    """json.loads with two fallbacks: (1) skip leading prose to the first JSON
+    object/array start, (2) tolerate trailing junk via raw_decode. Pure."""
     if not text:
         return None
-    # Find the first JSON object/array start (handles any leading prose).
-    starts = [i for i in (text.find("{"), text.find("[")) if i != -1]
-    if starts:
-        text = text[min(starts):]
     try:
         return json.loads(text)
     except json.JSONDecodeError:
+        pass
+    starts = [i for i in (text.find("{"), text.find("[")) if i != -1]
+    if not starts:
         return None
+    try:
+        decoded, _end = json.JSONDecoder().raw_decode(text[min(starts):])
+        return decoded
+    except json.JSONDecodeError:
+        return None
+
+
+def extract_json_payload(stdout: str | None) -> Any:
+    """Pull the JSON object/array out of `openclaw browser --json ...` stdout,
+    tolerating the 🦞 banner, box-drawing decoration, and banner boxes with
+    text content (Doctor warnings). Pure + testable."""
+    text = _strip_cli_noise(stdout)
+    if not text:
+        return None
+    return _decode_json_lenient(text)
+
+
+def parse_evaluate_output(stdout: str | None) -> Any:
+    """Parse `openclaw browser evaluate` stdout into the JS result. Strips CLI
+    noise first, then decodes leniently; double-decodes JSON-encoded strings.
+    Pure + testable (regression: Doctor-warnings banner outage 2026-06-10)."""
+    text = _strip_cli_noise(stdout)
+    if not text:
+        return None
+    decoded = _decode_json_lenient(text)
+    if decoded is None and text not in ("null", "None"):
+        print(f"[evaluate parse err] unparsable after noise-strip: {text[:300]}",
+              file=__import__("sys").stderr)
+        return None
+    if isinstance(decoded, str):
+        try:
+            decoded = json.loads(decoded)
+        except Exception:
+            pass
+    return decoded
 
 
 def oc_browser_json(*args: str, profile: str = BROWSER_PROFILE) -> Any:
@@ -148,30 +198,7 @@ def oc_evaluate(js: str, *, profile: str = BROWSER_PROFILE) -> Any:
     if rc != 0:
         print(f"[evaluate err] {err.strip()}", file=__import__("sys").stderr)
         return None
-
-    body_lines: list[str] = []
-    for line in out.splitlines():
-        s = line.strip()
-        if not s or s.startswith("🦞"):
-            continue
-        if all(ch in "│◇└├─┃|" for ch in s):
-            continue
-        body_lines.append(line)
-    if not body_lines:
-        return None
-
-    text = "\n".join(body_lines).strip()
-    try:
-        decoded = json.loads(text)
-        if isinstance(decoded, str):
-            try:
-                decoded = json.loads(decoded)
-            except Exception:
-                pass
-        return decoded
-    except json.JSONDecodeError as e:
-        print(f"[evaluate parse err] {e}: {text[:300]}", file=__import__("sys").stderr)
-        return None
+    return parse_evaluate_output(out)
 
 
 def oc_infer(prompt: str, model: str = DEFAULT_MODEL) -> str | None:
