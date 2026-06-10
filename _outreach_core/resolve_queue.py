@@ -116,6 +116,10 @@ _REASON_LABEL = {
     "confirm_submit_not_found": "確認画面の最終送信ボタンを自動特定できません",
     "submit_button_not_found": "送信ボタンを自動特定できません",
     "wrong_form_type": "想定と異なるフォーム種別を検出（誤フォームの可能性）",
+    "page_has_no_form": "ページにフォームが存在しません（URL要再精査：リダイレクト/案内ページ/閉鎖の可能性）",
+    "form_vanished_after_fill": "入力後にフォームが消失（バリデーション差し戻し/セッション切れの可能性）",
+    "submit_gate_unsatisfied": "送信ゲート（同意・必須選択）が未充足のまま送信ボタンに到達できません",
+    "wizard_too_deep": "多段フォームのステップ数が上限を超えました",
 }
 
 
@@ -146,6 +150,16 @@ def build_actionable_message(entry: dict[str, Any], *, auto_resolver: bool) -> s
         f"　URL: {url}",
         f"　ページ内ボタン候補（{len(buttons)}）: {btn_preview}",
     ]
+    # v17: show WHERE in the send process it failed, not just the last symptom.
+    timeline = diag.get("timeline")
+    if isinstance(timeline, list) and timeline:
+        from _outreach_core import send_timeline as tl
+
+        headline = tl.failure_headline(timeline)
+        if headline:
+            lines.append(f"　根本原因: {headline}")
+        lines.append("　プロセスログ:")
+        lines.append(tl.format_timeline(timeline))
     if shot:
         lines.append(f"　スクリーンショット: {shot}")
     if snap:

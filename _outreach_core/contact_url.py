@@ -464,6 +464,54 @@ def is_error_page(snapshot: str | None, url: str | None = None, http_status: int
     return False
 
 
+def classify_page_form_state(fields: dict | None, snapshot: str | None) -> dict:
+    """Send-time page vetting (v17): does the CURRENT page actually carry a form?
+
+    Production showed "first submit button not found / 0 candidates" cases whose
+    real cause was the URL itself: a redirect to a different site (ain_holdings),
+    a contact GUIDE page (links to forms, no form), or an expired/bounced session
+    page (duskin). Those must be caught BEFORE fill/submit and reported as a URL
+    problem, not a button problem.
+
+    Returns {"state": ..., counts...} where state is one of:
+      - "form_ok":      fillable controls present → proceed
+      - "gate_like":    no textarea but radios/checkbox/button (pre-form gate or
+                        wizard step) → proceed (gate logic handles it)
+      - "no_form":      page rendered but has no form controls → URL problem
+      - "error_page":   404/error keywords → URL problem
+      - "empty_render": no controls AND nearly empty body → likely JS still
+                        rendering → caller should wait + rescan once
+    """
+    f = fields if isinstance(fields, dict) else {}
+    inputs = [
+        x for x in (f.get("inputs") or [])
+        if str((x or {}).get("type") or "").lower()
+        not in ("hidden", "submit", "button", "image")
+    ]
+    textareas = f.get("textareas") or []
+    buttons = f.get("submit_buttons") or []
+    radios = f.get("radios") or {}
+    radio_n = len(radios) if isinstance(radios, (dict, list)) else 0
+    checks = f.get("checkboxes") or []
+    counts = {
+        "inputs": len(inputs),
+        "textareas": len(textareas),
+        "submit_buttons": len(buttons),
+        "radio_groups": radio_n,
+        "checkboxes": len(checks),
+    }
+    snap = snapshot or ""
+    if is_error_page(snap):
+        return {"state": "error_page", **counts}
+    controls = counts["inputs"] + counts["textareas"] + radio_n + counts["checkboxes"]
+    if controls == 0:
+        state = "empty_render" if len(snap.strip()) < 600 else "no_form"
+        return {"state": state, **counts}
+    if counts["textareas"] == 0 and counts["inputs"] <= 1:
+        return {"state": "gate_like", **counts}
+    return {"state": "form_ok", **counts}
+
+
 def _looks_like_contact_gate(fields: dict, snap_head: str) -> bool:
     radios = fields.get("radios") or {}
     checks = fields.get("checkboxes") or []

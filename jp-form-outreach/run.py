@@ -35,6 +35,7 @@ from _outreach_core import content_guard as core_content_guard
 from _outreach_core import contact_url as core_contact_url
 from _outreach_core import resolve_queue as core_resolve_queue
 from _outreach_core import send_journal as core_send_journal
+from _outreach_core import send_timeline as core_timeline
 from _outreach_core import submit_progress as core_submit_progress
 from _outreach_core import tab_utils as core_tab_utils
 from _outreach_core import infer as core_infer
@@ -4688,6 +4689,76 @@ def _enforce_tab_cap(protect: set[str], cap: int = 12) -> None:
         pass
 
 
+_PAGE_TEXT_HEAD_JS = r"""
+() => (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 4000)
+"""
+
+
+def _assess_page_and_recover(
+    d: dict[str, Any],
+    timeline: list[dict[str, Any]],
+    trace: Any,
+) -> tuple[bool, dict[str, Any]]:
+    """v17 URL精査: classify the current page's form state BEFORE filling.
+
+    empty_render → wait 3s + rescan once (JS-rendered pages).
+    no_form / error_page → ONE recovery hop: follow the page's own contact-ish
+    links (guide pages like ain_holdings link to the real form). On success the
+    target's form_url is updated in place and an event is emitted.
+
+    Returns (ok, state_dict).
+    """
+    tid = str(d.get("id") or d.get("name") or "?")
+
+    def _scan() -> dict[str, Any]:
+        fields = _rescan_form_fields(d)
+        text = _evaluate(_PAGE_TEXT_HEAD_JS)
+        return core_contact_url.classify_page_form_state(
+            fields, text if isinstance(text, str) else ""
+        )
+
+    state = _scan()
+    if state.get("state") == "empty_render":
+        time.sleep(3)
+        state = _scan()
+    ok = state.get("state") in ("form_ok", "gate_like")
+    core_timeline.add(
+        timeline, "page_state", ok,
+        state=state.get("state"),
+        inputs=state.get("inputs"),
+        textareas=state.get("textareas"),
+        buttons=state.get("submit_buttons"),
+    )
+    if ok:
+        return True, state
+
+    # Recovery hop: the page itself usually links to the real form.
+    cur_url = str(_evaluate("() => location.href") or d.get("form_url") or "")
+    cands = core_contact_url.contact_link_candidates(_list_page_links(), cur_url)
+    tried: list[str] = []
+    for cand in cands[:2]:
+        tried.append(cand)
+        _evaluate(f"() => {{ location.href = {json.dumps(cand)}; return true; }}")
+        time.sleep(2.5)
+        st2 = _scan()
+        if st2.get("state") in ("form_ok", "gate_like"):
+            old_url = d.get("form_url")
+            d["form_url"] = cand
+            _emit_event(
+                "send.url_recovered", stage="send", target_id=tid,
+                payload={"from": old_url, "to": cand, "state": st2.get("state")},
+                trace_dir=trace,
+            )
+            core_timeline.add(timeline, "url_recovery", True, to=cand)
+            print(f"  [send] ✓ URLリカバリ: {old_url} → {cand}")
+            return True, st2
+    core_timeline.add(
+        timeline, "url_recovery", (False if cands else None),
+        candidates=len(cands), tried=tried or None,
+    )
+    return False, state
+
+
 def _queue_for_resolver(
     d: dict[str, Any],
     reason_class: str,
@@ -4706,6 +4777,16 @@ def _queue_for_resolver(
     tid = str(d.get("id") or d.get("name") or "?")
     name = d.get("name", "?")
     diag = _blocker_diagnostics(d, trace=trace)
+    # v17: attach the stage timeline so the escalation shows WHERE the process
+    # actually failed (e.g. ページ状態で失敗 = URL problem), not the last symptom.
+    tl = d.get("_send_timeline")
+    if isinstance(tl, list) and tl:
+        diag["timeline"] = tl
+        try:
+            from _outreach_core import events as _ev
+            _ev.dump_trace(trace, "send_timeline.json", tl)
+        except Exception:  # noqa: BLE001
+            pass
     entry = {
         "target_id": tid,
         "name": name,
@@ -5063,6 +5144,12 @@ def _send_one_target(
     flow = d.get("flow") or (d.get("_llm_plan") or {}).get("next_step") or "single"
     captcha = (d.get("form_fields") or {}).get("has_recaptcha_v2") or d.get("captcha") == "recaptcha_v2_visible"
 
+    # v17: per-target stage timeline. Every checkpoint of the send process
+    # (open → page state → gates → fill → validation → submit → verify) records
+    # here so escalations report the FIRST failing stage, not the last symptom.
+    timeline: list[dict[str, Any]] = []
+    d["_send_timeline"] = timeline
+
     # Proactive URL-strip (§3.6): if this domain is known to reject URLs in the
     # body, send the URL-free variant from the start (no wasted first attempt).
     send_body = body
@@ -5185,6 +5272,21 @@ def _send_one_target(
     pre_snap = oc_browser("snapshot")
     ev.dump_trace(trace, "form_snapshot_pre.txt", pre_snap or "")
 
+    # v17: record where we actually landed — redirects to a different page
+    # (e.g. ain_holdings → アイン薬局 site) are a URL problem, not a form problem.
+    final_url = str(_evaluate("() => location.href") or "")
+    redirected = bool(
+        final_url
+        and core_contact_url._normalize_http_url(final_url)
+        != core_contact_url._normalize_http_url(form_url)
+    )
+    core_timeline.add(
+        timeline, "open", True,
+        url=form_url,
+        final_url=(final_url if redirected else None),
+        redirected=(redirected or None),
+    )
+
     # 2. Click any pre-form entry (e.g. "法人のお客様" tab)
     if d.get("entry_click_text"):
         for txt in (d["entry_click_text"] if isinstance(d["entry_click_text"], list) else [d["entry_click_text"]]):
@@ -5212,10 +5314,46 @@ def _send_one_target(
             trace_dir=trace,
         )
         time.sleep(1.5)
+    if d.get("entry_click_text") or (gate and gate.get("clicked")):
+        core_timeline.add(
+            timeline, "entry_click", None,
+            entry=d.get("entry_click_text"),
+            gate_clicked=bool(gate and gate.get("clicked")),
+        )
+
+    # v17 URL精査: verify the page actually carries a form BEFORE filling.
+    # Catches redirects, contact GUIDE pages, expired sessions — the production
+    # cases that used to surface later as "送信ボタンが見つからない（候補0）".
+    page_ok, page_state = _assess_page_and_recover(d, timeline, trace)
+    if not page_ok:
+        print(f"  [send] ⚠ PAGE_HAS_NO_FORM — state={page_state.get('state')} "
+              f"(inputs={page_state.get('inputs')}, buttons={page_state.get('submit_buttons')})")
+        filled_only.append(d)
+        core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_WRONG_FORM)
+        if cur_tab_id:
+            resolver_tab_ids.add(cur_tab_id)
+        _queue_for_resolver(
+            d, "page_has_no_form",
+            (
+                f"フォーム要素がページに存在しません (state={page_state.get('state')}, "
+                f"inputs={page_state.get('inputs')}, textareas={page_state.get('textareas')}, "
+                f"buttons={page_state.get('submit_buttons')}"
+                + (f", 最終URL={final_url}" if redirected else "")
+                + ") — URLの再精査が必要です"
+            ),
+            trace=trace, autonomous=autonomous, tab_id=cur_tab_id,
+        )
+        return {"outcome": "queued", "reason": "page_has_no_form"}
 
     # 3. Fill all fields
     diagnostics = fill_form_for_target(
         d, config, send_body, trace_dir=trace, iterative_fill=iterative_fill
+    )
+    core_timeline.add(
+        timeline, "fill", not diagnostics.get("errors"),
+        filled=len(diagnostics.get("filled") or []),
+        unfilled=len(diagnostics.get("unfilled") or []),
+        errors=(diagnostics.get("errors") or [])[:3] or None,
     )
     print(f"  [send] filled: {len(diagnostics['filled'])} / unfilled: {len(diagnostics['unfilled'])} / errors: {len(diagnostics['errors'])}")
     for f in diagnostics["filled"][:8]:
@@ -5265,6 +5403,10 @@ def _send_one_target(
     if captcha and not cap_state["blocking"]:
         print(f"  [send] captcha 再確認: enrich={captcha} だが live={cap_state['kind']} "
               f"（非ブロッキング）→ 続行")
+    core_timeline.add(
+        timeline, "captcha", (not cap_state["blocking"]),
+        kind=cap_state.get("kind"), blocking=cap_state["blocking"],
+    )
     if cap_state["blocking"]:
         label = core_captcha.reason_label(cap_state)
         print(f"  [send] ⚠ {label} — 突破せず迂回/記録（完全自律・人手なし方針）")
@@ -5390,6 +5532,20 @@ def _send_one_target(
             print(f"  [send]    ↳ matched but disabled: {(click_res.get('disabled_candidates') or [])[:3]}")
         if first_native:
             print(f"  [send]    ↳ {_native_submit_diag(first_native)}")
+        # v17: re-check the page state at THIS moment — a validation bounce or
+        # session expiry may have replaced the form since fill (duskin case).
+        live_state = core_contact_url.classify_page_form_state(
+            _rescan_form_fields(d),
+            (lambda t: t if isinstance(t, str) else "")(_evaluate(_PAGE_TEXT_HEAD_JS)),
+        )
+        core_timeline.add(
+            timeline, "first_submit", False,
+            flow=flow,
+            page_state_now=live_state.get("state"),
+            inputs_now=live_state.get("inputs"),
+            buttons_now=live_state.get("submit_buttons"),
+            found_but_disabled=bool(click_res and click_res.get("found_but_disabled")) or None,
+        )
         filled_only.append(d)
         _emit_event(
             "send.first_button_missing",
@@ -5409,11 +5565,22 @@ def _send_one_target(
         core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SUBMIT_NOT_FOUND)
         if cur_tab_id:
             resolver_tab_ids.add(cur_tab_id)
+        _live_form_gone = live_state.get("state") in ("no_form", "error_page", "empty_render")
         _queue_for_resolver(
             d,
-            "submit_gate_unsatisfied" if int((drive.get("remaining") or {}).get("total") or 0) > 0 else "first_submit_not_found",
             (
-                f"first submit button not found (flow={flow}); "
+                "form_vanished_after_fill" if _live_form_gone
+                else "submit_gate_unsatisfied" if int((drive.get("remaining") or {}).get("total") or 0) > 0
+                else "first_submit_not_found"
+            ),
+            (
+                (
+                    f"フォームが消失/不在の状態でボタン探索に失敗 (page_state={live_state.get('state')}, "
+                    f"inputs={live_state.get('inputs')}, buttons={live_state.get('submit_buttons')}) — "
+                    f"バリデーション差し戻し or セッション切れ or URL不正の可能性; "
+                    if _live_form_gone else ""
+                )
+                + f"first submit button not found (flow={flow}); "
                 f"noise_only_candidates={first_noise_only}; "
                 f"remaining_gates={json.dumps((drive.get('remaining') or {}), ensure_ascii=False)[:240]}; "
                 f"{_native_submit_diag(first_native)}"
@@ -5428,6 +5595,11 @@ def _send_one_target(
             )
         return {"outcome": "skipped"}
     print(f"  [send] clicked: {click_res.get('text')}")
+    core_timeline.add(
+        timeline, "first_submit", True,
+        flow=flow, button=(click_res.get("text") or "")[:40],
+        native=click_res.get("native_submit_method"),
+    )
     if click_res.get("radio_auto_selected"):
         print(f"  [send]    ↳ auto-selected radios: {(click_res.get('radio_items') or [])[:3]}")
     if click_res.get("select_auto_selected"):
@@ -5459,6 +5631,10 @@ def _send_one_target(
             f"{e['field'][:16]}[{e['kind']}]" for e in vfix["errors"][:4]
         )
         print(f"  [send] ⚠ validation errors: {err_fields} → fixed={vfix.get('fixed')}")
+        core_timeline.add(
+            timeline, "validation_fix", bool(vfix.get("recoverable")),
+            errors=err_fields, fixed=vfix.get("fixed"),
+        )
         if vfix.get("recoverable"):
             time.sleep(0.5)
             reclick = _click_button_with_gate_retry(
@@ -5477,6 +5653,7 @@ def _send_one_target(
             payload={"wait_user_ms": 0},
             trace_dir=trace,
         )
+        core_timeline.add(timeline, "confirm_page", True)
         # v15 §R3: confirm flow — journal right before the FINAL submit click.
         if mode in ("auto", "interactive") and not journal_attempted:
             core_send_journal.append_journal(
@@ -5549,6 +5726,11 @@ def _send_one_target(
                     print(f"  [send]    ↳ matched but disabled: {(click2.get('disabled_candidates') or [])[:3]}")
                 if final_native:
                     print(f"  [send]    ↳ {_native_submit_diag(final_native)}")
+                core_timeline.add(
+                    timeline, "final_submit", False,
+                    noise_only=final_noise_only or None,
+                    found_but_disabled=bool(click2 and click2.get("found_but_disabled")) or None,
+                )
                 if trace:
                     ev.dump_trace(
                         trace, "form_snapshot_confirm.txt",
@@ -5573,6 +5755,11 @@ def _send_one_target(
                     )
                 return {"outcome": "skipped"}
         print(f"  [send] clicked final: {click2.get('text')}")
+        core_timeline.add(
+            timeline, "final_submit", True,
+            button=(click2.get("text") or "")[:40],
+            native=click2.get("native_submit_method"),
+        )
         if click2.get("radio_auto_selected"):
             print(f"  [send]    ↳ auto-selected radios: {(click2.get('radio_items') or [])[:3]}")
         if click2.get("select_auto_selected"):
@@ -5665,6 +5852,13 @@ def _send_one_target(
         )
         ev.dump_trace(trace, "verify_evidence.json", vresult.get("evidence") or {})
         outcome = handle_verify_result(d, vresult, DATA_DIR, channel="jp_form")
+        core_timeline.add(
+            timeline, "verify", (outcome == "sent_ok"),
+            status=vresult.get("status"),
+            reason=(vresult.get("reason") or "")[:80],
+        )
+        ev.dump_trace(trace, "send_timeline.json", timeline)
+        print("  [send] プロセスログ:\n" + core_timeline.format_timeline(timeline))
         if outcome == "sent_ok":
             print(f"  [send] ✅ {vresult.get('reason')}")
             core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SENT)
