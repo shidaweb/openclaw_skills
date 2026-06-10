@@ -1,8 +1,10 @@
 """
 Post-send verification and needs_attention escalation.
 
-Pure Python / DOM heuristics only — no oc_infer, no openclaw infer subprocess.
-Escalation copy and user Q&A are handled by the OpenClaw agent (Opus 4.7).
+The PRIMARY verdict is pure Python / DOM heuristics (weighted evidence score,
+v15 §V1). An LLM is consulted ONLY for the uncertain middle band, via an
+injected ``infer_fn`` with a verbatim-quote hallucination guard (§V2) — it is
+never the final arbiter over deterministic evidence.
 """
 
 from __future__ import annotations
@@ -51,6 +53,24 @@ PAGE_EVIDENCE_JS = r"""
   title: document.title || '',
   text: (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 16000),
 })
+"""
+
+# v15 §V3 — form presence must be judged by VISIBILITY, not DOM existence.
+# A form hidden with display:none while a "確認中…" spinner runs must not be
+# counted as "gone" (false sent_ok) nor a hidden leftover as "still present".
+FORM_VISIBILITY_JS = r"""
+() => {
+  const visible = (el) => {
+    if (!el) return false;
+    if (el.offsetParent === null && getComputedStyle(el).position !== 'fixed') return false;
+    const st = getComputedStyle(el);
+    return st.display !== 'none' && st.visibility !== 'hidden';
+  };
+  let visibleForms = 0, visibleTextareas = 0;
+  for (const f of document.querySelectorAll('form')) if (visible(f)) visibleForms++;
+  for (const t of document.querySelectorAll('textarea')) if (visible(t)) visibleTextareas++;
+  return { visible_forms: visibleForms, visible_textareas: visibleTextareas };
+}
 """
 
 
@@ -223,6 +243,93 @@ def _jp_form_success_confirmed(evidence: dict[str, Any]) -> bool:
     return not evidence.get("has_error_keyword")
 
 
+# --- v15 §V1: weighted evidence scoring (pure) -------------------------------
+def score_send_evidence(evidence: dict[str, Any]) -> int:
+    """Weighted score over post-submit signals (§V1 table).
+
+    +2 success-looking URL / +2 success keyword / +2 form visibly gone
+    −3 visible error keyword / −2 input form still visibly present
+    """
+    score = 0
+    if evidence.get("url_success"):
+        score += 2
+    if evidence.get("has_success_keyword"):
+        score += 2
+    if evidence.get("form_gone_visible"):
+        score += 2
+    if evidence.get("has_error_keyword"):
+        score -= 3
+    if evidence.get("form_still_present"):
+        score -= 2
+    return score
+
+
+def verdict_from_score(score: int) -> str:
+    """≥3 → sent_ok, ≤−2 → failed, otherwise uncertain (§V1)."""
+    if score >= 3:
+        return "sent_ok"
+    if score <= -2:
+        return "failed"
+    return "uncertain"
+
+
+# --- v15 §V2: LLM tiebreak for uncertain verdicts (with hallucination guard) -
+def llm_tiebreak_verdict(
+    page_text: str,
+    page_url: str,
+    *,
+    infer_fn: Callable[[str, str], str | None],
+    model: str = "",
+) -> dict[str, Any] | None:
+    """Ask the LLM ONLY for uncertain cases; the primary verdict stays deterministic.
+
+    Returns {"verdict": "sent"|"not_sent"|"unclear", "quote": ...} or None on
+    any failure. A quote that does not literally appear in the page text is
+    rejected (hallucination guard).
+    """
+    prompt = (
+        "A Japanese inquiry form was just submitted in a browser. Based ONLY on "
+        "the page evidence below, decide whether the submission completed.\n\n"
+        f"## URL\n{page_url[:300]}\n\n"
+        f"## Page text (head)\n{(page_text or '')[:4000]}\n\n"
+        "## Output — STRICT JSON only\n"
+        '{"verdict": "sent|not_sent|unclear", "quote": "<verbatim sentence from '
+        'the page text that supports your verdict>"}\n'
+        "If nothing on the page clearly indicates success or failure, answer unclear.\n"
+    )
+    try:
+        raw = infer_fn(prompt, model)
+    except Exception:
+        return None
+    return parse_llm_tiebreak(raw, page_text)
+
+
+def parse_llm_tiebreak(raw: str | None, page_text: str) -> dict[str, Any] | None:
+    """Parse + guard the tiebreak JSON (pure). Quote must appear in page text."""
+    if not raw:
+        return None
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    verdict = str(data.get("verdict") or "").strip().lower()
+    if verdict not in ("sent", "not_sent", "unclear"):
+        return None
+    quote = str(data.get("quote") or "").strip()
+    if verdict in ("sent", "not_sent"):
+        # Hallucination guard: the supporting quote must literally exist on the
+        # page (whitespace-normalized). No quote → downgrade to unclear.
+        norm = lambda s: re.sub(r"\s+", "", s or "")  # noqa: E731
+        if not quote or norm(quote) not in norm(page_text):
+            return None
+    return {"verdict": verdict, "quote": quote}
+
+
 def _required_not_in_plan(target: dict[str, Any], plan: dict[str, Any] | None) -> list[dict[str, Any]]:
     form_fields = target.get("form_fields") or {}
     planned = _plan_field_names(plan)
@@ -260,6 +367,8 @@ def verify_send_completed(
     data_dir: Path | None = None,
     snapshot_path: Path | None = None,
     verify_strict: bool = True,
+    infer_fn: Callable[[str, str], str | None] | None = None,
+    tiebreak_model: str = "",
 ) -> dict[str, Any]:
     """
     Returns dict with status: ok | uncertain | needs_attention, reason, evidence, etc.
@@ -342,6 +451,40 @@ def verify_send_completed(
             "unresolved_fields": None,
         }
 
+    # v15 §V3: form visibility signals (visibility-based, not DOM existence)
+    if evaluate_fn:
+        vis = evaluate_fn(FORM_VISIBILITY_JS)
+        if isinstance(vis, dict):
+            visible_forms = int(vis.get("visible_forms") or 0)
+            visible_textareas = int(vis.get("visible_textareas") or 0)
+            evidence["visible_forms"] = visible_forms
+            evidence["visible_textareas"] = visible_textareas
+            evidence["form_gone_visible"] = (
+                visible_forms == 0 and visible_textareas == 0
+            )
+            evidence["form_still_present"] = visible_textareas > 0
+
+    # v15 §V1: weighted score settles cases keywords alone could not.
+    score = score_send_evidence(evidence)
+    evidence["score"] = score
+    score_verdict = verdict_from_score(score)
+    if score_verdict == "sent_ok":
+        return {
+            "status": "ok",
+            "reason": f"{name}: 送信完了をスコア判定で確認 (score={score})",
+            "evidence": evidence,
+            "snapshot_path": str(snapshot_path) if snapshot_path else None,
+            "unresolved_fields": None,
+        }
+    if score_verdict == "failed":
+        return {
+            "status": "needs_attention",
+            "reason": f"{name}: 送信失敗の証拠が優勢 (score={score})",
+            "evidence": evidence,
+            "snapshot_path": str(snapshot_path) if snapshot_path else None,
+            "unresolved_fields": None,
+        }
+
     if verify_strict and evaluate_fn:
         scan = evaluate_fn(build_scan_required_js(target))
         if isinstance(scan, dict):
@@ -375,6 +518,29 @@ def verify_send_completed(
         }
 
     if snap and not evidence.get("has_success_keyword"):
+        # v15 §V2: uncertain ONLY → LLM tiebreak (primary verdict stays
+        # deterministic; quote must literally appear on the page).
+        if infer_fn:
+            tb = llm_tiebreak_verdict(
+                snap, page_url, infer_fn=infer_fn, model=tiebreak_model
+            )
+            evidence["llm_tiebreak"] = tb
+            if tb and tb["verdict"] == "sent":
+                return {
+                    "status": "ok",
+                    "reason": f"{name}: LLM tiebreak=sent 「{tb['quote'][:60]}」",
+                    "evidence": evidence,
+                    "snapshot_path": str(snapshot_path) if snapshot_path else None,
+                    "unresolved_fields": None,
+                }
+            if tb and tb["verdict"] == "not_sent":
+                return {
+                    "status": "needs_attention",
+                    "reason": f"{name}: LLM tiebreak=not_sent 「{tb['quote'][:60]}」",
+                    "evidence": evidence,
+                    "snapshot_path": str(snapshot_path) if snapshot_path else None,
+                    "unresolved_fields": None,
+                }
         hint = ""
         if page_url:
             hint = f" (url={page_url[:100]})"

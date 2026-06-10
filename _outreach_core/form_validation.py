@@ -17,6 +17,7 @@ The run.py side only does DOM I/O and calls these to decide what to fix.
 from __future__ import annotations
 
 import re
+from datetime import date, timedelta
 from typing import Any
 
 # --- script detection --------------------------------------------------------
@@ -243,3 +244,52 @@ def parse_validation_errors(text: str | None) -> list[dict[str, str]]:
 
 def has_validation_errors(text: str | None) -> bool:
     return bool(parse_validation_errors(text))
+
+
+# --- v15 §S2: special field value helpers ------------------------------------
+def default_date_value(today: date | None = None) -> str:
+    """ISO date 7 business days (Mon–Fri) from today — for 希望日/date fields."""
+    d = today or date.today()
+    remaining = 7
+    while remaining > 0:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            remaining -= 1
+    return d.isoformat()
+
+
+_PREF_RE = re.compile(
+    r"^(東京都|北海道|(?:京都|大阪)府|.{2,3}県)"
+)
+_CITY_RE = re.compile(
+    # 市/区/郡+町村: greedy enough for compound names like 千葉市中央区
+    r"^((?:.+?郡.+?[町村])|(?:.+?市.+?区)|(?:.+?[市区町村]))"
+)
+
+
+def split_jp_address(addr: str | None) -> dict[str, str]:
+    """Split a single-line Japanese address into prefecture/city/line/building.
+
+    Pure heuristic for forms that demand split address fields when the brief
+    only has one string. Building = trailing token after whitespace when it
+    contains ビル/階/号室/マンション etc.
+    """
+    out = {"prefecture": "", "city": "", "address_line": "", "building": ""}
+    s = (addr or "").strip().replace("　", " ")
+    if not s:
+        return out
+    m = _PREF_RE.match(s)
+    if m:
+        out["prefecture"] = m.group(1)
+        s = s[m.end():].strip()
+    m = _CITY_RE.match(s)
+    if m:
+        out["city"] = m.group(1)
+        s = s[m.end():].strip()
+    # Trailing building part: last whitespace-separated token with a building marker
+    parts = s.split(" ")
+    if len(parts) > 1 and re.search(r"(ビル|タワー|マンション|ハイツ|階|F$|号室|号館)", parts[-1]):
+        out["building"] = parts[-1]
+        s = " ".join(parts[:-1]).strip()
+    out["address_line"] = s
+    return out

@@ -19,6 +19,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -33,6 +34,7 @@ from _outreach_core import captcha as core_captcha
 from _outreach_core import content_guard as core_content_guard
 from _outreach_core import contact_url as core_contact_url
 from _outreach_core import resolve_queue as core_resolve_queue
+from _outreach_core import send_journal as core_send_journal
 from _outreach_core import submit_progress as core_submit_progress
 from _outreach_core import tab_utils as core_tab_utils
 from _outreach_core import infer as core_infer
@@ -173,6 +175,53 @@ def _evaluate(js: str) -> Any:
 # Stage: bootstrap (load targets from targets.yaml)
 # ============================================================================
 
+# --- v15 §L1: bootstrap-time URL validation + domain dedup -------------------
+def _bootstrap_url_issue(c: dict[str, Any]) -> str | None:
+    """'invalid_url' when form_url is present but malformed (no scheme/netloc)."""
+    url = str(c.get("form_url") or "").strip()
+    if not url:
+        return None  # no URL is fine — enrich uses contact_url_candidates
+    from _outreach_core.contact_url import _normalize_http_url
+
+    return None if _normalize_http_url(url) else "invalid_url"
+
+
+def _bootstrap_domain(c: dict[str, Any]) -> str:
+    """Registrable domain key for dedup (form_url, else first candidate)."""
+    url = str(c.get("form_url") or "").strip()
+    if not url:
+        cands = c.get("contact_url_candidates")
+        if isinstance(cands, list) and cands:
+            url = str(cands[0] or "").strip()
+    return core_contact_url.registrable_domain(url) if url else ""
+
+
+def _history_form_url_domains() -> set[str]:
+    """Registrable domains of form_urls already in sent/skip history."""
+    domains: set[str] = set()
+    for path in (SENT_HISTORY_PATH, SKIP_HISTORY_PATH):
+        try:
+            if not path.exists():
+                continue
+            with path.open(encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    url = str(row.get("form_url") or "").strip()
+                    if url:
+                        dom = core_contact_url.registrable_domain(url)
+                        if dom:
+                            domains.add(dom)
+        except OSError:
+            continue
+    return domains
+
+
 def stage_bootstrap(targets_path: Path, out_path: Path,
                     include_sent: bool = False,
                     include_dropped: bool = False,
@@ -198,11 +247,17 @@ def stage_bootstrap(targets_path: Path, out_path: Path,
     skip_ids = load_skip_set()
     only_id_set = set(only_ids) if only_ids else None
 
+    # v15 §L1: domain-level dedup — against history AND within this batch.
+    history_domains = _history_form_url_domains()
+    seen_domains: set[str] = set()
+
     written: list[dict[str, Any]] = []
     filtered_sent = 0
     filtered_dropped = 0
     filtered_skip = 0
     filtered_only_ids = 0
+    filtered_invalid_url = 0
+    filtered_dup_domain = 0
     for c in companies:
         cid = c.get("id")
         if not cid:
@@ -222,6 +277,34 @@ def stage_bootstrap(targets_path: Path, out_path: Path,
             filtered_skip += 1
             continue
 
+        # v15 §L1: URL format validation — a malformed form_url wastes a whole
+        # enrich/browser cycle; record as skip so it surfaces in reports.
+        issue = _bootstrap_url_issue(c)
+        if issue == "invalid_url":
+            filtered_invalid_url += 1
+            print(f"[bootstrap] ⚠ {cid}: invalid form_url "
+                  f"({str(c.get('form_url'))[:80]}) — skipped (invalid_url)")
+            append_skip_history([{
+                "id": cid, "name": c.get("name"),
+                "draft": {"body": f"invalid_url: {str(c.get('form_url'))[:160]}"},
+            }])
+            continue
+
+        # v15 §L1: registrable-domain dedup (sent/skip history + same batch).
+        dom = _bootstrap_domain(c)
+        if dom:
+            if dom in history_domains and cid not in sent_ids and cid not in skip_ids:
+                filtered_dup_domain += 1
+                print(f"[bootstrap] ⚠ {cid}: domain {dom} already in "
+                      f"sent/skip history — filtered (dup_domain)")
+                continue
+            if dom in seen_domains:
+                filtered_dup_domain += 1
+                print(f"[bootstrap] ⚠ {cid}: domain {dom} duplicated within "
+                      f"this batch — filtered (dup_domain)")
+                continue
+            seen_domains.add(dom)
+
         c.setdefault("_loaded_at", datetime.utcnow().isoformat() + "Z")
         written.append(c)
 
@@ -240,6 +323,8 @@ def stage_bootstrap(targets_path: Path, out_path: Path,
     if filtered_sent: drops.append(f"{filtered_sent} sent")
     if filtered_dropped: drops.append(f"{filtered_dropped} dropped")
     if filtered_skip: drops.append(f"{filtered_skip} skipped")
+    if filtered_invalid_url: drops.append(f"{filtered_invalid_url} invalid_url")
+    if filtered_dup_domain: drops.append(f"{filtered_dup_domain} dup_domain")
     if drops:
         msg += f"  (filtered: {', '.join(drops)})"
     if capped:
@@ -433,6 +518,48 @@ def _list_page_links() -> list[dict[str, str]]:
     return res if isinstance(res, list) else []
 
 
+# v15 §F5: real HTTP status of the current page (null when API unavailable)
+_HTTP_STATUS_JS = r"""
+() => {
+  try {
+    const e = performance.getEntriesByType('navigation')[0];
+    return (e && typeof e.responseStatus === 'number') ? e.responseStatus : null;
+  } catch (err) { return null; }
+}
+"""
+
+_FETCH_SITEMAP_JS = r"""
+() => fetch('/sitemap.xml', {cache: 'no-store'})
+        .then(r => r.ok ? r.text() : '')
+        .catch(() => '')
+"""
+
+
+def _current_http_status() -> int | None:
+    res = _evaluate(_HTTP_STATUS_JS)
+    return res if isinstance(res, int) else None
+
+
+def _form_fields_empty(fields: dict[str, Any] | None) -> bool:
+    f = fields or {}
+    return not (
+        (f.get("inputs") or [])
+        or (f.get("selects") or [])
+        or (f.get("textareas") or [])
+    )
+
+
+def _sitemap_contact_candidates() -> list[str]:
+    """v15 §F2: mine /sitemap.xml of the CURRENT page's origin for contact URLs."""
+    try:
+        xml = _evaluate(_FETCH_SITEMAP_JS)
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(xml, str) or not xml.strip():
+        return []
+    return core_contact_url.extract_contact_urls_from_sitemap(xml)[:5]
+
+
 def _seed_form_urls(target: dict[str, Any]) -> list[str]:
     seeds: list[str] = []
     direct = str(target.get("form_url") or "").strip()
@@ -464,6 +591,8 @@ def _build_contact_candidates(target: dict[str, Any], current_url: str, page_lin
     if isinstance(user_cands, list):
         candidates.extend(str(x) for x in user_cands if str(x or "").strip())
     candidates.extend(core_contact_url.contact_link_candidates(page_links, current_url))
+    # v15 §F2: sitemap-mined contact URLs rank above blind common paths.
+    candidates.extend(_sitemap_contact_candidates())
     candidates.extend(core_contact_url.common_contact_paths(current_url))
 
     uniq: list[str] = []
@@ -487,6 +616,377 @@ def _classify_form_type(
     return core_contact_url.classify_form_type(fields, snapshot)
 
 
+def _classify_form_type_v2_for_enrich(
+    fields: dict[str, Any],
+    snapshot: str | None,
+    config: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """§F1 two-stage classify via the mockable ``_classify_form_type`` hook.
+
+    Enrich tests patch ``_classify_form_type`` to simulate ambiguous seeds;
+    production still gets LLM escalation on uncertain heuristics.
+    """
+    kind, reason = _classify_form_type(fields, snapshot)
+    return core_contact_url._llm_escalate_classification(
+        kind,
+        reason,
+        fields,
+        snapshot,
+        infer_fn=oc_infer if config else None,
+        model=_form_analyzer_base_model(config) if config else "",
+    )
+
+
+def _enrich_one_target(
+    t: dict[str, Any],
+    i: int,
+    total: int,
+    config: dict[str, Any] | None,
+    enriched: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Enrich a single target — extracted per-lead loop body (v15 §R1).
+
+    Appends exactly one row to ``enriched``. Exceptions are isolated by the
+    caller so one bad site cannot kill the whole enrich batch.
+    """
+    seed_urls = _seed_form_urls(t)
+    if not seed_urls:
+        print(f"[enrich] ({i}/{total}) {t.get('name')}: no form_url/contact_url_candidates, skipping")
+        enriched.append({**t, "_enrich_skipped": "no form_url"})
+        return {"outcome": "skipped"}
+
+    if t.get("category") in ("b2c_only", "iframe", "site_closed"):
+        cat = t.get("category")
+        print(f"[enrich] ({i}/{total}) {t.get('name')}: category={cat}, skipping")
+        enriched.append({**t, "_enrich_skipped": f"category={cat}"})
+        return {"outcome": "skipped"}
+
+    from _outreach_core.cookie_dismiss import apply_cookie_dismiss
+
+    t_work = dict(t)
+    fields: dict[str, Any] = {}
+    snap = ""
+    form_kind = "unknown_no_textarea"
+    form_reason = "no form analyzed"
+    correction_attempts = 0
+    corrected_emitted = False
+    chosen_url = ""
+    original_url = str(t.get("form_url") or "").strip()
+    best_known: dict[str, Any] | None = None
+
+    # Seed candidates: explicit form_url first, then contact_url_candidates.
+    for seed_idx, seed_url in enumerate(seed_urls[:5], 1):
+        print(f"[enrich] ({i}/{total}) {t.get('name')} -> seed {seed_idx}: {seed_url}")
+        oc_browser("open", seed_url)
+        time.sleep(RATE_LIMIT_SECONDS)
+        apply_cookie_dismiss(
+            _evaluate,
+            config,
+            stage="enrich",
+            target_id=t_work.get("id"),
+            emit_event=lambda kind, **kw: _emit_event(kind, **kw),
+        )
+        # Try clicking through any "法人" / "業務提携" entry-point links.
+        if t_work.get("entry_click_text"):
+            for txt in t_work["entry_click_text"] if isinstance(t_work["entry_click_text"], list) else [t_work["entry_click_text"]]:
+                _evaluate(f"""
+                    () => {{
+                      for (const a of document.querySelectorAll('a, button')) {{
+                        if ((a.textContent || '').trim().includes({json.dumps(txt)})) {{
+                          a.click(); return true;
+                        }}
+                      }}
+                      return false;
+                    }}
+                """)
+                time.sleep(2)
+
+        fields = _evaluate(_FORM_FIELDS_JS) or {}
+        snap = oc_browser("snapshot") or ""
+        # v15 §F4: SPA/lazy rendering — when nothing was collected and the page
+        # body is thin, wait 3s and rescan ONCE before judging.
+        if _form_fields_empty(fields) and len((snap or "").strip()) < 800:
+            print(f"[enrich]    ↳ 0 fields + thin page — waiting 3s for JS render")
+            time.sleep(3)
+            fields = _evaluate(_FORM_FIELDS_JS) or {}
+            snap = oc_browser("snapshot") or ""
+        # v15 §F5: pass the real HTTP status into error-page detection.
+        if core_contact_url.is_error_page(
+            snap, url=seed_url, http_status=_current_http_status()
+        ):
+            _emit_event(
+                "enrich.nav.error_page",
+                stage="enrich",
+                target_id=str(t_work.get("id") or ""),
+                payload={"url": seed_url[:200], "where": "seed"},
+            )
+            print(f"[enrich]    ↳ seed error page detected, skip: {seed_url}")
+            continue
+        # v15 §F1: two-stage classification — heuristics first, LLM (Sonnet)
+        # only when the heuristic verdict is uncertain; deterministic fallback.
+        cls = _classify_form_type_v2_for_enrich(fields, snap, config)
+        form_kind, form_reason = cls["kind"], cls["reason"]
+        llm_hint_url = cls.get("b2b_contact_hint_url")
+        if cls.get("llm_called"):
+            _emit_event(
+                "enrich.classify.llm",
+                stage="enrich",
+                target_id=str(t_work.get("id") or ""),
+                payload={
+                    "kind": form_kind,
+                    "src": cls.get("src"),
+                    "hint_url": (llm_hint_url or "")[:200],
+                },
+            )
+        chosen_url = seed_url
+        if form_kind == "contact":
+            best_known = {"url": seed_url, "fields": fields, "snap": snap}
+            break
+
+        # v15 §F3: hosted-form iframes — enter the iframe src instead of
+        # skipping (form.run / HubSpot / Tayori etc., or same-domain embeds).
+        ifr_src = core_contact_url.iframe_form_src(fields.get("iframes"), seed_url)
+        if ifr_src:
+            print(f"[enrich]    ↳ iframe form detected -> open {ifr_src}")
+            oc_browser("open", ifr_src)
+            time.sleep(RATE_LIMIT_SECONDS)
+            f3 = _evaluate(_FORM_FIELDS_JS) or {}
+            s3 = oc_browser("snapshot") or ""
+            k3, r3 = _classify_form_type(f3, s3)
+            _emit_event(
+                "enrich.iframe.entered",
+                stage="enrich",
+                target_id=str(t_work.get("id") or ""),
+                payload={"src": ifr_src[:200], "kind": k3},
+            )
+            if k3 == "contact":
+                fields, snap = f3, s3
+                form_kind, form_reason = k3, f"iframe:{r3 or 'contact'}"
+                chosen_url = ifr_src
+                best_known = {"url": ifr_src, "fields": f3, "snap": s3}
+                print(f"[enrich]    ✅ iframe form is the contact form -> {ifr_src}")
+                break
+
+        links = _list_page_links()
+        candidates = _build_contact_candidates(t_work, seed_url, links)
+        # v15 §F1: a 法人窓口 link spotted by the LLM jumps the queue.
+        if llm_hint_url:
+            hint_abs = core_contact_url.absolutize_url(llm_hint_url, seed_url)
+            if hint_abs and hint_abs not in candidates and hint_abs != seed_url:
+                candidates = [hint_abs] + candidates
+        if candidates:
+            print(
+                f"[enrich] ({i}/{total}) {t_work.get('name')}: "
+                f"non-contact ({form_kind}) -> try correcting URL ({len(candidates)} candidates)"
+            )
+        for cand in candidates:
+            correction_attempts += 1
+            print(f"[enrich]    ↳ candidate {correction_attempts}/{len(candidates)}: {cand}")
+            oc_browser("open", cand)
+            time.sleep(RATE_LIMIT_SECONDS)
+            apply_cookie_dismiss(
+                _evaluate,
+                config,
+                stage="enrich",
+                target_id=t_work.get("id"),
+                emit_event=lambda kind, **kw: _emit_event(kind, **kw),
+            )
+            snap2 = oc_browser("snapshot") or ""
+            if core_contact_url.is_error_page(
+                snap2, url=cand, http_status=_current_http_status()
+            ):
+                _emit_event(
+                    "enrich.nav.error_page",
+                    stage="enrich",
+                    target_id=str(t_work.get("id") or ""),
+                    payload={"url": cand[:200], "where": "candidate"},
+                )
+                if best_known and best_known.get("url"):
+                    oc_browser("open", str(best_known["url"]))
+                    time.sleep(RATE_LIMIT_SECONDS)
+                continue
+            fields2 = _evaluate(_FORM_FIELDS_JS) or {}
+            kind2, reason2 = _classify_form_type(fields2, snap2)
+            if kind2 == "contact":
+                fields, snap = fields2, snap2
+                form_kind, form_reason = kind2, reason2
+                chosen_url = cand
+                best_known = {"url": cand, "fields": fields2, "snap": snap2}
+                _emit_event(
+                    "enrich.form.url_corrected",
+                    stage="enrich",
+                    target_id=str(t_work.get("id") or ""),
+                    payload={
+                        "original_url": (seed_url or "")[:200],
+                        "corrected_url": cand[:200],
+                        "attempt_no": correction_attempts,
+                    },
+                )
+                corrected_emitted = True
+                print(f"[enrich]    ✅ corrected form_url -> {cand}")
+                break
+            if best_known and best_known.get("url"):
+                oc_browser("open", str(best_known["url"]))
+                time.sleep(RATE_LIMIT_SECONDS)
+        if form_kind == "contact":
+            break
+
+    if form_kind != "contact" and best_known:
+        chosen_url = str(best_known.get("url") or chosen_url)
+        fields = dict(best_known.get("fields") or fields)
+        snap = str(best_known.get("snap") or snap)
+        form_kind = "contact"
+        form_reason = "best_known_good_contact"
+
+    t_work["form_url"] = chosen_url or (seed_urls[0] if seed_urls else "")
+    if original_url and chosen_url and chosen_url != original_url:
+        t_work["form_url_original"] = original_url
+        t_work["form_url_corrected"] = True
+    elif not original_url and chosen_url:
+        t_work["form_url_original"] = ""
+        t_work["form_url_corrected"] = True
+    if t_work.get("form_url_corrected") and not corrected_emitted:
+        _emit_event(
+            "enrich.form.url_corrected",
+            stage="enrich",
+            target_id=str(t_work.get("id") or ""),
+            payload={
+                "original_url": original_url[:200],
+                "corrected_url": str(chosen_url or "")[:200],
+                "attempt_no": correction_attempts,
+            },
+        )
+
+    # Save first form snapshot for debugging
+    if i == 1:
+        sample = DATA_DIR / "sample_form.txt"
+        if snap:
+            sample.write_text(snap)
+            print(f"[enrich] saved first form snapshot -> {sample}")
+
+    if form_kind != "contact":
+        reason = form_reason or "non_contact"
+        if correction_attempts:
+            reason = f"{reason} (correction_attempts={correction_attempts}, all_failed)"
+        print(
+            f"[enrich] ({i}/{total}) {t_work.get('name')}: "
+            f"NON-CONTACT form ({form_kind}: {reason}) — adding to skip_history"
+        )
+        append_skip_history([
+            {
+                "id": t_work.get("id"),
+                "name": t_work.get("name"),
+                "industry": t_work.get("industry"),
+                "draft": {
+                    "body": f"non_contact_form: {form_kind} ({reason})"
+                },
+            }
+        ])
+        enriched.append(
+            {
+                **t_work,
+                "_enrich_skipped": f"non_contact_form:{form_kind}",
+                "_enrich_skip_reason": reason,
+            }
+        )
+        _emit_event(
+            "enrich.form.skipped_non_contact",
+            stage="enrich",
+            target_id=str(t_work.get("id") or ""),
+            payload={"kind": form_kind, "reason": reason, "correction_attempts": correction_attempts},
+        )
+        return {"outcome": "skipped"}
+
+    inquiry_fields = _extract_inquiry_type_fields(fields)
+    if inquiry_fields:
+        probe_plan = None
+        if config:
+            probe = {
+                "id": t_work.get("id"),
+                "name": t_work.get("name"),
+                "form_fields": fields,
+                "field_map_overrides": t_work.get("field_map_overrides", {}) or {},
+            }
+            probe_plan = _llm_analyze_form(probe, config, body_max_chars=400)
+        sel = _summarize_inquiry_type_selection(inquiry_fields, probe_plan)
+        if sel["count"] > 0:
+            _emit_event(
+                "enrich.inquiry_type_selected",
+                stage="enrich",
+                target_id=str(t_work.get("id") or ""),
+                payload={
+                    "count": sel["count"],
+                    "items": sel["items"],
+                    "confidence_counts": sel["confidence_counts"],
+                    "src_counts": sel["src_counts"],
+                },
+            )
+        llm_no_b2b, fallback_no_b2b, no_b2b = _inquiry_type_no_b2b_flags(inquiry_fields, probe_plan)
+        if no_b2b:
+            reason = "no_b2b_inquiry_type"
+            print(
+                f"[enrich] ({i}/{total}) {t_work.get('name')}: "
+                f"screen_skip ({reason})"
+            )
+            enriched.append(
+                {
+                    **t_work,
+                    "_enrich_skipped": "screen_skip",
+                    "_enrich_skip_reason": reason,
+                }
+            )
+            _emit_event(
+                "enrich.form.screen_skipped",
+                stage="enrich",
+                target_id=str(t_work.get("id") or ""),
+                payload={
+                    "reason": reason,
+                    "llm_no_b2b": llm_no_b2b,
+                    "fallback_no_b2b": fallback_no_b2b,
+                },
+            )
+            return {"outcome": "skipped"}
+
+    if fields.get("form_root_selector"):
+        t_work = {**t_work, "form_root_selector": fields["form_root_selector"]}
+    field_count = (
+        len(fields.get("inputs") or [])
+        + len(fields.get("selects") or [])
+        + len(fields.get("textareas") or [])
+    )
+    max_chars = 0
+    for ta in fields.get("textareas") or []:
+        ml = (ta or {}).get("max_length")
+        if ml:
+            max_chars = max(max_chars, int(ml))
+    tid = str(t_work.get("id") or t_work.get("name") or i)
+    trace = None
+    from _outreach_core import events as ev
+
+    if ev.get_context().data_dir:
+        trace = ev.trace_dir_for(tid)
+        ev.dump_trace(trace, "form_snapshot_pre.txt", snap or "", sender=None)
+    _emit_event(
+        "enrich.form.completed",
+        stage="enrich",
+        target_id=tid,
+        payload={
+            "field_count": field_count,
+            "has_captcha": bool(fields.get("has_recaptcha_v2")),
+            "detected_max_chars": max_chars or None,
+        },
+        trace_dir=trace,
+    )
+    enriched_entry = {
+        **t_work,
+        "form_fields": fields,
+        "_enriched_at": datetime.utcnow().isoformat() + "Z",
+    }
+    enriched.append(enriched_entry)
+    return {"outcome": "enriched"}
+
+
+
 def stage_enrich(
     input_path: Path,
     out_path: Path,
@@ -501,285 +1001,29 @@ def stage_enrich(
     print(f"[enrich] {len(targets)} targets to enrich")
 
     enriched: list[dict[str, Any]] = []
+    total = len(targets)
     for i, t in enumerate(targets, 1):
-        seed_urls = _seed_form_urls(t)
-        if not seed_urls:
-            print(f"[enrich] ({i}/{len(targets)}) {t.get('name')}: no form_url/contact_url_candidates, skipping")
-            enriched.append({**t, "_enrich_skipped": "no form_url"})
-            continue
-
-        if t.get("category") in ("b2c_only", "iframe", "site_closed"):
-            cat = t.get("category")
-            print(f"[enrich] ({i}/{len(targets)}) {t.get('name')}: category={cat}, skipping")
-            enriched.append({**t, "_enrich_skipped": f"category={cat}"})
-            continue
-
-        from _outreach_core.cookie_dismiss import apply_cookie_dismiss
-
-        t_work = dict(t)
-        fields: dict[str, Any] = {}
-        snap = ""
-        form_kind = "unknown_no_textarea"
-        form_reason = "no form analyzed"
-        correction_attempts = 0
-        corrected_emitted = False
-        chosen_url = ""
-        original_url = str(t.get("form_url") or "").strip()
-        best_known: dict[str, Any] | None = None
-
-        # Seed candidates: explicit form_url first, then contact_url_candidates.
-        for seed_idx, seed_url in enumerate(seed_urls[:5], 1):
-            print(f"[enrich] ({i}/{len(targets)}) {t.get('name')} -> seed {seed_idx}: {seed_url}")
-            oc_browser("open", seed_url)
-            time.sleep(RATE_LIMIT_SECONDS)
-            apply_cookie_dismiss(
-                _evaluate,
-                config,
-                stage="enrich",
-                target_id=t_work.get("id"),
-                emit_event=lambda kind, **kw: _emit_event(kind, **kw),
-            )
-            # Try clicking through any "法人" / "業務提携" entry-point links.
-            if t_work.get("entry_click_text"):
-                for txt in t_work["entry_click_text"] if isinstance(t_work["entry_click_text"], list) else [t_work["entry_click_text"]]:
-                    _evaluate(f"""
-                        () => {{
-                          for (const a of document.querySelectorAll('a, button')) {{
-                            if ((a.textContent || '').trim().includes({json.dumps(txt)})) {{
-                              a.click(); return true;
-                            }}
-                          }}
-                          return false;
-                        }}
-                    """)
-                    time.sleep(2)
-
-            fields = _evaluate(_FORM_FIELDS_JS) or {}
-            snap = oc_browser("snapshot") or ""
-            if core_contact_url.is_error_page(snap, url=seed_url):
+        try:
+            _enrich_one_target(t, i, total, config, enriched)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001 — per-lead isolation (v15 §R1)
+            tb = traceback.format_exc()
+            print(f"[enrich] ✗ ({i}/{total}) {t.get('name')}: crashed: {exc} — continuing",
+                  file=sys.stderr)
+            try:
                 _emit_event(
-                    "enrich.nav.error_page",
-                    stage="enrich",
-                    target_id=str(t_work.get("id") or ""),
-                    payload={"url": seed_url[:200], "where": "seed"},
+                    "enrich.lead_crashed", stage="enrich",
+                    target_id=str(t.get("id") or ""),
+                    payload={"error": str(exc)[:200], "tb_tail": tb[-800:]},
                 )
-                print(f"[enrich]    ↳ seed error page detected, skip: {seed_url}")
-                continue
-            form_kind, form_reason = _classify_form_type(fields, snap)
-            chosen_url = seed_url
-            if form_kind == "contact":
-                best_known = {"url": seed_url, "fields": fields, "snap": snap}
-                break
-
-            links = _list_page_links()
-            candidates = _build_contact_candidates(t_work, seed_url, links)
-            if candidates:
-                print(
-                    f"[enrich] ({i}/{len(targets)}) {t_work.get('name')}: "
-                    f"non-contact ({form_kind}) -> try correcting URL ({len(candidates)} candidates)"
-                )
-            for cand in candidates:
-                correction_attempts += 1
-                print(f"[enrich]    ↳ candidate {correction_attempts}/{len(candidates)}: {cand}")
-                oc_browser("open", cand)
-                time.sleep(RATE_LIMIT_SECONDS)
-                apply_cookie_dismiss(
-                    _evaluate,
-                    config,
-                    stage="enrich",
-                    target_id=t_work.get("id"),
-                    emit_event=lambda kind, **kw: _emit_event(kind, **kw),
-                )
-                snap2 = oc_browser("snapshot") or ""
-                if core_contact_url.is_error_page(snap2, url=cand):
-                    _emit_event(
-                        "enrich.nav.error_page",
-                        stage="enrich",
-                        target_id=str(t_work.get("id") or ""),
-                        payload={"url": cand[:200], "where": "candidate"},
-                    )
-                    if best_known and best_known.get("url"):
-                        oc_browser("open", str(best_known["url"]))
-                        time.sleep(RATE_LIMIT_SECONDS)
-                    continue
-                fields2 = _evaluate(_FORM_FIELDS_JS) or {}
-                kind2, reason2 = _classify_form_type(fields2, snap2)
-                if kind2 == "contact":
-                    fields, snap = fields2, snap2
-                    form_kind, form_reason = kind2, reason2
-                    chosen_url = cand
-                    best_known = {"url": cand, "fields": fields2, "snap": snap2}
-                    _emit_event(
-                        "enrich.form.url_corrected",
-                        stage="enrich",
-                        target_id=str(t_work.get("id") or ""),
-                        payload={
-                            "original_url": (seed_url or "")[:200],
-                            "corrected_url": cand[:200],
-                            "attempt_no": correction_attempts,
-                        },
-                    )
-                    corrected_emitted = True
-                    print(f"[enrich]    ✅ corrected form_url -> {cand}")
-                    break
-                if best_known and best_known.get("url"):
-                    oc_browser("open", str(best_known["url"]))
-                    time.sleep(RATE_LIMIT_SECONDS)
-            if form_kind == "contact":
-                break
-
-        if form_kind != "contact" and best_known:
-            chosen_url = str(best_known.get("url") or chosen_url)
-            fields = dict(best_known.get("fields") or fields)
-            snap = str(best_known.get("snap") or snap)
-            form_kind = "contact"
-            form_reason = "best_known_good_contact"
-
-        t_work["form_url"] = chosen_url or (seed_urls[0] if seed_urls else "")
-        if original_url and chosen_url and chosen_url != original_url:
-            t_work["form_url_original"] = original_url
-            t_work["form_url_corrected"] = True
-        elif not original_url and chosen_url:
-            t_work["form_url_original"] = ""
-            t_work["form_url_corrected"] = True
-        if t_work.get("form_url_corrected") and not corrected_emitted:
-            _emit_event(
-                "enrich.form.url_corrected",
-                stage="enrich",
-                target_id=str(t_work.get("id") or ""),
-                payload={
-                    "original_url": original_url[:200],
-                    "corrected_url": str(chosen_url or "")[:200],
-                    "attempt_no": correction_attempts,
-                },
-            )
-
-        # Save first form snapshot for debugging
-        if i == 1:
-            sample = DATA_DIR / "sample_form.txt"
-            if snap:
-                sample.write_text(snap)
-                print(f"[enrich] saved first form snapshot -> {sample}")
-
-        if form_kind != "contact":
-            reason = form_reason or "non_contact"
-            if correction_attempts:
-                reason = f"{reason} (correction_attempts={correction_attempts}, all_failed)"
-            print(
-                f"[enrich] ({i}/{len(targets)}) {t_work.get('name')}: "
-                f"NON-CONTACT form ({form_kind}: {reason}) — adding to skip_history"
-            )
-            append_skip_history([
-                {
-                    "id": t_work.get("id"),
-                    "name": t_work.get("name"),
-                    "industry": t_work.get("industry"),
-                    "draft": {
-                        "body": f"non_contact_form: {form_kind} ({reason})"
-                    },
-                }
-            ])
-            enriched.append(
-                {
-                    **t_work,
-                    "_enrich_skipped": f"non_contact_form:{form_kind}",
-                    "_enrich_skip_reason": reason,
-                }
-            )
-            _emit_event(
-                "enrich.form.skipped_non_contact",
-                stage="enrich",
-                target_id=str(t_work.get("id") or ""),
-                payload={"kind": form_kind, "reason": reason, "correction_attempts": correction_attempts},
-            )
-            continue
-
-        inquiry_fields = _extract_inquiry_type_fields(fields)
-        if inquiry_fields:
-            probe_plan = None
-            if config:
-                probe = {
-                    "id": t_work.get("id"),
-                    "name": t_work.get("name"),
-                    "form_fields": fields,
-                    "field_map_overrides": t_work.get("field_map_overrides", {}) or {},
-                }
-                probe_plan = _llm_analyze_form(probe, config, body_max_chars=400)
-            sel = _summarize_inquiry_type_selection(inquiry_fields, probe_plan)
-            if sel["count"] > 0:
-                _emit_event(
-                    "enrich.inquiry_type_selected",
-                    stage="enrich",
-                    target_id=str(t_work.get("id") or ""),
-                    payload={
-                        "count": sel["count"],
-                        "items": sel["items"],
-                        "confidence_counts": sel["confidence_counts"],
-                        "src_counts": sel["src_counts"],
-                    },
-                )
-            llm_no_b2b, fallback_no_b2b, no_b2b = _inquiry_type_no_b2b_flags(inquiry_fields, probe_plan)
-            if no_b2b:
-                reason = "no_b2b_inquiry_type"
-                print(
-                    f"[enrich] ({i}/{len(targets)}) {t_work.get('name')}: "
-                    f"screen_skip ({reason})"
-                )
-                enriched.append(
-                    {
-                        **t_work,
-                        "_enrich_skipped": "screen_skip",
-                        "_enrich_skip_reason": reason,
-                    }
-                )
-                _emit_event(
-                    "enrich.form.screen_skipped",
-                    stage="enrich",
-                    target_id=str(t_work.get("id") or ""),
-                    payload={
-                        "reason": reason,
-                        "llm_no_b2b": llm_no_b2b,
-                        "fallback_no_b2b": fallback_no_b2b,
-                    },
-                )
-                continue
-
-        if fields.get("form_root_selector"):
-            t_work = {**t_work, "form_root_selector": fields["form_root_selector"]}
-        field_count = (
-            len(fields.get("inputs") or [])
-            + len(fields.get("selects") or [])
-            + len(fields.get("textareas") or [])
-        )
-        max_chars = 0
-        for ta in fields.get("textareas") or []:
-            ml = (ta or {}).get("max_length")
-            if ml:
-                max_chars = max(max_chars, int(ml))
-        tid = str(t_work.get("id") or t_work.get("name") or i)
-        trace = None
-        from _outreach_core import events as ev
-
-        if ev.get_context().data_dir:
-            trace = ev.trace_dir_for(tid)
-            ev.dump_trace(trace, "form_snapshot_pre.txt", snap or "", sender=None)
-        _emit_event(
-            "enrich.form.completed",
-            stage="enrich",
-            target_id=tid,
-            payload={
-                "field_count": field_count,
-                "has_captcha": bool(fields.get("has_recaptcha_v2")),
-                "detected_max_chars": max_chars or None,
-            },
-            trace_dir=trace,
-        )
-        enriched_entry = {
-            **t_work,
-            "form_fields": fields,
-            "_enriched_at": datetime.utcnow().isoformat() + "Z",
-        }
-        enriched.append(enriched_entry)
+            except Exception:
+                pass
+            enriched.append({
+                **t,
+                "_enrich_skipped": "lead_crashed",
+                "_enrich_skip_reason": str(exc)[:200],
+            })
 
     with out_path.open("w") as f:
         for e in enriched:
@@ -793,6 +1037,49 @@ def stage_enrich(
 
 def build_system_block(config: dict[str, Any]) -> str:
     return core_prompt.build_system_block(config, PROMPTS_DIR)
+
+
+_INQUIRY_LABEL_RE = re.compile(
+    r"(お問い合わせ種別|問合せ種別|問い合わせ区分|お問い合わせ内容|カテゴリ|区分|ご用件|種別)",
+)
+
+
+def _form_constraints_block(target: dict[str, Any]) -> str:
+    """v15 §L2 — surface the form's hard constraints AT GENERATION TIME.
+
+    Knowing the textarea maxlength and the inquiry-type choices up front lets
+    the model write copy that fits the form, instead of being truncated later.
+    """
+    ff = target.get("form_fields") or {}
+    lines: list[str] = []
+    max_len = 0
+    for ta in ff.get("textareas") or []:
+        if isinstance(ta, dict) and ta.get("max_length"):
+            max_len = max(max_len, int(ta["max_length"]))
+    if max_len:
+        lines.append(f"- 本文 textarea maxlength: {max_len} 文字（厳守）")
+    for sel in (ff.get("selects") or [])[:6]:
+        if not isinstance(sel, dict):
+            continue
+        label = str(sel.get("label") or sel.get("name") or "")
+        if _INQUIRY_LABEL_RE.search(label):
+            opts = [str(o) for o in (sel.get("options") or [])[:15]]
+            if opts:
+                lines.append(f"- お問い合わせ種別の選択肢（{label}）: {' / '.join(opts)}")
+    radios = ff.get("radios") or {}
+    if isinstance(radios, dict):
+        for gname, opts in list(radios.items())[:4]:
+            labels = [str((o or {}).get("label") or "") for o in (opts or []) if isinstance(o, dict)]
+            labels = [x for x in labels if x]
+            if labels and _INQUIRY_LABEL_RE.search(" ".join(labels) + gname):
+                lines.append(f"- ラジオ選択肢（{gname}）: {' / '.join(labels[:10])}")
+    if not lines:
+        return ""
+    return (
+        "## Form constraints (write copy that fits this form)\n"
+        + "\n".join(lines)
+        + "\n\n"
+    )
 
 
 def build_user_block(target: dict[str, Any], max_chars: int) -> str:
@@ -811,7 +1098,8 @@ def build_user_block(target: dict[str, Any], max_chars: int) -> str:
         "If hook_context / direct_signals are too thin, output "
         "{\"subject\": \"SKIP\", \"body\": \"INSUFFICIENT_DATA: <reason>\"}.\n"
         "If category is b2c_only / iframe / site_closed, also output SKIP.\n\n"
-        "## Target\n"
+        + _form_constraints_block(target)
+        + "## Target\n"
         "```json\n"
         f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n"
         "```\n"
@@ -989,7 +1277,29 @@ def stage_draft(
             run_id=run_id or ev.get_run_id(),
             sender=config.get("sender"),
             limit=limit,
+            recent_bodies=_recent_sent_bodies(),
         )
+
+
+def _recent_sent_bodies(n: int = 20) -> list[str]:
+    """Bodies of the last N sent messages (v15 §L2 opening-dedup input)."""
+    if not SENT_HISTORY_PATH.exists():
+        return []
+    bodies: list[str] = []
+    try:
+        with SENT_HISTORY_PATH.open(encoding="utf-8") as f:
+            rows = [l for l in f if l.strip()]
+        for line in rows[-n:]:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            body = ((row.get("draft") or {}).get("body")) or ""
+            if body:
+                bodies.append(str(body))
+    except OSError:
+        return bodies
+    return bodies
 
 
 # ============================================================================
@@ -3880,6 +4190,21 @@ def _heuristic_fill_fallback(target: dict[str, Any], config: dict[str, Any],
     postal_format = overrides.get("postal_format", "no_hyphen")
     postal_value = sender["postal_code_no_hyphen"] if postal_format == "no_hyphen" else sender["postal_code"]
 
+    # v15 §S2: derive split address parts when the brief only carries a single
+    # address string (pure heuristic split; explicit sender keys always win).
+    from _outreach_core import form_validation as fv
+
+    addr_split = fv.split_jp_address(
+        str(sender.get("full_address") or sender.get("address") or "")
+    )
+    sender_prefecture = sender.get("prefecture") or addr_split["prefecture"]
+    sender_city = sender.get("city") or addr_split["city"]
+    sender_address_line = sender.get("address_line") or addr_split["address_line"]
+    sender_building = sender.get("building") or addr_split["building"]
+    sender_full_address = str(
+        sender.get("full_address") or sender.get("address") or ""
+    )
+
     # Sender field fill (multi-shot for split fields)
     fills = [
         # Try split-name first
@@ -3897,10 +4222,10 @@ def _heuristic_fill_fallback(target: dict[str, Any], config: dict[str, Any],
         ("email_confirm", sender["email"], SENDER_FIELD_PATTERNS["email_confirm"]),
         ("phone", phone_value, SENDER_FIELD_PATTERNS["phone"]),
         ("postal_code", postal_value, SENDER_FIELD_PATTERNS["postal_code"]),
-        ("city", f"{sender['city']}{sender['address_line']}", SENDER_FIELD_PATTERNS["city"]),
-        ("address_line", sender["address_line"], SENDER_FIELD_PATTERNS["address_line"]),
-        ("building", sender["building"], SENDER_FIELD_PATTERNS["building"]),
-        ("address_full", sender["full_address"], SENDER_FIELD_PATTERNS["address_full"]),
+        ("city", f"{sender_city}{sender_address_line}", SENDER_FIELD_PATTERNS["city"]),
+        ("address_line", sender_address_line, SENDER_FIELD_PATTERNS["address_line"]),
+        ("building", sender_building, SENDER_FIELD_PATTERNS["building"]),
+        ("address_full", sender_full_address, SENDER_FIELD_PATTERNS["address_full"]),
     ]
     for kind, value, patterns in fills:
         res = _fill_field(kind, value, patterns)
@@ -3910,10 +4235,19 @@ def _heuristic_fill_fallback(target: dict[str, Any], config: dict[str, Any],
         else:
             diagnostics["unfilled"].append(kind)
 
+    # v15 §S2: date fields (ご希望日 etc.) → 7 business days out, ISO format.
+    date_value = fv.default_date_value()
+    date_res = _fill_field(
+        "contact_date", date_value,
+        [r"希望日", r"予定日", r"ご都合", r"日程", r"実施日"],
+    )
+    if date_res and date_res.get("filled"):
+        diagnostics["filled"].append(f"contact_date={date_value}")
+
     # Prefecture select (separate handling)
-    pref_res = _fill_select(sender["prefecture"], label_pattern=r"都道府県|prefecture")
+    pref_res = _fill_select(sender_prefecture, label_pattern=r"都道府県|prefecture")
     if pref_res and pref_res.get("selected"):
-        diagnostics["filled"].append(f"prefecture={sender['prefecture']}")
+        diagnostics["filled"].append(f"prefecture={sender_prefecture}")
 
     # Apply overrides
     if overrides.get("category_radio"):
@@ -4241,6 +4575,14 @@ def _close_tab(target_id: str | None) -> None:
         pass
 
 
+def _close_tab_safely(target_id: str | None) -> None:
+    """Crash-path tab cleanup (v15 §R1) — must never raise."""
+    try:
+        _close_tab(target_id)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _list_tabs_payload() -> Any:
     try:
         return core_infer.oc_browser_json("tabs")
@@ -4546,6 +4888,822 @@ def _deep_submit(
     return {"vresult": vresult, "page_text": combined}
 
 
+# v15 §S1 — multi-step wizard generalization (single/confirm = special cases)
+MAX_FORM_STEPS = 4
+
+_WIZARD_CLICK_PATTERNS = [
+    r"入力内容を確認", r"送信内容を確認", r"内容(を|の)?確認", r"確認画面",
+    r"確認する", r"確認$", r"同意して次へ", r"^次へ$", r"次のステップへ",
+    r"^送信する$", r"^送信$", r"この内容で送信", r"内容を送信する",
+    r"上記の内容で送信", r"submit", r"確定",
+]
+
+
+def _advance_wizard_steps(
+    d: dict[str, Any],
+    config: dict[str, Any],
+    body: str,
+    *,
+    trace: Any,
+    steps_done: int,
+) -> dict[str, Any]:
+    """Drive remaining wizard steps after the known single/confirm clicks (§S1).
+
+    Loop (max MAX_FORM_STEPS total): success keyword / form visibly gone →
+    stop (verify decides); otherwise re-fill required fields (existing fill +
+    guardrails) and click a next/confirm/submit button. Returns
+    {"too_deep": bool, "extra_steps": int} — too_deep means the form is STILL
+    an input step after the cap, i.e. needs_attention (`wizard_too_deep`).
+    """
+    from _outreach_core.verify import FORM_VISIBILITY_JS, PAGE_EVIDENCE_JS
+
+    def _still_input_step() -> bool:
+        page = _evaluate(PAGE_EVIDENCE_JS)
+        vis = _evaluate(FORM_VISIBILITY_JS)
+        page_text = page.get("text", "") if isinstance(page, dict) else ""
+        visible_textareas = (
+            int(vis.get("visible_textareas") or 0) if isinstance(vis, dict) else 0
+        )
+        return core_submit_progress.wizard_should_continue(page_text, visible_textareas)
+
+    extra = 0
+    while steps_done + extra < MAX_FORM_STEPS:
+        if not _still_input_step():
+            return {"too_deep": False, "extra_steps": extra}
+        print(f"  [send] wizard: still an input step after {steps_done + extra} "
+              f"click(s) — fill + advance")
+        _heuristic_fill_fallback(d, config, body, None)
+        time.sleep(0.5)
+        cr = _click_button_with_gate_retry(
+            _WIZARD_CLICK_PATTERNS, form_root_selector=d.get("form_root_selector")
+        )
+        if not cr or not cr.get("clicked"):
+            # Nothing clickable — let verify/resolver judge the page as-is.
+            return {"too_deep": False, "extra_steps": extra, "stalled": True}
+        extra += 1
+        _emit_event(
+            "send.wizard_step",
+            stage="send",
+            target_id=str(d.get("id") or d.get("name") or ""),
+            payload={"step": steps_done + extra, "clicked": (cr.get("text") or "")[:60]},
+            trace_dir=trace,
+        )
+        time.sleep(3)
+    return {"too_deep": _still_input_step(), "extra_steps": extra}
+
+
+def _send_one_target(
+    d: dict[str, Any],
+    *,
+    di: int,
+    idx: int,
+    mode: str,
+    config: dict[str, Any],
+    verify_strict: bool,
+    iterative_fill: bool,
+    autonomous: bool,
+    score_on: bool,
+    tab_isolation: bool,
+    resolver_tab_ids: set[str],
+    sent: list[dict[str, Any]],
+    filled_only: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Send to a single target — extracted per-lead loop body (v15 §R1).
+
+    Mutates ``sent`` / ``filled_only`` / ``resolver_tab_ids`` in place
+    (mechanical extraction). Exceptions are isolated by the caller, so one
+    company can no longer kill the whole batch.
+    """
+    name = d.get("name", "?")
+    body = d["draft"]["body"]
+    form_url = d["form_url"]
+    flow = d.get("flow") or (d.get("_llm_plan") or {}).get("next_step") or "single"
+    captcha = (d.get("form_fields") or {}).get("has_recaptcha_v2") or d.get("captcha") == "recaptcha_v2_visible"
+
+    # Proactive URL-strip (§3.6): if this domain is known to reject URLs in the
+    # body, send the URL-free variant from the start (no wasted first attempt).
+    send_body = body
+    url_stripped = False
+    if core_avoidance.is_url_unfriendly(DATA_DIR, form_url) and core_content_guard.has_url(body):
+        send_body, _diag = core_content_guard.sanitize_body(body, kind="url")
+        url_stripped = True
+        print(f"  [send] このドメインはURL不可既知 → 本文からURL除去して送信 "
+              f"(removed {len(_diag.get('removed_urls') or [])})")
+
+    print(f"\n=== [{idx}] {name} ===")
+    print(f"  URL: {form_url}")
+    print(f"  Flow: {flow}, captcha: {captcha and 'v2 (manual)' or 'none/v3'}, chars: {len(send_body)}"
+          + (" [URL除去済]" if url_stripped else ""))
+
+    tid = str(d.get("id") or name)
+    from _outreach_core import events as ev
+
+    if not ev.get_context().data_dir:
+        ev.configure(skill="jp-form-outreach", data_dir=DATA_DIR)
+    trace = ev.trace_dir_for(tid)
+
+    # Autonomous self-score gate (the per-item replacement for human yes/no).
+    # Runs BEFORE opening the browser so weak drafts cost no page load.
+    # Quality is locked upfront; this is the secondary guard against a weak
+    # draft slipping through. Below threshold → skip & log, no human ask.
+    if autonomous and score_on and mode in ("auto", "interactive"):
+        decision = core_autonomy.self_score_draft(d, config, oc_infer_fn=oc_infer)
+        sc = decision.get("score")
+        print(f"  [send] self-score: {sc if sc is not None else 'n/a'} → "
+              f"{'send' if decision['send'] else 'SKIP'} ({decision['reason']})")
+        _emit_event(
+            "send.self_scored",
+            stage="send",
+            target_id=tid,
+            payload={
+                "score": sc,
+                "send": decision["send"],
+                "errored": decision.get("errored", False),
+                "reason": (decision.get("reason") or "")[:160],
+            },
+            trace_dir=trace,
+        )
+        if not decision["send"]:
+            _auto_skip_and_log(d, f"self_score_below_threshold: {decision['reason']}")
+            return {"outcome": "skipped"}
+
+    # Avoidance learning: if this domain has repeatedly shown a *visible*
+    # captcha challenge even after warmup, stop wasting attempts on it.
+    dstatus = core_avoidance.domain_status(DATA_DIR, form_url, config)
+    if dstatus["unviable"]:
+        print(f"  [send] ⏭ domain captcha-unviable "
+              f"({dstatus['captcha_blocks']}/{dstatus['attempts']} blocked) → route/skip")
+        _emit_event(
+            "send.domain_unviable", stage="send", target_id=tid,
+            payload=dstatus, trace_dir=trace,
+        )
+        core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SKIPPED)
+        if autonomous:
+            _auto_skip_and_log(
+                d, f"domain_captcha_unviable: {dstatus['captcha_blocks']}/{dstatus['attempts']} blocked"
+            )
+        else:
+            _handle_blocker(d, "domain repeatedly captcha-blocked", autonomous=False)
+        return {"outcome": "skipped"}
+
+    # 0. reCAPTCHA v3 warm-up (§11-A-8 + §3.5 avoidance): visit root domain +
+    #    dispatch natural interactions before navigating to the form. Warmup
+    #    duration is ADAPTIVE — bumped for domains previously challenged.
+    from _outreach_core.warmup import apply_warmup_if_enabled
+
+    warm_sec = core_avoidance.recommended_warmup_sec(DATA_DIR, form_url, config)
+    warm_config = _config_with_warmup_sec(config, warm_sec)
+    warmup_diag = apply_warmup_if_enabled(
+        form_url=form_url,
+        config=warm_config,
+        oc_browser_fn=oc_browser,
+        evaluate_fn=_evaluate,
+        emit_event=_emit_event,
+        stage="send",
+        target_id=tid,
+    )
+    if not warmup_diag.get("skipped"):
+        print(
+            f"  [send] reCAPTCHA v3 warmup: "
+            f"{warmup_diag.get('elapsed_sec')}s on {warmup_diag.get('seed_url')}"
+        )
+
+    # 1. Open form — in its own tracked tab (§17). Keep total tabs bounded;
+    #    error tabs (resolver-bound) are protected from the cap.
+    t0 = time.time()
+    cur_tab_id: str | None = None
+    if tab_isolation:
+        _enforce_tab_cap(protect=resolver_tab_ids)
+        cur_tab_id = _open_tab(form_url)
+        if cur_tab_id:
+            _focus_tab(cur_tab_id)
+    if not cur_tab_id:
+        oc_browser("open", form_url)  # fallback (also opens a tab)
+    d["_send_tab_id"] = cur_tab_id  # crash-path cleanup handle (v15 §R1)
+    time.sleep(RATE_LIMIT_SECONDS)
+    _emit_event(
+        "send.opened",
+        stage="send",
+        target_id=tid,
+        payload={"url": form_url, "tab_id": cur_tab_id,
+                 "time_ms": int((time.time() - t0) * 1000)},
+        trace_dir=trace,
+    )
+    from _outreach_core.cookie_dismiss import apply_cookie_dismiss
+
+    apply_cookie_dismiss(
+        _evaluate,
+        config,
+        stage="send",
+        target_id=tid,
+        emit_event=lambda kind, **kw: _emit_event(kind, trace_dir=trace, **kw),
+    )
+
+    pre_snap = oc_browser("snapshot")
+    ev.dump_trace(trace, "form_snapshot_pre.txt", pre_snap or "")
+
+    # 2. Click any pre-form entry (e.g. "法人のお客様" tab)
+    if d.get("entry_click_text"):
+        for txt in (d["entry_click_text"] if isinstance(d["entry_click_text"], list) else [d["entry_click_text"]]):
+            cr = _click_button([re.escape(txt)])
+            _emit_event(
+                "send.entry_clicked",
+                stage="send",
+                target_id=tid,
+                payload={"text": txt, "success": bool(cr and cr.get("clicked"))},
+                trace_dir=trace,
+            )
+            time.sleep(1.5)
+    gate = _try_open_pre_form_gate()
+    if gate and gate.get("clicked"):
+        _emit_event(
+            "send.pre_form_gate_clicked",
+            stage="send",
+            target_id=tid,
+            payload={
+                "patterns": _PRE_FORM_ENTRY_PATTERNS,
+                "checked_boxes": gate.get("checked_boxes", 0),
+                "radio_auto_selected": gate.get("radio_auto_selected", 0),
+                "select_auto_selected": gate.get("select_auto_selected", 0),
+            },
+            trace_dir=trace,
+        )
+        time.sleep(1.5)
+
+    # 3. Fill all fields
+    diagnostics = fill_form_for_target(
+        d, config, send_body, trace_dir=trace, iterative_fill=iterative_fill
+    )
+    print(f"  [send] filled: {len(diagnostics['filled'])} / unfilled: {len(diagnostics['unfilled'])} / errors: {len(diagnostics['errors'])}")
+    for f in diagnostics["filled"][:8]:
+        print(f"    ✓ {f}")
+    if diagnostics["errors"]:
+        for e in diagnostics["errors"]:
+            print(f"    ✗ {e}")
+
+    wrong_form_reason = _detect_wrong_form_type(diagnostics)
+    if wrong_form_reason:
+        print(f"  [send] ⚠ WRONG_FORM_TYPE detected — {wrong_form_reason}")
+        print(f"          aborting submit; browser left open for manual review")
+        filled_only.append(d)
+        _emit_event(
+            "send.wrong_form_type",
+            stage="send",
+            target_id=tid,
+            payload={"reason": wrong_form_reason},
+            trace_dir=trace,
+        )
+        core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_WRONG_FORM)
+        if cur_tab_id:
+            resolver_tab_ids.add(cur_tab_id)
+        _queue_for_resolver(
+            d, "wrong_form_type",
+            f"WRONG_FORM_TYPE_DETECTED — {wrong_form_reason}",
+            trace=trace, autonomous=autonomous, tab_id=cur_tab_id,
+        )
+        return {"outcome": "skipped"}
+
+    # Live captcha re-check (§3.5): the enrich-time flag only says a widget
+    # EXISTS; here we verify whether a challenge is actually VISIBLE/blocking
+    # right now. This is the fix for the production false positives — a missing
+    # submit button or non-blocking v3/checkbox must NOT be reported as
+    # "reCAPTCHA". Presence ≠ blocking.
+    cap_state = _live_captcha_state()
+    _emit_event(
+        "send.captcha_check", stage="send", target_id=tid,
+        payload={
+            "enrich_flag": bool(captcha),
+            "live_kind": cap_state["kind"],
+            "blocking": cap_state["blocking"],
+            "counts": cap_state.get("counts", {}),
+        },
+        trace_dir=trace,
+    )
+    if captcha and not cap_state["blocking"]:
+        print(f"  [send] captcha 再確認: enrich={captcha} だが live={cap_state['kind']} "
+              f"（非ブロッキング）→ 続行")
+    if cap_state["blocking"]:
+        label = core_captcha.reason_label(cap_state)
+        print(f"  [send] ⚠ {label} — 突破せず迂回/記録（完全自律・人手なし方針）")
+        core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_CAPTCHA_BLOCKED)
+        filled_only.append(d)
+        if autonomous:
+            _auto_skip_and_log(d, f"captcha_blocking: {cap_state['kind']} ({label})")
+        else:
+            _escalate_await_proceed(d, f"reCAPTCHA visible challenge: {cap_state['kind']}")
+        return {"outcome": "skipped"}
+
+    if mode == "fill-only":
+        print(f"  [send] ✓ filled. Click 確認/送信 manually.")
+        filled_only.append(d)
+        return {"outcome": "skipped"}
+
+    # 4. Click first submit button (確認 for confirm-flow, 送信 for single)
+    time.sleep(1.0)
+    plan = d.get("_llm_plan") or {}
+    plan_flow = plan.get("next_step")
+    if plan_flow and plan_flow != flow:
+        flow = plan_flow
+    inferred_flow = _infer_submit_flow_from_buttons(form_root_selector=d.get("form_root_selector"))
+    if inferred_flow and inferred_flow != flow:
+        flow = inferred_flow
+    if flow == "confirm":
+        patterns = [
+            r"入力内容を確認", r"送信内容を確認", r"内容(を|の)?確認",
+            r"確認画面", r"確認する", r"確認$", r"内容の確認へ",
+            r"同意して次へ", r"^次へ$", r"次のステップへ",
+        ]
+    else:
+        patterns = [r"送信する", r"^送信$", r"submit", r"内容を送信", r"同意して.*送信"]
+    plan_first = plan.get("first_button_pattern")
+    if plan_first and plan_first not in patterns:
+        patterns = patterns + [plan_first]
+    # v15 §R3: journal BEFORE any click that can actually submit. In single
+    # flow the very first click is the real submit; in confirm flow the final
+    # click (step 5) is journaled instead. A crash between this row and the
+    # "verified" row marks the target unverified → human review on resume.
+    journal_attempted = False
+    if mode in ("auto", "interactive") and flow != "confirm":
+        core_send_journal.append_journal(
+            DATA_DIR, tid, core_send_journal.PHASE_SUBMIT_ATTEMPTED, form_url=form_url
+        )
+        journal_attempted = True
+    drive = _drive_enable_sequence(
+        d,
+        plan,
+        body=send_body,
+        stage="send",
+        trace_dir=trace,
+        max_steps=4,
+    )
+    click_res = (drive.get("click_res") or {}) if drive.get("clicked") else None
+    if click_res:
+        click_res["enable_steps"] = int(drive.get("steps") or 0)
+        _emit_event(
+            "send.enable_sequence.completed",
+            stage="send",
+            target_id=tid,
+            payload={
+                "steps": int(drive.get("steps") or 0),
+                "applied": (drive.get("applied") or [])[:8],
+            },
+            trace_dir=trace,
+        )
+    if not click_res:
+        click_res = _click_button_with_gate_retry(
+            patterns,
+            form_root_selector=d.get("form_root_selector"),
+        )
+    first_native: dict[str, Any] | None = None
+    first_noise_only = False
+    if not click_res or not click_res.get("clicked"):
+        # Strengthened detection (§3.5): before declaring failure, enumerate
+        # the form's buttons and let the LLM pick the most likely confirm/submit
+        # control — the same fallback the FINAL submit already had. Many
+        # "first submit not found" cases (e.g. オリヒロ) were mislabeled as
+        # reCAPTCHA when the button simply didn't match the regex list.
+        print(f"  [send] first submit button regex miss — LLM picker fallback")
+        buttons = _enumerate_buttons(
+            form_root_selector=d.get("form_root_selector"),
+            filled_names=_filled_name_hints(d),
+        )
+        if buttons:
+            ranked = _phase_filter_submit_candidates(
+                buttons,
+                phase="first" if flow == "confirm" else "final",
+            )
+            first_noise_only = len(ranked) == 0
+            click_res = _llm_click_submit_candidate(
+                buttons,
+                config or {},
+                form_root_selector=d.get("form_root_selector"),
+                phase="first" if flow == "confirm" else "final",
+            )
+            pick = (click_res or {}).get("picked") or {}
+            if click_res and click_res.get("clicked"):
+                picked_label = pick.get("text") or pick.get("selector") or click_res.get("text")
+                print(f"  [send] LLM picked first: {picked_label} ({pick.get('reason','')[:60]})")
+                _emit_event(
+                    "send.first.llm_pick", stage="send", target_id=tid,
+                    payload={
+                        "picked_text": (pick.get("text") or "")[:120],
+                        "picked_selector": (pick.get("selector") or "")[:160],
+                        "clicked": bool(click_res and click_res.get("clicked")),
+                        "candidates": len(buttons),
+                    },
+                    trace_dir=trace,
+                )
+        if not click_res or not click_res.get("clicked"):
+            first_native = _submit_native(d, form_root_selector=d.get("form_root_selector"))
+            if first_native.get("clicked"):
+                click_res = {
+                    "clicked": True,
+                    "text": f"[native:{first_native.get('method')}]",
+                    "native_submit_method": first_native.get("method"),
+                }
+    if not click_res or not click_res.get("clicked"):
+        print(f"  [send] ⚠ first submit button not found (patterns={patterns})")
+        if click_res and click_res.get("found_but_disabled"):
+            print(f"  [send]    ↳ matched but disabled: {(click_res.get('disabled_candidates') or [])[:3]}")
+        if first_native:
+            print(f"  [send]    ↳ {_native_submit_diag(first_native)}")
+        filled_only.append(d)
+        _emit_event(
+            "send.first_button_missing",
+            stage="send",
+            target_id=tid,
+            payload={
+                "patterns": patterns,
+                "flow": flow,
+                "found_but_disabled": bool(click_res and click_res.get("found_but_disabled")),
+                "native_submit_method": (first_native or {}).get("method"),
+                "native_submit_reason": (first_native or {}).get("reason"),
+                "noise_only_candidates": first_noise_only,
+                "remaining_gate_total": int((drive.get("remaining") or {}).get("total") or 0),
+            },
+            trace_dir=trace,
+        )
+        core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SUBMIT_NOT_FOUND)
+        if cur_tab_id:
+            resolver_tab_ids.add(cur_tab_id)
+        _queue_for_resolver(
+            d,
+            "submit_gate_unsatisfied" if int((drive.get("remaining") or {}).get("total") or 0) > 0 else "first_submit_not_found",
+            (
+                f"first submit button not found (flow={flow}); "
+                f"noise_only_candidates={first_noise_only}; "
+                f"remaining_gates={json.dumps((drive.get('remaining') or {}), ensure_ascii=False)[:240]}; "
+                f"{_native_submit_diag(first_native)}"
+            ),
+            trace=trace, autonomous=autonomous, tab_id=cur_tab_id,
+        )
+        if journal_attempted:
+            # No click actually happened — close the journal so this target is
+            # not flagged as an unverified prior attempt on resume (§R3).
+            core_send_journal.append_journal(
+                DATA_DIR, tid, core_send_journal.PHASE_VERIFIED, outcome="no_click"
+            )
+        return {"outcome": "skipped"}
+    print(f"  [send] clicked: {click_res.get('text')}")
+    if click_res.get("radio_auto_selected"):
+        print(f"  [send]    ↳ auto-selected radios: {(click_res.get('radio_items') or [])[:3]}")
+    if click_res.get("select_auto_selected"):
+        print(f"  [send]    ↳ auto-selected selects: {(click_res.get('select_items') or [])[:3]}")
+    _emit_event(
+        "send.button.clicked",
+        stage="send",
+        target_id=tid,
+        payload={
+            "pattern_matched": True,
+            "text": (click_res.get("text") or "")[:80],
+            "radio_auto_selected": int(click_res.get("radio_auto_selected") or 0),
+            "select_auto_selected": int(click_res.get("select_auto_selected") or 0),
+            "native_submit_method": click_res.get("native_submit_method"),
+        },
+        trace_dir=trace,
+    )
+    time.sleep(3)
+
+    # 4b. Validation-error recovery: if the form bounced us back to the input
+    # page with inline errors (e.g. furigana format / required title), harvest
+    # them, fix deterministically, and re-click the first submit ONCE. This is
+    # the general safety net beyond the proactive guardrails.
+    vfix = _harvest_and_fix_validation_errors(
+        d, config, send_body, stage="send", trace_dir=trace,
+    )
+    if vfix.get("errors"):
+        err_fields = ", ".join(
+            f"{e['field'][:16]}[{e['kind']}]" for e in vfix["errors"][:4]
+        )
+        print(f"  [send] ⚠ validation errors: {err_fields} → fixed={vfix.get('fixed')}")
+        if vfix.get("recoverable"):
+            time.sleep(0.5)
+            reclick = _click_button_with_gate_retry(
+                patterns, form_root_selector=d.get("form_root_selector")
+            )
+            if reclick and reclick.get("clicked"):
+                print(f"  [send] ↻ re-submitted after validation fix: {reclick.get('text')}")
+                time.sleep(3)
+
+    # 5. If confirm flow, click final submit
+    if flow == "confirm":
+        _emit_event(
+            "send.confirm.reached",
+            stage="send",
+            target_id=tid,
+            payload={"wait_user_ms": 0},
+            trace_dir=trace,
+        )
+        # v15 §R3: confirm flow — journal right before the FINAL submit click.
+        if mode in ("auto", "interactive") and not journal_attempted:
+            core_send_journal.append_journal(
+                DATA_DIR, tid, core_send_journal.PHASE_SUBMIT_ATTEMPTED, form_url=form_url
+            )
+            journal_attempted = True
+        click2 = _click_button_with_gate_retry([
+            r"^送信する$", r"^送信$", r"この内容で送信",
+            r"内容を送信する", r"上記の内容で送信", r"^回答送信$",
+            r"^送る$", r"submit", r"完了", r"確定",
+            r"内容で.*送信", r"^以上の内容", r"内容を以上で",
+            r"上記内容を送信", r"問い合わせを送信", r"お問い合わせを送信",
+        ])
+        final_native: dict[str, Any] | None = None
+        final_noise_only = False
+        if not click2 or not click2.get("clicked"):
+            print(f"  [send] ⚠ final submit not matched by patterns — falling back to LLM picker")
+            post = _post_form_llm_gate_action(
+                d,
+                config or {},
+                stage="send",
+                trace_dir=trace,
+            )
+            if int(post.get("checked") or 0) > 0:
+                click2 = _click_button_with_gate_retry([
+                    r"^送信する$", r"^送信$", r"この内容で送信",
+                    r"内容を送信する", r"上記の内容で送信", r"^回答送信$",
+                    r"^送る$", r"submit", r"完了", r"確定",
+                    r"内容で.*送信", r"^以上の内容", r"内容を以上で",
+                    r"上記内容を送信", r"問い合わせを送信", r"お問い合わせを送信",
+                ], form_root_selector=d.get("form_root_selector"))
+            buttons = _enumerate_buttons(
+                form_root_selector=d.get("form_root_selector"),
+                filled_names=_filled_name_hints(d),
+            )
+            if buttons:
+                ranked = _phase_filter_submit_candidates(buttons, phase="final")
+                final_noise_only = len(ranked) == 0
+                click2 = _llm_click_submit_candidate(
+                    buttons,
+                    config or {},
+                    form_root_selector=d.get("form_root_selector"),
+                    phase="final",
+                )
+                pick = (click2 or {}).get("picked") or {}
+                if click2 and click2.get("clicked"):
+                    picked_label = pick.get("text") or pick.get("selector") or click2.get("text")
+                    print(f"  [send] LLM picked: {picked_label} ({pick.get('reason','')[:60]})")
+                    _emit_event(
+                        "send.final.llm_pick", stage="send", target_id=tid,
+                        payload={
+                            "picked_text": (pick.get("text") or "")[:120],
+                            "picked_selector": (pick.get("selector") or "")[:160],
+                            "clicked": bool(click2 and click2.get("clicked")),
+                            "candidates": len(buttons),
+                        },
+                        trace_dir=trace,
+                    )
+            if not click2 or not click2.get("clicked"):
+                final_native = _submit_native(d, form_root_selector=d.get("form_root_selector"))
+                if final_native.get("clicked"):
+                    click2 = {
+                        "clicked": True,
+                        "text": f"[native:{final_native.get('method')}]",
+                        "native_submit_method": final_native.get("method"),
+                    }
+            if not click2 or not click2.get("clicked"):
+                print(f"  [send] ⚠ final submit still not clickable after LLM fallback — awaiting proceed")
+                if click2 and click2.get("found_but_disabled"):
+                    print(f"  [send]    ↳ matched but disabled: {(click2.get('disabled_candidates') or [])[:3]}")
+                if final_native:
+                    print(f"  [send]    ↳ {_native_submit_diag(final_native)}")
+                if trace:
+                    ev.dump_trace(
+                        trace, "form_snapshot_confirm.txt",
+                        oc_browser("snapshot") or "",
+                    )
+                filled_only.append(d)
+                core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SUBMIT_NOT_FOUND)
+                if cur_tab_id:
+                    resolver_tab_ids.add(cur_tab_id)
+                _queue_for_resolver(
+                    d, "confirm_submit_not_found",
+                    (
+                        "confirm-page final submit not found; "
+                        f"noise_only_candidates={final_noise_only}; {_native_submit_diag(final_native)}"
+                    ),
+                    trace=trace, autonomous=autonomous, tab_id=cur_tab_id,
+                )
+                if journal_attempted:
+                    core_send_journal.append_journal(
+                        DATA_DIR, tid, core_send_journal.PHASE_VERIFIED,
+                        outcome="no_click",
+                    )
+                return {"outcome": "skipped"}
+        print(f"  [send] clicked final: {click2.get('text')}")
+        if click2.get("radio_auto_selected"):
+            print(f"  [send]    ↳ auto-selected radios: {(click2.get('radio_items') or [])[:3]}")
+        if click2.get("select_auto_selected"):
+            print(f"  [send]    ↳ auto-selected selects: {(click2.get('select_items') or [])[:3]}")
+        _emit_event(
+            "send.final.clicked",
+            stage="send",
+            target_id=tid,
+            payload={
+                "text": (click2.get("text") or "")[:80],
+                "radio_auto_selected": int(click2.get("radio_auto_selected") or 0),
+                "select_auto_selected": int(click2.get("select_auto_selected") or 0),
+                "native_submit_method": click2.get("native_submit_method"),
+            },
+            trace_dir=trace,
+        )
+        time.sleep(5)
+
+    # 5b. v15 §S1: generalized multi-step wizard. If the page STILL shows an
+    # active form (3+ step flows beyond the single/confirm dichotomy), keep
+    # filling + clicking next/confirm/submit up to MAX_FORM_STEPS total.
+    if mode in ("auto", "interactive"):
+        wiz = _advance_wizard_steps(
+            d, config, send_body, trace=trace,
+            steps_done=2 if flow == "confirm" else 1,
+        )
+        if wiz.get("too_deep"):
+            print(f"  [send] ⚠ wizard too deep (>{MAX_FORM_STEPS} steps) — needs attention")
+            filled_only.append(d)
+            _emit_event(
+                "send.wizard_too_deep", stage="send", target_id=tid,
+                payload={"max_steps": MAX_FORM_STEPS,
+                         "extra_steps": wiz.get("extra_steps", 0)},
+                trace_dir=trace,
+            )
+            if cur_tab_id:
+                resolver_tab_ids.add(cur_tab_id)
+            _queue_for_resolver(
+                d, "wizard_too_deep",
+                f"multi-step form exceeded {MAX_FORM_STEPS} steps",
+                trace=trace, autonomous=autonomous, tab_id=cur_tab_id,
+            )
+            if journal_attempted:
+                core_send_journal.append_journal(
+                    DATA_DIR, tid, core_send_journal.PHASE_VERIFIED,
+                    outcome="wizard_too_deep",
+                )
+            return {"outcome": "skipped"}
+
+    # 6. Verify send (keywords, required fields, plan gaps)
+    time.sleep(2)
+    ev.dump_trace(trace, "form_snapshot_post.txt", oc_browser("snapshot") or "")
+    from _outreach_core.verify import PAGE_EVIDENCE_JS
+
+    page_evidence = _evaluate(PAGE_EVIDENCE_JS)
+    snap = oc_browser("snapshot")
+    snap_path = DATA_DIR / f"verify_snapshot_{d.get('id', di)}.txt"
+    combined = snap or ""
+    if isinstance(page_evidence, dict):
+        combined = f"{combined}\n{page_evidence.get('text', '')}\n{page_evidence.get('url', '')}"
+    if combined.strip():
+        snap_path.write_text(combined, encoding="utf-8")
+
+    # v15 §V1: ALWAYS persist post-submit evidence (URL+title+text head) so a
+    # sent_ok can be audited later for false positives — not only on failure.
+    if isinstance(page_evidence, dict):
+        ev.dump_trace(
+            trace, "post_submit_evidence.txt",
+            f"url: {page_evidence.get('url', '')}\n"
+            f"title: {page_evidence.get('title', '')}\n\n"
+            f"{(page_evidence.get('text') or '')[:4000]}",
+        )
+
+    if mode in ("auto", "interactive"):
+        if d.get("_llm_plan"):
+            ev.dump_trace(trace, "fill_plan.json", d["_llm_plan"], sender=config.get("sender"))
+        vresult = verify_send_completed(
+            d,
+            "jp_form",
+            snapshot=combined,
+            browser_verify=page_evidence if isinstance(page_evidence, dict) else None,
+            plan=d.get("_llm_plan"),
+            evaluate_fn=_evaluate,
+            data_dir=DATA_DIR,
+            snapshot_path=snap_path if combined.strip() else None,
+            verify_strict=verify_strict,
+            # v15 §V2: LLM tiebreak ONLY for the uncertain middle band.
+            infer_fn=lambda p, m: oc_infer(p, m or core_infer.DEFAULT_MODEL),
+            tiebreak_model=_form_analyzer_base_model(config),
+        )
+        ev.dump_trace(trace, "verify_evidence.json", vresult.get("evidence") or {})
+        outcome = handle_verify_result(d, vresult, DATA_DIR, channel="jp_form")
+        if outcome == "sent_ok":
+            print(f"  [send] ✅ {vresult.get('reason')}")
+            core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SENT)
+            if tab_isolation:
+                _close_tab(cur_tab_id)  # success → close the tab
+            sent.append(d)
+        else:
+            # Content-rejection fallback (§3.6): the form rejected the body for
+            # disallowed characters / a URL. Retry ONCE with the URL removed
+            # ("URLは送らないルート"). Learn the domain so next time we pre-strip.
+            rej = core_content_guard.detect_content_rejection(combined)
+            if (rej and not url_stripped and core_content_guard.has_url(send_body)
+                    and mode in ("auto", "interactive")):
+                print(f"  [send] ⚠ コンテンツ拒否を検知 "
+                      f"({rej['kind']}: {rej['evidence']}) → URL除去して再送")
+                core_avoidance.mark_url_unfriendly(DATA_DIR, form_url)
+                core_avoidance.record_outcome(
+                    DATA_DIR, form_url, core_avoidance.OUTCOME_CONTENT_REJECTED)
+                sanitized, sdiag = core_content_guard.sanitize_body(send_body, kind=rej["kind"])
+                _emit_event(
+                    "send.content_rejected", stage="send", target_id=tid,
+                    payload={
+                        "kind": rej["kind"],
+                        "evidence": rej["evidence"],
+                        "removed_urls": sdiag.get("removed_urls"),
+                    },
+                    trace_dir=trace,
+                )
+                retry = _deep_submit(
+                    d, sanitized, config, trace=trace, flow=flow,
+                    verify_strict=verify_strict, iterative_fill=iterative_fill,
+                )
+                outcome2 = (
+                    handle_verify_result(d, retry["vresult"], DATA_DIR, channel="jp_form")
+                    if retry.get("vresult") else "failed"
+                )
+                if outcome2 == "sent_ok":
+                    print(f"  [send] ✅ URL除去で再送成功")
+                    core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SENT)
+                    if tab_isolation:
+                        _close_tab(cur_tab_id)
+                    _emit_event("send.url_fallback_ok", stage="send", target_id=tid,
+                                payload={"removed_urls": sdiag.get("removed_urls")}, trace_dir=trace)
+                    sent.append(d)
+                else:
+                    print(f"  [send] ⚠ URL除去再送も不成立 — filled_only")
+                    filled_only.append(d)
+            else:
+                escalated_ok = False
+                if mode in ("auto", "interactive") and _has_form_analyzer_escalation(config):
+                    escalated_model = _form_analyzer_escalation_model(config)
+                    cur_model = str(
+                        (d.get("_llm_plan_meta") or {}).get("model")
+                        or _form_analyzer_base_model(config)
+                    )
+                    if escalated_model and cur_model != escalated_model:
+                        print(
+                            f"  [send] verify failed → form analyzer escalation "
+                            f"{cur_model} -> {escalated_model}"
+                        )
+                        _emit_event(
+                            "send.verify.escalation_retry",
+                            stage="send",
+                            target_id=tid,
+                            payload={
+                                "from_model": cur_model,
+                                "to_model": escalated_model,
+                                "verify_status": vresult.get("status"),
+                                "verify_reason": (vresult.get("reason") or "")[:160],
+                            },
+                            trace_dir=trace,
+                        )
+                        d.pop("_llm_plan", None)
+                        d.pop("_llm_plan_meta", None)
+                        esc_cfg = _config_with_form_analyzer_model(config, escalated_model)
+                        retry = _deep_submit(
+                            d, send_body, esc_cfg, trace=trace, flow=flow,
+                            verify_strict=verify_strict, iterative_fill=True,
+                        )
+                        outcome2 = (
+                            handle_verify_result(d, retry["vresult"], DATA_DIR, channel="jp_form")
+                            if retry.get("vresult") else "failed"
+                        )
+                        if outcome2 == "sent_ok":
+                            print(f"  [send] ✅ escalated analyzer retry succeeded")
+                            core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SENT)
+                            if tab_isolation:
+                                _close_tab(cur_tab_id)
+                            _emit_event(
+                                "send.verify.escalation_ok",
+                                stage="send",
+                                target_id=tid,
+                                payload={"model": escalated_model},
+                                trace_dir=trace,
+                            )
+                            sent.append(d)
+                            escalated_ok = True
+                        else:
+                            _emit_event(
+                                "send.verify.escalation_failed",
+                                stage="send",
+                                target_id=tid,
+                                payload={"model": escalated_model},
+                                trace_dir=trace,
+                            )
+                if not escalated_ok:
+                    print(f"  [send] ⚠ verify: {vresult.get('status')} — {vresult.get('reason')}")
+                    filled_only.append(d)
+    else:
+        filled_only.append(d)
+    # v15 §R3: close the journal — verify has settled (any outcome). A target
+    # whose journal stays open (submit_attempted only) is treated as a possible
+    # double-send on the next run and routed to needs_attention.
+    if journal_attempted:
+        final_outcome = "sent_ok" if any(x is d for x in sent) else "not_confirmed"
+        core_send_journal.append_journal(
+            DATA_DIR, tid, core_send_journal.PHASE_VERIFIED, outcome=final_outcome
+        )
+    return {"outcome": "sent" if any(x is d for x in sent) else "done"}
+
+
+
 def stage_send(
     input_path: Path,
     ids: set[int],
@@ -4579,6 +5737,34 @@ def stage_send(
         if not targets:
             return
 
+    # v15 §R3: resume guard — a target whose journal shows submit_attempted
+    # without verified crashed mid-submit last run. Double-send risk → do NOT
+    # auto-send; route to needs_attention for a human decision.
+    unverified = core_send_journal.unverified_attempt_ids(
+        core_send_journal.load_journal(DATA_DIR)
+    )
+    flagged = [d for d in targets if str(d.get("id")) in unverified]
+    if flagged:
+        names = ", ".join(d.get("name", "?") for d in flagged)
+        print(f"[send] ⚠ {len(flagged)} target(s) with UNVERIFIED prior submit "
+              f"attempt → needs_attention (二重送信防止): {names}")
+        for d in flagged:
+            append_needs_attention(DATA_DIR, {
+                "target_id": d.get("id"),
+                "name": d.get("name"),
+                "channel": "jp_form",
+                "reason": ("unverified_prior_attempt: 前回runが最終送信クリック後・"
+                           "verify前に異常終了。二重送信防止のため自動送信を停止。"
+                           "送信履歴(メール受信等)を確認してから判断してください"),
+            })
+            _emit_event(
+                "send.unverified_prior_attempt", stage="send",
+                target_id=str(d.get("id") or ""), payload={},
+            )
+        targets = [d for d in targets if str(d.get("id")) not in unverified]
+        if not targets:
+            return
+
     mode_label = {
         "interactive": "interactive (prompts after fill)",
         "auto": "AUTO (no prompts)",
@@ -4601,664 +5787,50 @@ def stage_send(
     hb = HeartbeatSession(SKILL_DIR, "send", len(targets), heartbeat=heartbeat, data_dir=DATA_DIR)
     hb.start(f"send {len(targets)} targets")
 
-    for di, d in enumerate(targets):
-        idx = sendable.index(d) + 1
-        name = d.get("name", "?")
-        body = d["draft"]["body"]
-        form_url = d["form_url"]
-        flow = d.get("flow") or (d.get("_llm_plan") or {}).get("next_step") or "single"
-        captcha = (d.get("form_fields") or {}).get("has_recaptcha_v2") or d.get("captcha") == "recaptcha_v2_visible"
-
-        # Proactive URL-strip (§3.6): if this domain is known to reject URLs in the
-        # body, send the URL-free variant from the start (no wasted first attempt).
-        send_body = body
-        url_stripped = False
-        if core_avoidance.is_url_unfriendly(DATA_DIR, form_url) and core_content_guard.has_url(body):
-            send_body, _diag = core_content_guard.sanitize_body(body, kind="url")
-            url_stripped = True
-            print(f"  [send] このドメインはURL不可既知 → 本文からURL除去して送信 "
-                  f"(removed {len(_diag.get('removed_urls') or [])})")
-
-        print(f"\n=== [{idx}] {name} ===")
-        print(f"  URL: {form_url}")
-        print(f"  Flow: {flow}, captcha: {captcha and 'v2 (manual)' or 'none/v3'}, chars: {len(send_body)}"
-              + (" [URL除去済]" if url_stripped else ""))
-
-        tid = str(d.get("id") or name)
-        from _outreach_core import events as ev
-
-        if not ev.get_context().data_dir:
-            ev.configure(skill="jp-form-outreach", data_dir=DATA_DIR)
-        trace = ev.trace_dir_for(tid)
-
-        # Autonomous self-score gate (the per-item replacement for human yes/no).
-        # Runs BEFORE opening the browser so weak drafts cost no page load.
-        # Quality is locked upfront; this is the secondary guard against a weak
-        # draft slipping through. Below threshold → skip & log, no human ask.
-        if autonomous and score_on and mode in ("auto", "interactive"):
-            decision = core_autonomy.self_score_draft(d, config, oc_infer_fn=oc_infer)
-            sc = decision.get("score")
-            print(f"  [send] self-score: {sc if sc is not None else 'n/a'} → "
-                  f"{'send' if decision['send'] else 'SKIP'} ({decision['reason']})")
-            _emit_event(
-                "send.self_scored",
-                stage="send",
-                target_id=tid,
-                payload={
-                    "score": sc,
-                    "send": decision["send"],
-                    "errored": decision.get("errored", False),
-                    "reason": (decision.get("reason") or "")[:160],
-                },
-                trace_dir=trace,
-            )
-            if not decision["send"]:
-                _auto_skip_and_log(d, f"self_score_below_threshold: {decision['reason']}")
-                continue
-
-        # Avoidance learning: if this domain has repeatedly shown a *visible*
-        # captcha challenge even after warmup, stop wasting attempts on it.
-        dstatus = core_avoidance.domain_status(DATA_DIR, form_url, config)
-        if dstatus["unviable"]:
-            print(f"  [send] ⏭ domain captcha-unviable "
-                  f"({dstatus['captcha_blocks']}/{dstatus['attempts']} blocked) → route/skip")
-            _emit_event(
-                "send.domain_unviable", stage="send", target_id=tid,
-                payload=dstatus, trace_dir=trace,
-            )
-            core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SKIPPED)
-            if autonomous:
-                _auto_skip_and_log(
-                    d, f"domain_captcha_unviable: {dstatus['captcha_blocks']}/{dstatus['attempts']} blocked"
+    try:
+        for di, d in enumerate(targets):
+            idx = sendable.index(d) + 1
+            tid = str(d.get("id") or d.get("name", "?"))
+            try:
+                result = _send_one_target(
+                    d, di=di, idx=idx, mode=mode, config=config,
+                    verify_strict=verify_strict, iterative_fill=iterative_fill,
+                    autonomous=autonomous, score_on=score_on,
+                    tab_isolation=tab_isolation, resolver_tab_ids=resolver_tab_ids,
+                    sent=sent, filled_only=filled_only,
                 )
-            else:
-                _handle_blocker(d, "domain repeatedly captcha-blocked", autonomous=False)
-            continue
-
-        # 0. reCAPTCHA v3 warm-up (§11-A-8 + §3.5 avoidance): visit root domain +
-        #    dispatch natural interactions before navigating to the form. Warmup
-        #    duration is ADAPTIVE — bumped for domains previously challenged.
-        from _outreach_core.warmup import apply_warmup_if_enabled
-
-        warm_sec = core_avoidance.recommended_warmup_sec(DATA_DIR, form_url, config)
-        warm_config = _config_with_warmup_sec(config, warm_sec)
-        warmup_diag = apply_warmup_if_enabled(
-            form_url=form_url,
-            config=warm_config,
-            oc_browser_fn=oc_browser,
-            evaluate_fn=_evaluate,
-            emit_event=_emit_event,
-            stage="send",
-            target_id=tid,
-        )
-        if not warmup_diag.get("skipped"):
-            print(
-                f"  [send] reCAPTCHA v3 warmup: "
-                f"{warmup_diag.get('elapsed_sec')}s on {warmup_diag.get('seed_url')}"
-            )
-
-        # 1. Open form — in its own tracked tab (§17). Keep total tabs bounded;
-        #    error tabs (resolver-bound) are protected from the cap.
-        t0 = time.time()
-        cur_tab_id: str | None = None
-        if tab_isolation:
-            _enforce_tab_cap(protect=resolver_tab_ids)
-            cur_tab_id = _open_tab(form_url)
-            if cur_tab_id:
-                _focus_tab(cur_tab_id)
-        if not cur_tab_id:
-            oc_browser("open", form_url)  # fallback (also opens a tab)
-        time.sleep(RATE_LIMIT_SECONDS)
-        _emit_event(
-            "send.opened",
-            stage="send",
-            target_id=tid,
-            payload={"url": form_url, "tab_id": cur_tab_id,
-                     "time_ms": int((time.time() - t0) * 1000)},
-            trace_dir=trace,
-        )
-        from _outreach_core.cookie_dismiss import apply_cookie_dismiss
-
-        apply_cookie_dismiss(
-            _evaluate,
-            config,
-            stage="send",
-            target_id=tid,
-            emit_event=lambda kind, **kw: _emit_event(kind, trace_dir=trace, **kw),
-        )
-
-        pre_snap = oc_browser("snapshot")
-        ev.dump_trace(trace, "form_snapshot_pre.txt", pre_snap or "")
-
-        # 2. Click any pre-form entry (e.g. "法人のお客様" tab)
-        if d.get("entry_click_text"):
-            for txt in (d["entry_click_text"] if isinstance(d["entry_click_text"], list) else [d["entry_click_text"]]):
-                cr = _click_button([re.escape(txt)])
-                _emit_event(
-                    "send.entry_clicked",
-                    stage="send",
-                    target_id=tid,
-                    payload={"text": txt, "success": bool(cr and cr.get("clicked"))},
-                    trace_dir=trace,
-                )
-                time.sleep(1.5)
-        gate = _try_open_pre_form_gate()
-        if gate and gate.get("clicked"):
-            _emit_event(
-                "send.pre_form_gate_clicked",
-                stage="send",
-                target_id=tid,
-                payload={
-                    "patterns": _PRE_FORM_ENTRY_PATTERNS,
-                    "checked_boxes": gate.get("checked_boxes", 0),
-                    "radio_auto_selected": gate.get("radio_auto_selected", 0),
-                    "select_auto_selected": gate.get("select_auto_selected", 0),
-                },
-                trace_dir=trace,
-            )
-            time.sleep(1.5)
-
-        # 3. Fill all fields
-        diagnostics = fill_form_for_target(
-            d, config, send_body, trace_dir=trace, iterative_fill=iterative_fill
-        )
-        print(f"  [send] filled: {len(diagnostics['filled'])} / unfilled: {len(diagnostics['unfilled'])} / errors: {len(diagnostics['errors'])}")
-        for f in diagnostics["filled"][:8]:
-            print(f"    ✓ {f}")
-        if diagnostics["errors"]:
-            for e in diagnostics["errors"]:
-                print(f"    ✗ {e}")
-
-        wrong_form_reason = _detect_wrong_form_type(diagnostics)
-        if wrong_form_reason:
-            print(f"  [send] ⚠ WRONG_FORM_TYPE detected — {wrong_form_reason}")
-            print(f"          aborting submit; browser left open for manual review")
-            filled_only.append(d)
-            _emit_event(
-                "send.wrong_form_type",
-                stage="send",
-                target_id=tid,
-                payload={"reason": wrong_form_reason},
-                trace_dir=trace,
-            )
-            core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_WRONG_FORM)
-            if cur_tab_id:
-                resolver_tab_ids.add(cur_tab_id)
-            _queue_for_resolver(
-                d, "wrong_form_type",
-                f"WRONG_FORM_TYPE_DETECTED — {wrong_form_reason}",
-                trace=trace, autonomous=autonomous, tab_id=cur_tab_id,
-            )
-            continue
-
-        # Live captcha re-check (§3.5): the enrich-time flag only says a widget
-        # EXISTS; here we verify whether a challenge is actually VISIBLE/blocking
-        # right now. This is the fix for the production false positives — a missing
-        # submit button or non-blocking v3/checkbox must NOT be reported as
-        # "reCAPTCHA". Presence ≠ blocking.
-        cap_state = _live_captcha_state()
-        _emit_event(
-            "send.captcha_check", stage="send", target_id=tid,
-            payload={
-                "enrich_flag": bool(captcha),
-                "live_kind": cap_state["kind"],
-                "blocking": cap_state["blocking"],
-                "counts": cap_state.get("counts", {}),
-            },
-            trace_dir=trace,
-        )
-        if captcha and not cap_state["blocking"]:
-            print(f"  [send] captcha 再確認: enrich={captcha} だが live={cap_state['kind']} "
-                  f"（非ブロッキング）→ 続行")
-        if cap_state["blocking"]:
-            label = core_captcha.reason_label(cap_state)
-            print(f"  [send] ⚠ {label} — 突破せず迂回/記録（完全自律・人手なし方針）")
-            core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_CAPTCHA_BLOCKED)
-            filled_only.append(d)
-            if autonomous:
-                _auto_skip_and_log(d, f"captcha_blocking: {cap_state['kind']} ({label})")
-            else:
-                _escalate_await_proceed(d, f"reCAPTCHA visible challenge: {cap_state['kind']}")
-            continue
-
-        if mode == "fill-only":
-            print(f"  [send] ✓ filled. Click 確認/送信 manually.")
-            filled_only.append(d)
-            continue
-
-        # 4. Click first submit button (確認 for confirm-flow, 送信 for single)
-        time.sleep(1.0)
-        plan = d.get("_llm_plan") or {}
-        plan_flow = plan.get("next_step")
-        if plan_flow and plan_flow != flow:
-            flow = plan_flow
-        inferred_flow = _infer_submit_flow_from_buttons(form_root_selector=d.get("form_root_selector"))
-        if inferred_flow and inferred_flow != flow:
-            flow = inferred_flow
-        if flow == "confirm":
-            patterns = [
-                r"入力内容を確認", r"送信内容を確認", r"内容(を|の)?確認",
-                r"確認画面", r"確認する", r"確認$", r"内容の確認へ",
-                r"同意して次へ", r"^次へ$", r"次のステップへ",
-            ]
-        else:
-            patterns = [r"送信する", r"^送信$", r"submit", r"内容を送信", r"同意して.*送信"]
-        plan_first = plan.get("first_button_pattern")
-        if plan_first and plan_first not in patterns:
-            patterns = patterns + [plan_first]
-        drive = _drive_enable_sequence(
-            d,
-            plan,
-            body=send_body,
-            stage="send",
-            trace_dir=trace,
-            max_steps=4,
-        )
-        click_res = (drive.get("click_res") or {}) if drive.get("clicked") else None
-        if click_res:
-            click_res["enable_steps"] = int(drive.get("steps") or 0)
-            _emit_event(
-                "send.enable_sequence.completed",
-                stage="send",
-                target_id=tid,
-                payload={
-                    "steps": int(drive.get("steps") or 0),
-                    "applied": (drive.get("applied") or [])[:8],
-                },
-                trace_dir=trace,
-            )
-        if not click_res:
-            click_res = _click_button_with_gate_retry(
-                patterns,
-                form_root_selector=d.get("form_root_selector"),
-            )
-        first_native: dict[str, Any] | None = None
-        first_noise_only = False
-        if not click_res or not click_res.get("clicked"):
-            # Strengthened detection (§3.5): before declaring failure, enumerate
-            # the form's buttons and let the LLM pick the most likely confirm/submit
-            # control — the same fallback the FINAL submit already had. Many
-            # "first submit not found" cases (e.g. オリヒロ) were mislabeled as
-            # reCAPTCHA when the button simply didn't match the regex list.
-            print(f"  [send] first submit button regex miss — LLM picker fallback")
-            buttons = _enumerate_buttons(
-                form_root_selector=d.get("form_root_selector"),
-                filled_names=_filled_name_hints(d),
-            )
-            if buttons:
-                ranked = _phase_filter_submit_candidates(
-                    buttons,
-                    phase="first" if flow == "confirm" else "final",
-                )
-                first_noise_only = len(ranked) == 0
-                click_res = _llm_click_submit_candidate(
-                    buttons,
-                    config or {},
-                    form_root_selector=d.get("form_root_selector"),
-                    phase="first" if flow == "confirm" else "final",
-                )
-                pick = (click_res or {}).get("picked") or {}
-                if click_res and click_res.get("clicked"):
-                    picked_label = pick.get("text") or pick.get("selector") or click_res.get("text")
-                    print(f"  [send] LLM picked first: {picked_label} ({pick.get('reason','')[:60]})")
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:  # noqa: BLE001 — per-lead isolation (v15 §R1)
+                tb = traceback.format_exc()
+                print(f"  [send] ✗ lead crashed: {exc} — continuing with next target",
+                      file=sys.stderr)
+                try:
                     _emit_event(
-                        "send.first.llm_pick", stage="send", target_id=tid,
-                        payload={
-                            "picked_text": (pick.get("text") or "")[:120],
-                            "picked_selector": (pick.get("selector") or "")[:160],
-                            "clicked": bool(click_res and click_res.get("clicked")),
-                            "candidates": len(buttons),
-                        },
-                        trace_dir=trace,
+                        "send.lead_crashed", stage="send", target_id=tid,
+                        payload={"error": str(exc)[:200], "tb_tail": tb[-800:]},
                     )
-            if not click_res or not click_res.get("clicked"):
-                first_native = _submit_native(d, form_root_selector=d.get("form_root_selector"))
-                if first_native.get("clicked"):
-                    click_res = {
-                        "clicked": True,
-                        "text": f"[native:{first_native.get('method')}]",
-                        "native_submit_method": first_native.get("method"),
-                    }
-        if not click_res or not click_res.get("clicked"):
-            print(f"  [send] ⚠ first submit button not found (patterns={patterns})")
-            if click_res and click_res.get("found_but_disabled"):
-                print(f"  [send]    ↳ matched but disabled: {(click_res.get('disabled_candidates') or [])[:3]}")
-            if first_native:
-                print(f"  [send]    ↳ {_native_submit_diag(first_native)}")
-            filled_only.append(d)
-            _emit_event(
-                "send.first_button_missing",
-                stage="send",
-                target_id=tid,
-                payload={
-                    "patterns": patterns,
-                    "flow": flow,
-                    "found_but_disabled": bool(click_res and click_res.get("found_but_disabled")),
-                    "native_submit_method": (first_native or {}).get("method"),
-                    "native_submit_reason": (first_native or {}).get("reason"),
-                    "noise_only_candidates": first_noise_only,
-                    "remaining_gate_total": int((drive.get("remaining") or {}).get("total") or 0),
-                },
-                trace_dir=trace,
-            )
-            core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SUBMIT_NOT_FOUND)
-            if cur_tab_id:
-                resolver_tab_ids.add(cur_tab_id)
-            _queue_for_resolver(
-                d,
-                "submit_gate_unsatisfied" if int((drive.get("remaining") or {}).get("total") or 0) > 0 else "first_submit_not_found",
-                (
-                    f"first submit button not found (flow={flow}); "
-                    f"noise_only_candidates={first_noise_only}; "
-                    f"remaining_gates={json.dumps((drive.get('remaining') or {}), ensure_ascii=False)[:240]}; "
-                    f"{_native_submit_diag(first_native)}"
-                ),
-                trace=trace, autonomous=autonomous, tab_id=cur_tab_id,
-            )
-            continue
-        print(f"  [send] clicked: {click_res.get('text')}")
-        if click_res.get("radio_auto_selected"):
-            print(f"  [send]    ↳ auto-selected radios: {(click_res.get('radio_items') or [])[:3]}")
-        if click_res.get("select_auto_selected"):
-            print(f"  [send]    ↳ auto-selected selects: {(click_res.get('select_items') or [])[:3]}")
-        _emit_event(
-            "send.button.clicked",
-            stage="send",
-            target_id=tid,
-            payload={
-                "pattern_matched": True,
-                "text": (click_res.get("text") or "")[:80],
-                "radio_auto_selected": int(click_res.get("radio_auto_selected") or 0),
-                "select_auto_selected": int(click_res.get("select_auto_selected") or 0),
-                "native_submit_method": click_res.get("native_submit_method"),
-            },
-            trace_dir=trace,
-        )
-        time.sleep(3)
+                    append_needs_attention(DATA_DIR, {
+                        "target_id": d.get("id"), "name": d.get("name"),
+                        "channel": "jp_form",
+                        "reason": f"lead_crashed: {str(exc)[:160]}",
+                    })
+                except Exception:
+                    pass
+                _close_tab_safely(d.get("_send_tab_id"))
+                result = {"outcome": "crashed"}
+            d.pop("_send_tab_id", None)
+            hb.tick(di + 1, f"{d.get('name', '?')} · {result.get('outcome', 'done')}")
 
-        # 4b. Validation-error recovery: if the form bounced us back to the input
-        # page with inline errors (e.g. furigana format / required title), harvest
-        # them, fix deterministically, and re-click the first submit ONCE. This is
-        # the general safety net beyond the proactive guardrails.
-        vfix = _harvest_and_fix_validation_errors(
-            d, config, send_body, stage="send", trace_dir=trace,
-        )
-        if vfix.get("errors"):
-            err_fields = ", ".join(
-                f"{e['field'][:16]}[{e['kind']}]" for e in vfix["errors"][:4]
-            )
-            print(f"  [send] ⚠ validation errors: {err_fields} → fixed={vfix.get('fixed')}")
-            if vfix.get("recoverable"):
-                time.sleep(0.5)
-                reclick = _click_button_with_gate_retry(
-                    patterns, form_root_selector=d.get("form_root_selector")
-                )
-                if reclick and reclick.get("clicked"):
-                    print(f"  [send] ↻ re-submitted after validation fix: {reclick.get('text')}")
-                    time.sleep(3)
-
-        # 5. If confirm flow, click final submit
-        if flow == "confirm":
-            _emit_event(
-                "send.confirm.reached",
-                stage="send",
-                target_id=tid,
-                payload={"wait_user_ms": 0},
-                trace_dir=trace,
-            )
-            click2 = _click_button_with_gate_retry([
-                r"^送信する$", r"^送信$", r"この内容で送信",
-                r"内容を送信する", r"上記の内容で送信", r"^回答送信$",
-                r"^送る$", r"submit", r"完了", r"確定",
-                r"内容で.*送信", r"^以上の内容", r"内容を以上で",
-                r"上記内容を送信", r"問い合わせを送信", r"お問い合わせを送信",
-            ])
-            final_native: dict[str, Any] | None = None
-            final_noise_only = False
-            if not click2 or not click2.get("clicked"):
-                print(f"  [send] ⚠ final submit not matched by patterns — falling back to LLM picker")
-                post = _post_form_llm_gate_action(
-                    d,
-                    config or {},
-                    stage="send",
-                    trace_dir=trace,
-                )
-                if int(post.get("checked") or 0) > 0:
-                    click2 = _click_button_with_gate_retry([
-                        r"^送信する$", r"^送信$", r"この内容で送信",
-                        r"内容を送信する", r"上記の内容で送信", r"^回答送信$",
-                        r"^送る$", r"submit", r"完了", r"確定",
-                        r"内容で.*送信", r"^以上の内容", r"内容を以上で",
-                        r"上記内容を送信", r"問い合わせを送信", r"お問い合わせを送信",
-                    ], form_root_selector=d.get("form_root_selector"))
-                buttons = _enumerate_buttons(
-                    form_root_selector=d.get("form_root_selector"),
-                    filled_names=_filled_name_hints(d),
-                )
-                if buttons:
-                    ranked = _phase_filter_submit_candidates(buttons, phase="final")
-                    final_noise_only = len(ranked) == 0
-                    click2 = _llm_click_submit_candidate(
-                        buttons,
-                        config or {},
-                        form_root_selector=d.get("form_root_selector"),
-                        phase="final",
-                    )
-                    pick = (click2 or {}).get("picked") or {}
-                    if click2 and click2.get("clicked"):
-                        picked_label = pick.get("text") or pick.get("selector") or click2.get("text")
-                        print(f"  [send] LLM picked: {picked_label} ({pick.get('reason','')[:60]})")
-                        _emit_event(
-                            "send.final.llm_pick", stage="send", target_id=tid,
-                            payload={
-                                "picked_text": (pick.get("text") or "")[:120],
-                                "picked_selector": (pick.get("selector") or "")[:160],
-                                "clicked": bool(click2 and click2.get("clicked")),
-                                "candidates": len(buttons),
-                            },
-                            trace_dir=trace,
-                        )
-                if not click2 or not click2.get("clicked"):
-                    final_native = _submit_native(d, form_root_selector=d.get("form_root_selector"))
-                    if final_native.get("clicked"):
-                        click2 = {
-                            "clicked": True,
-                            "text": f"[native:{final_native.get('method')}]",
-                            "native_submit_method": final_native.get("method"),
-                        }
-                if not click2 or not click2.get("clicked"):
-                    print(f"  [send] ⚠ final submit still not clickable after LLM fallback — awaiting proceed")
-                    if click2 and click2.get("found_but_disabled"):
-                        print(f"  [send]    ↳ matched but disabled: {(click2.get('disabled_candidates') or [])[:3]}")
-                    if final_native:
-                        print(f"  [send]    ↳ {_native_submit_diag(final_native)}")
-                    if trace:
-                        ev.dump_trace(
-                            trace, "form_snapshot_confirm.txt",
-                            oc_browser("snapshot") or "",
-                        )
-                    filled_only.append(d)
-                    core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SUBMIT_NOT_FOUND)
-                    if cur_tab_id:
-                        resolver_tab_ids.add(cur_tab_id)
-                    _queue_for_resolver(
-                        d, "confirm_submit_not_found",
-                        (
-                            "confirm-page final submit not found; "
-                            f"noise_only_candidates={final_noise_only}; {_native_submit_diag(final_native)}"
-                        ),
-                        trace=trace, autonomous=autonomous, tab_id=cur_tab_id,
-                    )
-                    continue
-            print(f"  [send] clicked final: {click2.get('text')}")
-            if click2.get("radio_auto_selected"):
-                print(f"  [send]    ↳ auto-selected radios: {(click2.get('radio_items') or [])[:3]}")
-            if click2.get("select_auto_selected"):
-                print(f"  [send]    ↳ auto-selected selects: {(click2.get('select_items') or [])[:3]}")
-            _emit_event(
-                "send.final.clicked",
-                stage="send",
-                target_id=tid,
-                payload={
-                    "text": (click2.get("text") or "")[:80],
-                    "radio_auto_selected": int(click2.get("radio_auto_selected") or 0),
-                    "select_auto_selected": int(click2.get("select_auto_selected") or 0),
-                    "native_submit_method": click2.get("native_submit_method"),
-                },
-                trace_dir=trace,
-            )
-            time.sleep(5)
-
-        # 6. Verify send (keywords, required fields, plan gaps)
-        time.sleep(2)
-        ev.dump_trace(trace, "form_snapshot_post.txt", oc_browser("snapshot") or "")
-        from _outreach_core.verify import PAGE_EVIDENCE_JS
-
-        page_evidence = _evaluate(PAGE_EVIDENCE_JS)
-        snap = oc_browser("snapshot")
-        snap_path = DATA_DIR / f"verify_snapshot_{d.get('id', di)}.txt"
-        combined = snap or ""
-        if isinstance(page_evidence, dict):
-            combined = f"{combined}\n{page_evidence.get('text', '')}\n{page_evidence.get('url', '')}"
-        if combined.strip():
-            snap_path.write_text(combined, encoding="utf-8")
-
-        if mode in ("auto", "interactive"):
-            if d.get("_llm_plan"):
-                ev.dump_trace(trace, "fill_plan.json", d["_llm_plan"], sender=config.get("sender"))
-            vresult = verify_send_completed(
-                d,
-                "jp_form",
-                snapshot=combined,
-                browser_verify=page_evidence if isinstance(page_evidence, dict) else None,
-                plan=d.get("_llm_plan"),
-                evaluate_fn=_evaluate,
-                data_dir=DATA_DIR,
-                snapshot_path=snap_path if combined.strip() else None,
-                verify_strict=verify_strict,
-            )
-            ev.dump_trace(trace, "verify_evidence.json", vresult.get("evidence") or {})
-            outcome = handle_verify_result(d, vresult, DATA_DIR, channel="jp_form")
-            if outcome == "sent_ok":
-                print(f"  [send] ✅ {vresult.get('reason')}")
-                core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SENT)
-                if tab_isolation:
-                    _close_tab(cur_tab_id)  # success → close the tab
-                sent.append(d)
-            else:
-                # Content-rejection fallback (§3.6): the form rejected the body for
-                # disallowed characters / a URL. Retry ONCE with the URL removed
-                # ("URLは送らないルート"). Learn the domain so next time we pre-strip.
-                rej = core_content_guard.detect_content_rejection(combined)
-                if (rej and not url_stripped and core_content_guard.has_url(send_body)
-                        and mode in ("auto", "interactive")):
-                    print(f"  [send] ⚠ コンテンツ拒否を検知 "
-                          f"({rej['kind']}: {rej['evidence']}) → URL除去して再送")
-                    core_avoidance.mark_url_unfriendly(DATA_DIR, form_url)
-                    core_avoidance.record_outcome(
-                        DATA_DIR, form_url, core_avoidance.OUTCOME_CONTENT_REJECTED)
-                    sanitized, sdiag = core_content_guard.sanitize_body(send_body, kind=rej["kind"])
-                    _emit_event(
-                        "send.content_rejected", stage="send", target_id=tid,
-                        payload={
-                            "kind": rej["kind"],
-                            "evidence": rej["evidence"],
-                            "removed_urls": sdiag.get("removed_urls"),
-                        },
-                        trace_dir=trace,
-                    )
-                    retry = _deep_submit(
-                        d, sanitized, config, trace=trace, flow=flow,
-                        verify_strict=verify_strict, iterative_fill=iterative_fill,
-                    )
-                    outcome2 = (
-                        handle_verify_result(d, retry["vresult"], DATA_DIR, channel="jp_form")
-                        if retry.get("vresult") else "failed"
-                    )
-                    if outcome2 == "sent_ok":
-                        print(f"  [send] ✅ URL除去で再送成功")
-                        core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SENT)
-                        if tab_isolation:
-                            _close_tab(cur_tab_id)
-                        _emit_event("send.url_fallback_ok", stage="send", target_id=tid,
-                                    payload={"removed_urls": sdiag.get("removed_urls")}, trace_dir=trace)
-                        sent.append(d)
-                    else:
-                        print(f"  [send] ⚠ URL除去再送も不成立 — filled_only")
-                        filled_only.append(d)
-                else:
-                    escalated_ok = False
-                    if mode in ("auto", "interactive") and _has_form_analyzer_escalation(config):
-                        escalated_model = _form_analyzer_escalation_model(config)
-                        cur_model = str(
-                            (d.get("_llm_plan_meta") or {}).get("model")
-                            or _form_analyzer_base_model(config)
-                        )
-                        if escalated_model and cur_model != escalated_model:
-                            print(
-                                f"  [send] verify failed → form analyzer escalation "
-                                f"{cur_model} -> {escalated_model}"
-                            )
-                            _emit_event(
-                                "send.verify.escalation_retry",
-                                stage="send",
-                                target_id=tid,
-                                payload={
-                                    "from_model": cur_model,
-                                    "to_model": escalated_model,
-                                    "verify_status": vresult.get("status"),
-                                    "verify_reason": (vresult.get("reason") or "")[:160],
-                                },
-                                trace_dir=trace,
-                            )
-                            d.pop("_llm_plan", None)
-                            d.pop("_llm_plan_meta", None)
-                            esc_cfg = _config_with_form_analyzer_model(config, escalated_model)
-                            retry = _deep_submit(
-                                d, send_body, esc_cfg, trace=trace, flow=flow,
-                                verify_strict=verify_strict, iterative_fill=True,
-                            )
-                            outcome2 = (
-                                handle_verify_result(d, retry["vresult"], DATA_DIR, channel="jp_form")
-                                if retry.get("vresult") else "failed"
-                            )
-                            if outcome2 == "sent_ok":
-                                print(f"  [send] ✅ escalated analyzer retry succeeded")
-                                core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SENT)
-                                if tab_isolation:
-                                    _close_tab(cur_tab_id)
-                                _emit_event(
-                                    "send.verify.escalation_ok",
-                                    stage="send",
-                                    target_id=tid,
-                                    payload={"model": escalated_model},
-                                    trace_dir=trace,
-                                )
-                                sent.append(d)
-                                escalated_ok = True
-                            else:
-                                _emit_event(
-                                    "send.verify.escalation_failed",
-                                    stage="send",
-                                    target_id=tid,
-                                    payload={"model": escalated_model},
-                                    trace_dir=trace,
-                                )
-                    if not escalated_ok:
-                        print(f"  [send] ⚠ verify: {vresult.get('status')} — {vresult.get('reason')}")
-                        filled_only.append(d)
-        else:
-            filled_only.append(d)
-
-        hb.tick(di + 1, f"{name} · verify done")
-
-        if di < len(targets) - 1:
-            print(f"  [send] sleeping 30s before next...")
-            time.sleep(30)
-
-    hb.end(f"send done · sent={len(sent)} · pending={len(filled_only)}")
-    if sent:
-        append_sent_history(sent)
+            if di < len(targets) - 1:
+                print(f"  [send] sleeping 30s before next...")
+                time.sleep(30)
+    finally:
+        # §R1 acceptance: hb.end always runs; partial successes are persisted
+        # even when the loop dies mid-batch.
+        hb.end(f"send done · sent={len(sent)} · pending={len(filled_only)}")
+        if sent:
+            append_sent_history(sent)
     print(f"\n[send] done · sent={len(sent)} · filled-only={len(filled_only)}")
     if filled_only:
         names = ", ".join(d.get("name", "?") for d in filled_only)

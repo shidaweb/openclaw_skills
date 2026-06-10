@@ -129,24 +129,28 @@ def oc_browser_json(*args: str, profile: str = BROWSER_PROFILE) -> Any:
     """Run `openclaw browser --browser-profile <p> --json <args>` and return the
     parsed JSON (dict/list) or None. Used for tab management (open/tabs)."""
     cmd = ["openclaw", "browser", "--browser-profile", profile, "--json", *args]
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    if res.returncode != 0:
-        print(f"[browser json err] {' '.join(args)}: {res.stderr.strip()}",
+    # Hard wall via _run (default 240s / OUTREACH_SUBPROC_TIMEOUT_SEC): a hung
+    # gateway must never stall the pipeline indefinitely (v15 reliability fix).
+    rc, out, err = _run(cmd)
+    if rc != 0:
+        print(f"[browser json err] {' '.join(args)}: {err.strip()}",
               file=__import__("sys").stderr)
         return None
-    return extract_json_payload(res.stdout)
+    return extract_json_payload(out)
 
 
 def oc_evaluate(js: str, *, profile: str = BROWSER_PROFILE) -> Any:
     """Run JS in the browser via `openclaw browser evaluate --fn`. No LLM."""
     cmd = ["openclaw", "browser", "--browser-profile", profile, "evaluate", "--fn", js]
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    if res.returncode != 0:
-        print(f"[evaluate err] {res.stderr.strip()}", file=__import__("sys").stderr)
+    # Hard wall via _run (default 240s / OUTREACH_SUBPROC_TIMEOUT_SEC): evaluate
+    # was the last un-timeouted subprocess path (v15 reliability fix).
+    rc, out, err = _run(cmd)
+    if rc != 0:
+        print(f"[evaluate err] {err.strip()}", file=__import__("sys").stderr)
         return None
 
     body_lines: list[str] = []
-    for line in res.stdout.splitlines():
+    for line in out.splitlines():
         s = line.strip()
         if not s or s.startswith("🦞"):
             continue

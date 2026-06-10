@@ -1,7 +1,10 @@
-"""Contact form URL candidate and form-type classification helpers (v8)."""
+"""Contact form URL candidate and form-type classification helpers (v8, v15 §F)."""
 
 from __future__ import annotations
 
+import json
+import re
+from typing import Any, Callable
 from urllib.parse import urljoin, urlparse
 
 
@@ -163,8 +166,243 @@ def common_contact_paths(base_url: str) -> list[str]:
         "/company/contact",
         "/business/contact",
         "/form",
+        # v15 §F2 expansion
+        "/contact-us",
+        "/contactus",
+        "/inquiry/",
+        "/contact/business",
+        "/business/inquiry",
+        "/company/inquiry",
+        "/support/inquiry",
+        "/お問い合わせ",
+        "/%E3%81%8A%E5%95%8F%E3%81%84%E5%90%88%E3%82%8F%E3%81%9B",
     )
     return _dedupe_urls([f"{root}{x}" for x in paths])
+
+
+# --- v15 §F2: sitemap.xml mining -------------------------------------------
+_SITEMAP_LOC_RE = re.compile(r"<loc>\s*([^<]+?)\s*</loc>", re.IGNORECASE)
+_SITEMAP_CONTACT_RE = re.compile(r"contact|inquiry|toiawase|otoiawase", re.IGNORECASE)
+
+
+def extract_contact_urls_from_sitemap(xml_text: str | None) -> list[str]:
+    """Contact-looking URLs from a sitemap.xml body (pure; tolerant of junk).
+
+    Filters out recruit/IR-style paths with the same avoid-list used for link
+    candidates, normalizes, and dedupes preserving order.
+    """
+    if not xml_text:
+        return []
+    out: list[str] = []
+    for m in _SITEMAP_LOC_RE.finditer(xml_text):
+        url = (m.group(1) or "").strip()
+        if not url or not _SITEMAP_CONTACT_RE.search(url):
+            continue
+        low = url.lower()
+        if any(kw in low for kw in _AVOID_PATH_KW):
+            continue
+        out.append(url)
+    return _dedupe_urls(out)
+
+
+# --- v15 §F3: iframe / hosted form services ---------------------------------
+KNOWN_FORM_SERVICE_HOSTS = (
+    "form.run",
+    "formrun",
+    "tayori.com",
+    "hsforms.com",
+    "hubspot",
+    "kintoneapp.com",
+    "formzu",
+    "secure-link",
+    "synergy",
+    "formok",
+    "ssl-form",
+    "formmailer",
+    "marketo.com",
+    "salesforce.com",
+)
+
+
+def iframe_form_src(
+    iframes: list[dict[str, Any]] | None, base_url: str
+) -> str | None:
+    """If one of the page's iframes hosts a real form, return its src to re-enrich.
+
+    Accept when the iframe host is a known hosted-form service OR shares the
+    page's registrable domain. Returns the first acceptable src, else None.
+    """
+    for fr in iframes or []:
+        src = str((fr or {}).get("src") or "").strip()
+        if not src:
+            continue
+        host = _host_only(src)
+        if not host:
+            continue
+        if any(svc in host for svc in KNOWN_FORM_SERVICE_HOSTS):
+            return src
+        if base_url and same_registrable_domain(src, base_url):
+            return src
+    return None
+
+
+# --- v15 §F1: two-stage classification (heuristics → LLM only when uncertain)
+_VALID_LLM_FORM_TYPES = (
+    "contact", "recruit", "login", "b2c_support", "ir", "reservation", "other",
+)
+
+
+def classification_is_uncertain(
+    kind: str, reason: str | None, fields: dict | None
+) -> bool:
+    """Is the heuristic classification ambiguous enough to ask the LLM? (§F1)
+
+    Uncertain when:
+      - kind is ``unknown_no_textarea`` (the dominant mis-skip bucket), or
+      - reason is heading-based ("heading mentions ...") yet a textarea exists
+        (heading said non-contact but the form looks like one), or
+      - zero fields were collected at all (likely JS-rendered or wrong root).
+    """
+    f = fields or {}
+    field_count = (
+        len(f.get("inputs") or [])
+        + len(f.get("selects") or [])
+        + len(f.get("textareas") or [])
+    )
+    if kind == "unknown_no_textarea":
+        return True
+    if (reason or "").startswith("heading mentions") and (f.get("textareas") or []):
+        return True
+    if field_count == 0:
+        return True
+    return False
+
+
+def _llm_classify_prompt(snapshot: str | None, fields: dict | None) -> str:
+    f = fields or {}
+    field_summary = {
+        "inputs": [
+            {"name": i.get("name"), "label": i.get("label"), "type": i.get("type")}
+            for i in (f.get("inputs") or [])[:25]
+        ],
+        "selects": [
+            {"name": s.get("name"), "label": s.get("label")}
+            for s in (f.get("selects") or [])[:10]
+        ],
+        "textareas": [
+            {"name": t.get("name"), "label": t.get("label")}
+            for t in (f.get("textareas") or [])[:5]
+        ],
+    }
+    return (
+        "You are classifying a Japanese corporate web page that may contain a form.\n"
+        "Decide what kind of form (if any) this page is for.\n\n"
+        "## Page snapshot (head)\n"
+        f"{(snapshot or '')[:4000]}\n\n"
+        "## Collected form fields\n"
+        f"{json.dumps(field_summary, ensure_ascii=False)}\n\n"
+        "## Output — STRICT JSON only, no prose\n"
+        '{"form_type": "contact|recruit|login|b2c_support|ir|reservation|other",\n'
+        ' "confidence": 0.0-1.0,\n'
+        ' "b2b_contact_hint_url": "<url of a 法人/business contact link visible'
+        " on this page, or null>\"}\n"
+        "Rules: form_type=contact means a general/B2B inquiry form a vendor may "
+        "legitimately use. Recruit/entry, login, member registration, consumer "
+        "support, IR and reservation forms are NOT contact.\n"
+    )
+
+
+def parse_llm_classification(raw: str | None) -> dict[str, Any] | None:
+    """Parse + validate the LLM classification JSON. None when unusable (pure)."""
+    if not raw:
+        return None
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    form_type = str(data.get("form_type") or "").strip().lower()
+    if form_type not in _VALID_LLM_FORM_TYPES:
+        return None
+    try:
+        confidence = float(data.get("confidence"))
+    except (TypeError, ValueError):
+        return None
+    confidence = max(0.0, min(1.0, confidence))
+    hint = data.get("b2b_contact_hint_url")
+    hint_url = str(hint).strip() if isinstance(hint, str) and hint.strip() else None
+    if hint_url and not hint_url.lower().startswith(("http://", "https://")):
+        hint_url = None
+    return {"form_type": form_type, "confidence": confidence,
+            "b2b_contact_hint_url": hint_url}
+
+
+def _llm_escalate_classification(
+    kind: str,
+    reason: str | None,
+    fields: dict,
+    snapshot: str | None,
+    *,
+    infer_fn: Callable[[str, str], str | None] | None = None,
+    model: str = "",
+    min_confidence: float = 0.6,
+) -> dict[str, Any]:
+    """Apply the LLM second stage to an existing heuristic verdict (§F1).
+
+    Separated from ``classify_form_type_v2`` so callers (e.g. enrich in run.py)
+    can supply a mockable heuristic hook while still getting LLM escalation.
+    """
+    out: dict[str, Any] = {
+        "kind": kind, "reason": reason, "src": "heuristic",
+        "llm_called": False, "b2b_contact_hint_url": None,
+    }
+    if not infer_fn or not classification_is_uncertain(kind, reason, fields):
+        return out
+    out["llm_called"] = True
+    try:
+        raw = infer_fn(_llm_classify_prompt(snapshot, fields), model)
+    except Exception:
+        return out
+    parsed = parse_llm_classification(raw)
+    if not parsed:
+        return out
+    out["b2b_contact_hint_url"] = parsed.get("b2b_contact_hint_url")
+    if parsed["confidence"] < min_confidence:
+        return out
+    llm_kind = parsed["form_type"]
+    # "other" carries no actionable signal — keep heuristic verdict.
+    if llm_kind == "other":
+        return out
+    out["kind"] = llm_kind
+    out["reason"] = f"llm:{llm_kind} (conf={parsed['confidence']:.2f})"
+    out["src"] = "llm"
+    return out
+
+
+def classify_form_type_v2(
+    fields: dict,
+    snapshot: str | None,
+    *,
+    infer_fn: Callable[[str, str], str | None] | None = None,
+    model: str = "",
+    min_confidence: float = 0.6,
+) -> dict[str, Any]:
+    """Two-stage classification (§F1): heuristics first, LLM only when uncertain.
+
+    Returns {"kind", "reason", "src": "heuristic"|"llm", "llm_called": bool,
+    "b2b_contact_hint_url": str|None}. The LLM is never the final arbiter when
+    its confidence is below ``min_confidence`` and any failure (no infer_fn,
+    timeout, parse error) falls back to the heuristic result.
+    """
+    kind, reason = classify_form_type(fields, snapshot)
+    return _llm_escalate_classification(
+        kind, reason, fields, snapshot,
+        infer_fn=infer_fn, model=model, min_confidence=min_confidence,
+    )
 
 
 def classify_form_type(fields: dict, snapshot: str | None) -> tuple[str, str | None]:

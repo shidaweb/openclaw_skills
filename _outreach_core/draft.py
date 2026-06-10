@@ -121,6 +121,50 @@ def enforce_char_limit(
     return out
 
 
+# --- v15 §L2: opening-sentence duplication guard -----------------------------
+def normalize_opening(body: str | None) -> str:
+    """First sentence of a draft, normalized for comparison (pure)."""
+    text = (body or "").strip()
+    if not text:
+        return ""
+    first_line = text.splitlines()[0]
+    # First sentence = up to the first 。/．/! (Japanese copy rarely uses '.')
+    m = re.split(r"[。．！!]", first_line, maxsplit=1)
+    sent = m[0] if m else first_line
+    # Strip whitespace and company-agnostic punctuation for a stable key
+    return re.sub(r"[\s\u3000、,，・]", "", sent)
+
+
+def opening_too_similar(
+    body: str | None,
+    recent_bodies: list[str] | None,
+    *,
+    min_common_prefix: int = 18,
+) -> bool:
+    """True when the draft's opening matches a recent send too closely (pure).
+
+    Similar = identical normalized opening, OR a common prefix of at least
+    ``min_common_prefix`` chars (catches template-y "御社の◯◯を拝見し…" reuse).
+    """
+    mine = normalize_opening(body)
+    if not mine:
+        return False
+    for prev in recent_bodies or []:
+        theirs = normalize_opening(prev)
+        if not theirs:
+            continue
+        if mine == theirs:
+            return True
+        common = 0
+        for a, b in zip(mine, theirs):
+            if a != b:
+                break
+            common += 1
+        if common >= min_common_prefix:
+            return True
+    return False
+
+
 def resolve_refine_enabled(
     config: dict[str, Any],
     *,
@@ -154,6 +198,7 @@ def stage_draft(
     run_id: str | None = None,
     sender: dict[str, Any] | None = None,
     limit: int | None = None,
+    recent_bodies: list[str] | None = None,
 ) -> None:
     from _outreach_core import events as ev
 
@@ -299,6 +344,30 @@ def stage_draft(
                 }
             else:
                 print("          → refine failed, keeping pass-1 draft")
+
+        # v15 §L2: opening-duplication guard — when the opener matches a recent
+        # send too closely, force ONE extra refine pass so each company gets a
+        # distinct opening (template smell kills reply rates).
+        if (
+            draft.get("subject") != "SKIP"
+            and refine_fn
+            and opening_too_similar(draft.get("body"), recent_bodies)
+        ):
+            print(f"[draft] ({label}) opening too similar to a recent send — forcing refine")
+            ev.emit(
+                "draft.opening_duplicate",
+                stage="draft",
+                target_id=target_id,
+                payload={"opening": normalize_opening(draft.get("body"))[:60]},
+                trace_dir=trace,
+            )
+            re_refined = refine_fn(lead, draft, config, max_chars)
+            if re_refined and re_refined.get("body"):
+                draft = {
+                    "subject": re_refined.get("subject") or draft.get("subject"),
+                    "body": re_refined["body"],
+                    "_dedup_refined": True,
+                }
 
         if draft.get("subject") != "SKIP":
             draft = enforce_char_limit(

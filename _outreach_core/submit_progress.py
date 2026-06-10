@@ -54,11 +54,35 @@ _FINAL_STEP_TEXT_RE = re.compile(r"(送信|submit|完了|確定|問い合わせ�
 _ROUTE_GROUP_RE = re.compile(r"(お客様|個人|法人|企業|一般|取引|お問い合わせ対象|お問い合わせ区分)", re.I)
 
 
+def wizard_should_continue(page_text: str | None, visible_textareas: int) -> bool:
+    """v15 §S1 — should the wizard loop take another step?
+
+    Continue only while the page shows NO success keyword AND a visible
+    textarea remains (we are still on an input step of a multi-step form).
+    """
+    from _outreach_core.verify import FORM_SUCCESS_KEYWORDS  # no import cycle
+
+    hay = (page_text or "").casefold()
+    if any(k.casefold() in hay for k in FORM_SUCCESS_KEYWORDS):
+        return False
+    return int(visible_textareas or 0) > 0
+
+
 def is_agreement_label(label: str | None) -> bool:
     text = (label or "").strip()
     if not text:
         return False
     return bool(_AGREEMENT_RE.search(text))
+
+
+_NEWSLETTER_RE = re.compile(
+    r"(メルマガ|メールマガジン|ニュースレター|案内を希望|配信)",
+    re.I,
+)
+
+
+def is_newsletter_label(label: str | None) -> bool:
+    return bool(_NEWSLETTER_RE.search((label or "").strip()))
 
 
 def should_auto_check_checkbox(box: dict[str, Any] | None) -> bool:
@@ -68,6 +92,10 @@ def should_auto_check_checkbox(box: dict[str, Any] | None) -> bool:
         return False
     label = str(box.get("label") or "")
     required = bool(box.get("required"))
+    # v15 §S2: never opt the sender into newsletters — an optional
+    # newsletter/配信 checkbox is left unchecked even if it pattern-matches.
+    if not required and is_newsletter_label(label):
+        return False
     return required or is_agreement_label(label)
 
 
