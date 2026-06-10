@@ -213,6 +213,31 @@ def is_url_unfriendly(data_dir: Path, url_or_domain: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Cloudflare-gated domain learning — domains that show Turnstile / a managed
+# challenge. Remembering this lets the NEXT visit do a genuine root-domain
+# warmup dwell (so the persistent browser profile carries its own cf_clearance
+# cookie) and pace requests. This is legitimate "behave like a normal client"
+# hygiene — we never solve or bypass the challenge.
+# ---------------------------------------------------------------------------
+
+def mark_cloudflare(data_dir: Path, url_or_domain: str) -> None:
+    domain = domain_of(url_or_domain) or (url_or_domain or "").strip().lower()
+    if not domain:
+        return
+    stats = read_stats(data_dir)
+    row = stats.get(domain) or _blank_domain()
+    row["cloudflare"] = True
+    stats[domain] = row
+    _write_stats(data_dir, stats)
+
+
+def is_cloudflare_domain(data_dir: Path, url_or_domain: str) -> bool:
+    domain = domain_of(url_or_domain) or (url_or_domain or "").strip().lower()
+    row = read_stats(data_dir).get(domain) or {}
+    return bool(row.get("cloudflare"))
+
+
+# ---------------------------------------------------------------------------
 # Adaptive warmup
 # ---------------------------------------------------------------------------
 

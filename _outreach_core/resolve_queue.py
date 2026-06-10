@@ -120,6 +120,7 @@ _REASON_LABEL = {
     "form_vanished_after_fill": "入力後にフォームが消失（バリデーション差し戻し/セッション切れの可能性）",
     "submit_gate_unsatisfied": "送信ゲート（同意・必須選択）が未充足のまま送信ボタンに到達できません",
     "wizard_too_deep": "多段フォームのステップ数が上限を超えました",
+    "cloudflare_challenge": "Cloudflare bot検知（Turnstile/managed challenge）をブロッキングで検出。突破不可のため手動通過が必要",
 }
 
 

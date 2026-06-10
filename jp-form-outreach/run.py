@@ -4555,6 +4555,20 @@ def _config_with_warmup_sec(config: dict[str, Any] | None, warm_sec: int) -> dic
     return cfg
 
 
+def _config_force_cf_warmup(config: dict[str, Any] | None, warm_sec: int) -> dict[str, Any]:
+    """Config that FORCES a genuine root-domain warmup dwell, for domains known
+    to be Cloudflare-gated. This is legitimate hygiene: the persistent browser
+    profile loads the root domain for real and dwells so it carries its own
+    cf_clearance cookie before we navigate to the form — we never solve or
+    bypass the challenge. Min 20s dwell so clearance can actually be issued."""
+    cfg = dict(config or {})
+    captcha_block = dict(cfg.get("captcha") or {})
+    captcha_block["v3_strategy"] = "passthrough_with_warmup"
+    captcha_block["warmup_sec"] = max(20, int(warm_sec or 0))
+    cfg["captcha"] = captcha_block
+    return cfg
+
+
 def _live_captcha_state() -> dict[str, Any]:
     """Evaluate the LIVE page for an actually-visible/blocking reCAPTCHA.
     Distinguishes a real v2 challenge from a non-blocking v3/checkbox, so a
@@ -5222,7 +5236,14 @@ def _send_one_target(
     from _outreach_core.warmup import apply_warmup_if_enabled
 
     warm_sec = core_avoidance.recommended_warmup_sec(DATA_DIR, form_url, config)
-    warm_config = _config_with_warmup_sec(config, warm_sec)
+    # Cloudflare-gated domains (learned): force a genuine root-domain warmup
+    # dwell so the persistent profile carries its own cf_clearance — reduces the
+    # chance Turnstile re-triggers, without solving/bypassing anything.
+    if core_avoidance.is_cloudflare_domain(DATA_DIR, form_url):
+        warm_config = _config_force_cf_warmup(config, warm_sec)
+        print(f"  [send] cf-gated domain既知 → root warmup を強制 ({max(20, warm_sec)}s, cf_clearance自然取得)")
+    else:
+        warm_config = _config_with_warmup_sec(config, warm_sec)
     warmup_diag = apply_warmup_if_enabled(
         form_url=form_url,
         config=warm_config,
@@ -5286,6 +5307,45 @@ def _send_one_target(
         final_url=(final_url if redirected else None),
         redirected=(redirected or None),
     )
+
+    # 1b. Early Cloudflare / bot-detection check (v18). A full-page Turnstile
+    # "Verify you are human" interstitial gates the real form and has zero form
+    # controls — without this it would be misread as page_has_no_form. We do NOT
+    # solve it: a MANAGED challenge often auto-clears on a real browser profile,
+    # so we wait once; if it's still blocking we learn the domain (so next time
+    # gets a genuine root-warmup dwell) and route to human relay / skip.
+    cap_landing = _live_captcha_state()
+    if cap_landing.get("cloudflare"):
+        core_avoidance.mark_cloudflare(DATA_DIR, form_url)
+    if cap_landing.get("blocking"):
+        # Managed interstitials clear themselves on a trusted session — give it
+        # one genuine wait (no interaction injection), then re-check.
+        if cap_landing.get("kind") == "turnstile_interstitial":
+            print("  [send] Cloudflare managed challenge検出 → 自動クリア待機（最大12s）")
+            for _ in range(4):
+                time.sleep(3)
+                cap_landing = _live_captcha_state()
+                if not cap_landing.get("blocking"):
+                    print("  [send] ✓ challenge自動クリア → 続行")
+                    break
+    if cap_landing.get("blocking"):
+        label = core_captcha.reason_label(cap_landing)
+        core_timeline.add(timeline, "captcha", False, kind=cap_landing.get("kind"))
+        print(f"  [send] ⚠ {label} — 突破せず記録/迂回（人手 or skip）")
+        core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_CAPTCHA_BLOCKED)
+        filled_only.append(d)
+        if cur_tab_id:
+            resolver_tab_ids.add(cur_tab_id)
+        if autonomous:
+            _auto_skip_and_log(d, f"cloudflare_blocking: {cap_landing.get('kind')} ({label})")
+        else:
+            _queue_for_resolver(
+                d, "cloudflare_challenge",
+                f"Cloudflare bot検知をブロッキングで検出 ({cap_landing.get('kind')}) — "
+                f"突破不可。手動でチャレンジ通過後に送信が必要",
+                trace=trace, autonomous=False, tab_id=cur_tab_id,
+            )
+        return {"outcome": "skipped", "reason": "cloudflare_blocking"}
 
     # 2. Click any pre-form entry (e.g. "法人のお客様" tab)
     if d.get("entry_click_text"):
@@ -5407,6 +5467,8 @@ def _send_one_target(
         timeline, "captcha", (not cap_state["blocking"]),
         kind=cap_state.get("kind"), blocking=cap_state["blocking"],
     )
+    if cap_state.get("cloudflare"):
+        core_avoidance.mark_cloudflare(DATA_DIR, form_url)
     if cap_state["blocking"]:
         label = core_captcha.reason_label(cap_state)
         print(f"  [send] ⚠ {label} — 突破せず迂回/記録（完全自律・人手なし方針）")
