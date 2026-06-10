@@ -3248,6 +3248,48 @@ def _inquiry_guardrail_status(target: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _click_submit_by_instruction(
+    d: dict[str, Any],
+    *,
+    phase: str,
+    form_root_selector: str | None = None,
+) -> dict[str, Any] | None:
+    """v19: click send when the PAGE TEXT explicitly says to.
+
+    Handles confirm pages like 「上記の内容でよろしければ、送信ボタンをクリックして
+    ください。」 where the instruction is the reliable signal but the button's own
+    label may be generic / an image. We only act on a genuine submit-type or
+    in-form control (never a nav link), and never click a 確認/次へ button in the
+    final phase. Returns a click_res-like dict (with by_instruction=True) or None.
+    """
+    page_text = _evaluate(_PAGE_TEXT_HEAD_JS)
+    page_text = page_text if isinstance(page_text, str) else ""
+    if not core_submit_progress.detect_confirm_instruction(page_text):
+        return None
+    buttons = _enumerate_buttons(
+        form_root_selector=form_root_selector,
+        filled_names=_filled_name_hints(d),
+    )
+    ranked = _phase_filter_submit_candidates(buttons, phase=phase)
+    for cand in ranked:
+        if not (cand.get("is_submit_type") or cand.get("in_form")):
+            continue
+        txt = str(cand.get("text") or "").strip()
+        sel = str(cand.get("selector") or "").strip()
+        if phase == "final" and txt and _looks_like_first_step_button(txt) \
+                and not _looks_like_final_step_button(txt):
+            continue
+        res = _click_by_selector(sel) if sel else None
+        if (not res or not res.get("clicked")) and txt:
+            res = _click_by_exact_text(txt, form_root_selector=form_root_selector)
+        if res and res.get("clicked"):
+            res["by_instruction"] = True
+            res["picked"] = {"text": txt, "selector": sel,
+                             "reason": "confirm_instruction_text"}
+            return res
+    return None
+
+
 def _llm_click_submit_candidate(
     buttons: list[dict[str, Any]],
     config: dict[str, Any],
@@ -5581,6 +5623,20 @@ def _send_one_target(
                     trace_dir=trace,
                 )
         if not click_res or not click_res.get("clicked"):
+            # v19: page-instruction fallback (「…よろしければ送信ボタンをクリック」).
+            instr = _click_submit_by_instruction(
+                d,
+                phase="first" if flow == "confirm" else "final",
+                form_root_selector=d.get("form_root_selector"),
+            )
+            if instr and instr.get("clicked"):
+                click_res = instr
+                print(f"  [send] 指示文に従い送信ボタンをクリック: {instr.get('text')}")
+                _emit_event(
+                    "send.first.instruction_click", stage="send", target_id=tid,
+                    payload={"text": (instr.get("text") or "")[:120]}, trace_dir=trace,
+                )
+        if not click_res or not click_res.get("clicked"):
             first_native = _submit_native(d, form_root_selector=d.get("form_root_selector"))
             if first_native.get("clicked"):
                 click_res = {
@@ -5773,6 +5829,20 @@ def _send_one_target(
                             "candidates": len(buttons),
                         },
                         trace_dir=trace,
+                    )
+            if not click2 or not click2.get("clicked"):
+                # v19: page-instruction fallback (「上記の内容でよろしければ送信ボタンを
+                # クリックしてください」) before native — confirm pages often phrase the
+                # final send this way with a generically-labelled button.
+                instr2 = _click_submit_by_instruction(
+                    d, phase="final", form_root_selector=d.get("form_root_selector"),
+                )
+                if instr2 and instr2.get("clicked"):
+                    click2 = instr2
+                    print(f"  [send] 指示文に従い最終送信をクリック: {instr2.get('text')}")
+                    _emit_event(
+                        "send.final.instruction_click", stage="send", target_id=tid,
+                        payload={"text": (instr2.get("text") or "")[:120]}, trace_dir=trace,
                     )
             if not click2 or not click2.get("clicked"):
                 final_native = _submit_native(d, form_root_selector=d.get("form_root_selector"))

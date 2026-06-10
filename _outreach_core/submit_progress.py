@@ -54,6 +54,48 @@ _FINAL_STEP_TEXT_RE = re.compile(r"(送信|submit|完了|確定|問い合わせ�
 _ROUTE_GROUP_RE = re.compile(r"(お客様|個人|法人|企業|一般|取引|お問い合わせ対象|お問い合わせ区分)", re.I)
 
 
+# Confirmation-page instruction text. Many JP forms render a sentence telling
+# the human to click send to finalize — "上記の内容でよろしければ送信ボタンを
+# クリックしてください" — instead of (or alongside) a regex-matchable button. Used
+# as a STRONG "this is the final-submit page" signal to confidently click send.
+_CONFIRM_PRE_RE = re.compile(
+    r"(上記の?内容|ご記入(の)?内容|入力(された)?内容|ご入力内容|下記の?内容|"
+    r"内容をご確認|ご確認の上|ご確認のうえ|お間違い|よろしければ|よろしけれ|"
+    r"確認の上|間違いがなけれ|問題なけれ)",
+)
+_CONFIRM_SEND_RE = re.compile(
+    r"(送信|送信ボタン|お送り|送付|確定|完了)\s*(ボタン)?\s*"
+    r"(を|に)?\s*(押して|押下|クリック|タップ|してください|して下さい|"
+    r"ください|下さい|お願い|送信)",
+)
+# A bare imperative "送信ボタンを押してください" without the 内容 preamble.
+_CLICK_SEND_RE = re.compile(
+    r"(送信|確定|完了)(ボタン)?(を)?(押して|押下|クリックして|タップして)",
+)
+
+
+def detect_confirm_instruction(page_text: str | None) -> bool:
+    """True if the page TEXT instructs the user to click send to finalize.
+
+    Two shapes:
+      1. "上記の内容で…よろしければ…送信ボタンをクリック" (content-confirm preamble + send)
+      2. "送信ボタンを押してください" (bare imperative)
+    This is a page-level signal, independent of whether any button's own label
+    matched the submit regexes — it lets us click a generically-labelled (or
+    image) send button with confidence on a confirm page.
+    """
+    t = (page_text or "").replace("\n", " ")
+    if not t:
+        return False
+    if _CLICK_SEND_RE.search(t):
+        return True
+    # preamble + a send verb within a reasonable window
+    m = _CONFIRM_PRE_RE.search(t)
+    if m and _CONFIRM_SEND_RE.search(t[m.start(): m.start() + 120]):
+        return True
+    return False
+
+
 def wizard_should_continue(page_text: str | None, visible_textareas: int) -> bool:
     """v15 §S1 — should the wizard loop take another step?
 
