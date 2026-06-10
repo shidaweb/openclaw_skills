@@ -78,27 +78,104 @@ def expected_kana_kind(label: str | None) -> str | None:
     return None
 
 
+# Compound words that contain 名/姓 but do NOT mean a split-name field.
+# Without stripping these, 氏名/お名前/会社名 were misclassified as "mei" and the
+# kana guard then enforced the mei-half into a FULL-name furigana field (bug).
+_NAME_COMPOUND_RE = re.compile(
+    r"(氏名|名前|名称|フルネーム|件名|題名|品名|書名|署名"
+    r"|会社名|法人名|団体名|企業名|店舗名|学校名|施設名|部署名|役職名"
+    r"|担当者名|ご担当名|ブランド名|サイト名|サービス名|商品名|旧姓)"
+)
+
+
 def name_part(label: str | None) -> str | None:
     """Which half of a split name does this label target? ``"sei"`` (姓/セイ),
-    ``"mei"`` (名/メイ), or ``None`` (full name)."""
+    ``"mei"`` (名/メイ), or ``None`` (full name / not a name part).
+
+    Compound words (氏名, お名前, 会社名, 件名, 旧姓 …) are stripped first so a
+    full-name or non-name label never matches the bare 名/姓 markers.
+    """
     if not label:
         return None
-    if "セイ" in label or "せい" in label or "姓" in label or "myoji" in label.lower():
+    low = label.lower()
+    stripped = _NAME_COMPOUND_RE.sub("", label)
+    if (
+        "セイ" in stripped or "せい" in stripped or "姓" in stripped
+        or "苗字" in label or "名字" in label
+        or re.search(r"(?:last|family)[ _-]?name|myoji|\bsei\b", low)
+    ):
         return "sei"
-    if "メイ" in label or "めい" in label or "名" in label:
+    # re-strip 名字/苗字 so their 名 does not leak into the mei check
+    stripped_mei = stripped.replace("名字", "").replace("苗字", "")
+    if (
+        "メイ" in stripped_mei or "めい" in stripped_mei or "名" in stripped_mei
+        or re.search(r"first[ _-]?name|\bmei\b", low)
+    ):
         return "mei"
     return None
 
 
+_NAME_SPACE_RE = re.compile(r"[\s　]+")
+
+
+def split_jp_name(full: str | None) -> tuple[str, str]:
+    """(sei, mei) from a full name string.
+
+    Whitespace (incl. 全角) is the trusted separator; without it we fall back to
+    the legacy 2-char-surname heuristic. Returns ("", "") for empty input.
+    """
+    s = (full or "").strip()
+    if not s:
+        return ("", "")
+    parts = [p for p in _NAME_SPACE_RE.split(s) if p]
+    if len(parts) >= 2:
+        return (parts[0], "".join(parts[1:]))
+    if len(s) > 2:
+        return (s[:2], s[2:])
+    return (s, "")
+
+
+def sender_name_parts(sender: dict[str, Any]) -> dict[str, str]:
+    """Resolve sei/mei for kanji + katakana + hiragana readings.
+
+    Preference per variant: explicit sender keys (``name_sei`` /
+    ``name_kana_sei`` / ``name_furigana_mei`` …) → whitespace split of the full
+    string → 2-char heuristic. Missing kana variants are derived from the other
+    script so a brief that only carries ``name_kana`` still yields ふりがな halves.
+    """
+    kanji = str(sender.get("name") or "")
+    kana = str(sender.get("name_kana") or "")
+    hira = str(sender.get("name_furigana") or "")
+    if not kana and hira:
+        kana = hiragana_to_katakana(hira)
+    if not hira and kana:
+        hira = katakana_to_hiragana(kana)
+    out: dict[str, str] = {}
+    for prefix, full in (("name", kanji), ("name_kana", kana), ("name_furigana", hira)):
+        sei = str(sender.get(f"{prefix}_sei") or "").strip()
+        mei = str(sender.get(f"{prefix}_mei") or "").strip()
+        if not (sei and mei):
+            s2, m2 = split_jp_name(full)
+            sei = sei or s2
+            mei = mei or m2
+        out[f"{prefix}_sei"] = sei
+        out[f"{prefix}_mei"] = mei
+    return out
+
+
 def _split_kana(full: str, sender: dict[str, Any], part: str, kind: str) -> str:
-    """Pick the sei/mei portion, preferring explicit sender fields, then a
-    2-char heuristic (matches the existing convention name_kana[:2] / [2:])."""
+    """Pick the sei/mei portion: explicit sender fields → whitespace split →
+    2-char heuristic (via sender_name_parts), falling back to ``full``."""
+    if part not in ("sei", "mei"):
+        return full
     suffix = "_kana" if kind == "katakana" else "_furigana"
-    if part == "sei":
-        return str(sender.get(f"name{suffix}_sei") or full[:2] or full)
-    if part == "mei":
-        return str(sender.get(f"name{suffix}_mei") or full[2:] or full)
-    return full
+    explicit = str(sender.get(f"name{suffix}_{part}") or "").strip()
+    if explicit:
+        return explicit
+    resolved = sender_name_parts(sender).get(f"name{suffix}_{part}", "")
+    if resolved:
+        return resolved
+    return (full[:2] if part == "sei" else full[2:]) or full
 
 
 def furigana_value_for_label(label: str | None, sender: dict[str, Any]) -> str | None:
@@ -256,6 +333,99 @@ def default_date_value(today: date | None = None) -> str:
         if d.weekday() < 5:
             remaining -= 1
     return d.isoformat()
+
+
+# --- label-aware option choice for selects / radios ---------------------------
+# Labels we know how to answer deterministically even when the group is not an
+# inquiry-type field. Used by submit gates and the heuristic fill pass.
+KNOWN_CHOICE_LABEL_RE = re.compile(
+    r"(都道府県|prefecture|従業員|社員数|会社規模|企業規模|業種|業界|industry"
+    r"|きっかけ|お?知りになった|知った|経由|媒体|どちらで|予算|budget"
+    r"|連絡方法|返信方法|ご返答|回答方法|連絡手段|性別|役職|職種)",
+    re.IGNORECASE,
+)
+
+
+def choose_option_for_label(
+    label: str | None,
+    options: list[Any] | None,
+    sender: dict[str, Any] | None = None,
+) -> dict[str, str] | None:
+    """Pick the most appropriate option for a select/radio given its LABEL.
+
+    Pure decision function. Known label categories get a deterministic answer
+    (都道府県→sender's prefecture, 従業員数→smallest band, きっかけ→その他, 連絡方法→
+    メール, …); anything else falls back to the B2B-preference scorer and finally
+    to neutral options (その他/未定). Returns ``{"value", "reason"}`` or ``None``
+    when no safe choice exists (caller should escalate, not guess).
+    """
+    from _outreach_core import submit_progress as sp  # lazy: avoid import cycle
+
+    lab = (label or "").strip()
+    opts = sp._normalize_options(options or [])
+    usable = [
+        o for o in opts
+        if not o.get("disabled") and not o.get("selected")
+        and not sp._is_placeholder_option(o)
+    ]
+    if not usable:
+        return None
+
+    def _find(*keywords: str, reason: str) -> dict[str, str] | None:
+        for o in usable:
+            text = f"{o.get('label') or ''} {o.get('value') or ''}".lower()
+            if any(k.lower() in text for k in keywords if k):
+                return {"value": str(o.get("label") or o.get("value")), "reason": reason}
+        return None
+
+    s = sender or {}
+    if re.search(r"都道府県|prefecture|地域|エリア", lab, re.IGNORECASE):
+        pref = str(s.get("prefecture") or "").strip()
+        return _find(pref, reason="sender_prefecture") if pref else None
+    if re.search(r"従業員|社員数|会社規模|企業規模|人数規模", lab):
+        return (
+            _find("10名以下", "10人以下", "1〜10", "1～10", "1-10", "10未満", "〜10名",
+                  reason="employee_smallest_band")
+            or _find("50名以下", "11〜", "11～", "〜50", reason="employee_small_band")
+            or {"value": str(usable[0].get("label") or usable[0].get("value")),
+                "reason": "employee_first_band"}
+        )
+    if re.search(r"業種|業界|industry", lab, re.IGNORECASE):
+        kws = str(s.get("industry_keywords") or "サービス 小売 通信販売 EC IT").split()
+        for kw in kws:
+            hit = _find(kw, reason=f"industry:{kw}")
+            if hit:
+                return hit
+        return _find("その他", reason="industry_other")
+    if re.search(r"きっかけ|お?知りになった|知った|経由|媒体|どちらで", lab):
+        return (
+            _find("その他", reason="referral_other")
+            or _find("検索", "web", "サイト", "インターネット", reason="referral_web")
+        )
+    if re.search(r"予算|budget", lab, re.IGNORECASE):
+        return (
+            _find("未定", reason="budget_undecided")
+            or _find("その他", "わからない", "決まっていない", reason="budget_other")
+        )
+    if re.search(r"連絡方法|返信方法|ご返答|回答方法|連絡手段", lab):
+        return _find("メール", "mail", reason="contact_by_email")
+    if re.search(r"性別", lab):
+        g = str(s.get("gender") or "").strip()
+        return _find(g, reason="sender_gender") if g else None
+    if re.search(r"役職|職種", lab):
+        return (
+            _find("経営", "役員", "代表", "経営者", reason="role_executive")
+            or _find("その他", reason="role_other")
+        )
+    # Unknown / inquiry-type-ish label → B2B preference scorer, then neutral.
+    picked = sp.choose_b2b_option(options or [])
+    if picked and str(picked.get("value") or "").strip():
+        return {"value": str(picked["value"]),
+                "reason": f"b2b:{picked.get('reason', '')}"}
+    return (
+        _find("その他", reason="generic_other")
+        or _find("未定", "該当なし", reason="generic_undecided")
+    )
 
 
 _PREF_RE = re.compile(

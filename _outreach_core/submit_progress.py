@@ -109,7 +109,10 @@ def pick_checkboxes_to_check(checkboxes: list[dict[str, Any]] | None) -> list[di
     return out
 
 
-def pick_radio_gate_actions(groups: list[dict[str, Any]] | None) -> list[dict[str, str]]:
+def pick_radio_gate_actions(
+    groups: list[dict[str, Any]] | None,
+    sender: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
     """Choose radio options that are likely required submit gates.
 
     Input schema (dict keys):
@@ -120,7 +123,12 @@ def pick_radio_gate_actions(groups: list[dict[str, Any]] | None) -> list[dict[st
       - options: [{label, value, checked}]
     Output:
       - [{name: group_name, value: option_label_or_value}]
+
+    Label-aware first (性別/連絡方法/きっかけ… via form_validation.
+    choose_option_for_label), then the B2B-preference picker.
     """
+    from _outreach_core import form_validation as fv  # lazy: avoid import cycle
+
     if not isinstance(groups, list):
         return []
     actions: list[dict[str, str]] = []
@@ -134,9 +142,16 @@ def pick_radio_gate_actions(groups: list[dict[str, Any]] | None) -> list[dict[st
             continue
         label = str(g.get("label") or "")
         required = bool(g.get("required"))
-        if not required and not _RADIO_GATE_GROUP_RE.search(label):
+        if (
+            not required
+            and not _RADIO_GATE_GROUP_RE.search(label)
+            and not fv.KNOWN_CHOICE_LABEL_RE.search(label)
+        ):
             continue
-        choice = _pick_radio_option(g.get("options") or [])
+        labelled = fv.choose_option_for_label(label, g.get("options") or [], sender)
+        choice = str((labelled or {}).get("value") or "").strip() or _pick_radio_option(
+            g.get("options") or []
+        )
         if not choice:
             continue
         actions.append({"name": name, "value": choice})
@@ -271,8 +286,18 @@ def choose_b2b_option(options: list[Any] | None) -> dict[str, Any] | None:
     }
 
 
-def pick_select_gate_actions(groups: list[dict[str, Any]] | None) -> list[dict[str, str]]:
-    """Choose select options likely required to unblock submit."""
+def pick_select_gate_actions(
+    groups: list[dict[str, Any]] | None,
+    sender: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
+    """Choose select options likely required to unblock submit.
+
+    Handles required selects plus any select whose label we know how to answer
+    (お問い合わせ種別, 都道府県, 従業員数, きっかけ, 予算, 連絡方法 …). Label-aware
+    choice first, then the B2B-preference picker.
+    """
+    from _outreach_core import form_validation as fv  # lazy: avoid import cycle
+
     if not isinstance(groups, list):
         return []
     actions: list[dict[str, str]] = []
@@ -286,10 +311,17 @@ def pick_select_gate_actions(groups: list[dict[str, Any]] | None) -> list[dict[s
             continue
         label = str(g.get("label") or "")
         required = bool(g.get("required"))
-        if not required and not _INQUIRY_TYPE_RE.search(label):
+        if (
+            not required
+            and not _INQUIRY_TYPE_RE.search(label)
+            and not fv.KNOWN_CHOICE_LABEL_RE.search(label)
+        ):
             continue
-        picked = choose_b2b_option(g.get("options") or [])
-        choice = str((picked or {}).get("value") or "").strip()
+        labelled = fv.choose_option_for_label(label, g.get("options") or [], sender)
+        choice = str((labelled or {}).get("value") or "").strip()
+        if not choice:
+            picked = choose_b2b_option(g.get("options") or [])
+            choice = str((picked or {}).get("value") or "").strip()
         if not choice:
             continue
         actions.append({"name": name, "value": choice})

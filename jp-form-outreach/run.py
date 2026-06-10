@@ -1112,7 +1112,7 @@ extract_first_json = core_prompt.extract_first_json
 
 _REFINE_PROMPT_TEMPLATE = """You wrote the draft below for a Japanese B2B inquiry-form message.
 Now act as a tough senior copywriter and **critique then rewrite** it,
-**strictly following the persona spec embedded below** (this is persona v3).
+**strictly following the persona spec embedded below** (this is persona v6).
 
 ## Persona spec (MUST follow — this is the source of truth)
 
@@ -1126,27 +1126,35 @@ Now act as a tough senior copywriter and **critique then rewrite** it,
 ```json
 {draft_json}```
 
-## Critique checklist (apply strictly — persona-v3 enforcement)
+## Critique checklist (apply strictly — persona-v6 enforcement)
 
 **ハード制約（違反したら必ず書き直す）:**
 
-A. **4セクション構成の保全** — 必ず次の順で構成されているか:
-   Section 1: 挨拶+自己紹介 / Section 2: 課題仮説 / Section 3: 解決策+実績 / Section 4: 定型クロージング
-   → セクション欠落・順序入れ替えがあれば書き直す。特に Section 3（弊社実績への
-     ブリッジ）と Section 4（定型クロージング）の欠落を厳しく検知。
+A. **5セクション構成の保全** — 必ず次の順で構成されているか:
+   Section 1: 挨拶+名乗り（会社名・氏名・役職＋何をやっているか） /
+   Section 2: 相手の現状の行動・方向性の説明（観察のみ・課題なし） /
+   Section 3: その中にある課題の提示（仮説語尾） /
+   Section 4: 解決策の提示+実績ブリッジ / Section 5: 定型クロージング
+   → セクション欠落・順序入れ替えがあれば書き直す。特に
+     (1) 文書の先頭が名乗りでない（フック・固有事実開き）、
+     (2) Section 2 に課題が混ざっている、
+     (3) Section 4（実績ブリッジ）と Section 5（定型クロージング）の欠落、
+     を厳しく検知。
 
-B. **Section 4 の定型文（一字一句保つ）** — 以下が **そのまま** 含まれているか:
-   - 「よろしければ一度、オンラインでご提案のお時間を頂けないでしょうか。」
+B. **Section 5 の定型文（一字一句保つ）** — 以下が **そのまま** 含まれているか:
+   - 「よろしければご提案のお時間をいただけないでしょうか。」
    - 「ご多忙の折、誠に恐縮ですが、何卒よろしくお願い申し上げます。」
    - 末尾の「カレンダー：https://example.com/your-booking-url」
    → どれか欠けていたら **絶対に追加して書き直す**。URL 単独貼り（ラベルなし）も NG。
+   旧定型「よろしければ一度、オンラインでご提案のお時間を頂けないでしょうか。」が
+   あれば新定型に置換する。
 
 C. **質問形 CTA 禁止（NG #1）** — 本文に疑問符（？）または「〜いただけますか」
    「〜どうされていますか」「〜聞かせてください」のような問い掛けが含まれていないか
-   → 含まれていたら削除して Section 4 の定型に置換する。
+   → 含まれていたら削除して Section 5 の定型に置換する。
 
 D. **「どうぞ」「ぜひどうぞ」「お声がけください」などの軽い口語 CTA 禁止（NG #2）**
-   → Section 4 の定型に置換。
+   → Section 5 の定型に置換。
 
 E. **断定回避（NG #3）** — 「〜になっている」「〜が課題である」「効きます」「刺さる」等の
    断定的な指摘がないか → 「〜ではないかと感じております」「〜論点と見受けられます」等に置換。
@@ -1169,9 +1177,10 @@ J. **「拝察」1回・「拝見」2回まで（NG #8）** — 超過分は「�
 
 **自由度のあるチェック（必要に応じて改善）:**
 
-1. Section 2 の課題仮説は、相手企業の固有事実（IR数値・店舗数・新サービス等）を
+1. Section 2 の現状説明は、相手企業の固有事実（IR数値・店舗数・新サービス等）を
    1〜2点引用しているか → していなければ enriched 情報から補う。
-2. Section 3 は「肩書＋事例コピペ」になっていないか。事例から相手企業の論点への
+   Section 3 の課題仮説は Section 2 の現状説明と論理的につながっているか。
+2. Section 4 は「肩書＋事例コピペ」になっていないか。事例から相手企業の論点への
    ブリッジが 1文添えられているか → なければ追加。
 3. 本文は max_chars={max_chars} 以内に収まっているか。超えていたら削る。
 
@@ -1181,12 +1190,12 @@ J. **「拝察」1回・「拝見」2回まで（NG #8）** — 超過分は「�
 {{
   "critique": "<2-4 sentence critique of the original draft, in Japanese — どのハード制約に違反していたかを明示>",
   "subject": "<refined subject or null>",
-  "body": "<refined body, ≤{max_chars} chars, persona-v3 完全準拠>"
+  "body": "<refined body, ≤{max_chars} chars, persona-v6 完全準拠>"
 }}
 ```
 
 ハード制約 A〜J のいずれかに違反していた場合は **必ず** rewrite してください。
-本当に元案が persona-v3 完全準拠で改善余地がなければ `critique` を「改善不要」、
+本当に元案が persona-v6 完全準拠で改善余地がなければ `critique` を「改善不要」、
 subject/body は元のままコピーしてください。
 
 Output only the JSON, no prose."""
@@ -1203,10 +1212,12 @@ def _refine_draft(target: dict[str, Any], draft: dict[str, Any],
     )
     target_for_prompt = {k: target[k] for k in payload_keys if k in target}
 
-    # Load persona spec so refine stays aligned with v3
-    from _outreach_core.prompt import resolve_prompts_dir
+    # Load persona spec so refine stays aligned with the live persona.
+    # _prefer_local: use the per-client override (system_persona.local.md) when it
+    # exists — the same file the draft stage uses — instead of the git template.
+    from _outreach_core.prompt import resolve_prompts_dir, _prefer_local
     prompts_dir = resolve_prompts_dir(SKILL_DIR, config)
-    persona_path = prompts_dir / "system_persona.md"
+    persona_path = _prefer_local(prompts_dir, "system_persona.md")
     try:
         persona = persona_path.read_text(encoding="utf-8")
     except OSError:
@@ -1698,10 +1709,15 @@ SENDER_FIELD_PATTERNS = {
     "name": [r"お?名前", r"氏名", r"name", r"担当者", r"ご担当"],
     "name_kana": [r"フリガナ", r"カナ", r"kana", r"katakana"],
     "name_furigana": [r"ふりがな", r"furigana", r"hiragana"],
-    "name_sei": [r"姓"],
-    "name_mei": [r"名$"],
-    "name_kana_sei": [r"セイ"],
-    "name_kana_mei": [r"メイ"],
+    # 姓: avoid 旧姓; accept 苗字/名字/last|family name.
+    "name_sei": [r"(?<!旧)姓", r"苗字", r"名字", r"last[ _-]?name", r"family[ _-]?name", r"\bsei\b"],
+    # 名: must NOT match compounds (会社名, 氏名, 名前, 件名 …) — the old r"名$"
+    # poured the given name into 会社名/氏名 fields. Anchor to a bare 名.
+    "name_mei": [r"^名$", r"^名[\s　]*[（(※:：]", r"[（(]名[)）]", r"first[ _-]?name", r"\bmei\b"],
+    "name_kana_sei": [r"セイ", r"姓.{0,6}(フリガナ|カナ)", r"(フリガナ|カナ).{0,6}姓"],
+    "name_kana_mei": [r"メイ", r"[（(]名[)）].{0,6}(フリガナ|カナ)", r"(フリガナ|カナ).{0,6}[（(]名[)）]"],
+    "name_furigana_sei": [r"^せい$", r"姓.{0,6}ふりがな", r"ふりがな.{0,6}姓"],
+    "name_furigana_mei": [r"^めい$", r"[（(]名[)）].{0,6}ふりがな", r"ふりがな.{0,6}[（(]名[)）]"],
     "company": [r"会社名", r"法人名", r"団体名", r"貴社", r"御社", r"company"],
     "role": [r"役職", r"部署", r"position", r"title"],
     "email": [r"メール", r"e-?mail"],
@@ -2329,6 +2345,38 @@ def _harvest_and_fix_validation_errors(
     return out
 
 
+def _auto_fill_known_selects(sender: dict[str, Any]) -> list[str]:
+    """Fill required / known-label <select>s via the label-aware pure chooser.
+
+    Returns human-readable diagnostics entries for everything it set.
+    """
+    from _outreach_core import form_validation as fv
+
+    res = _evaluate(_LIST_SELECT_GATES_JS)
+    groups = res if isinstance(res, list) else []
+    filled: list[str] = []
+    for g in groups:
+        if not isinstance(g, dict) or bool(g.get("selected")):
+            continue
+        name = str(g.get("name") or g.get("id") or "").strip()
+        if not name:
+            continue
+        label = str(g.get("label") or "")
+        required = bool(g.get("required"))
+        if not required and not fv.KNOWN_CHOICE_LABEL_RE.search(label):
+            continue
+        choice = fv.choose_option_for_label(label, g.get("options") or [], sender)
+        if not choice:
+            continue
+        out = _apply_field_action(name, "select_option", choice["value"])
+        if out and out.get("ok"):
+            filled.append(
+                f"select:{(label or name)[:20]}={choice['value'][:24]} ({choice['reason']})"
+            )
+            time.sleep(0.15)
+    return filled
+
+
 def _auto_check_submit_gates() -> dict[str, Any]:
     """Check required/agreement checkboxes that often block submit progression."""
     res = _evaluate(_LIST_CHECKBOX_GATES_JS)
@@ -2353,11 +2401,22 @@ def _auto_check_submit_gates() -> dict[str, Any]:
     }
 
 
+# Sender context for gate auto-fill decisions. Set once per target by
+# fill_form_for_target / stage_send; read by the _auto_select_* helpers, which
+# are called deep inside click-retry loops where no config is in scope.
+_SENDER_CTX: dict[str, Any] = {}
+
+
+def _set_sender_ctx(config: dict[str, Any] | None) -> None:
+    global _SENDER_CTX
+    _SENDER_CTX = dict((config or {}).get("sender") or {})
+
+
 def _auto_select_submit_radios() -> dict[str, Any]:
     """Select likely radio gates (法人/提案系/その他) to unblock submit."""
     res = _evaluate(_LIST_RADIO_GATES_JS)
     groups = res if isinstance(res, list) else []
-    actions = core_submit_progress.pick_radio_gate_actions(groups)
+    actions = core_submit_progress.pick_radio_gate_actions(groups, sender=_SENDER_CTX)
     selected_count = 0
     selected_items: list[str] = []
     for act in actions:
@@ -2377,7 +2436,7 @@ def _auto_select_submit_selects() -> dict[str, Any]:
     """Select required inquiry category dropdowns to unblock submit."""
     res = _evaluate(_LIST_SELECT_GATES_JS)
     groups = res if isinstance(res, list) else []
-    actions = core_submit_progress.pick_select_gate_actions(groups)
+    actions = core_submit_progress.pick_select_gate_actions(groups, sender=_SENDER_CTX)
     selected_count = 0
     selected_items: list[str] = []
     for act in actions:
@@ -3296,9 +3355,13 @@ The draft body will be ≤ {body_max_chars} characters. Use placeholder `__BODY_
 ## Rules
 
 1. Map each visible field to a value from sender / overrides
-2. For split 姓/名 fields: name_sei = first 2 chars of sender.name, name_mei = remainder
-3. For カナ/カタカナ fields: use sender.name_kana split similarly if needed
-4. For ふりがな/ひらがな fields: use sender.name_furigana
+2. For split 姓/名 fields: use sender.name_sei / sender.name_mei when present,
+   else first 2 chars of sender.name / remainder. Note: 氏名・お名前 = FULL name
+   (not the 名 half); 苗字・名字 = 姓.
+3. For カナ/カタカナ fields: use sender.name_kana (split: sender.name_kana_sei /
+   name_kana_mei when present). カタカナ表記のラベル(フリガナ/セイ/メイ)にはカタカナを入れる.
+4. For ふりがな/ひらがな fields: use sender.name_furigana (split: sender.
+   name_furigana_sei / name_furigana_mei). ひらがな表記のラベル(ふりがな/せい/めい)にはひらがなを入れる.
 5. For メール確認用: re-use sender.email
 6. For 電話番号 split into 3 fields: split sender.phone (no hyphens) at positions 3 and 7
 7. For 郵便番号 split into 2: first 3 / last 4
@@ -3318,7 +3381,10 @@ The draft body will be ≤ {body_max_chars} characters. Use placeholder `__BODY_
 16. For 同意 / プライバシー / 利用規約 / 個人情報 checkboxes:
     add to checkboxes_to_check. If name/id is unclear, include exact label text
     via {{"name":"", "label":"..."}}.
-17. For optional fields like FAX, ニュースレター, 当社をどこで知ったか when no override: action="skip"
+17. For optional fields like FAX, ニュースレター: action="skip".
+    For 当社をどこで知ったか/きっかけ selects or radios: choose "その他" when that
+    option exists (else "検索"/"Web"系), only skip if neither exists.
+    For ご予算: choose "未定" or "その他". For 連絡方法: choose "メール".
 18. For 従業員数 select with override.employee_count_required: use sender.employee_count_band
 19. Prefer `name` as the field identifier; fall back to `id`.
     If neither exists, use "name": "selector:<css>" AND set `selector` to the same CSS selector.
@@ -4002,6 +4068,7 @@ def fill_form_for_target(
       2. Fall back to heuristic regex patterns for any unmapped fields
     """
     sender = config.get("sender", {})
+    _set_sender_ctx(config)  # gate auto-fill (radio/select) decisions need sender
 
     # === Phase 1: LLM-driven fill ===
     from _outreach_core.draft import resolve_max_chars
@@ -4205,17 +4272,26 @@ def _heuristic_fill_fallback(target: dict[str, Any], config: dict[str, Any],
         sender.get("full_address") or sender.get("address") or ""
     )
 
-    # Sender field fill (multi-shot for split fields)
+    # Sender field fill (multi-shot for split fields).
+    # Order matters: kana/ふりがな variants fill BEFORE kanji splits and full-name
+    # patterns so a 「姓（フリガナ）」 field is taken by the kana pattern first and
+    # never receives kanji. Split values prefer explicit sender keys, then a
+    # whitespace split, then the legacy 2-char heuristic (fv.sender_name_parts).
+    name_parts = fv.sender_name_parts(sender)
     fills = [
-        # Try split-name first
-        ("name_sei", sender["name"][:2], SENDER_FIELD_PATTERNS["name_sei"]),
-        ("name_mei", sender["name"][2:], SENDER_FIELD_PATTERNS["name_mei"]),
-        ("name_kana_sei", sender["name_kana"][:2], SENDER_FIELD_PATTERNS["name_kana_sei"]),
-        ("name_kana_mei", sender["name_kana"][2:], SENDER_FIELD_PATTERNS["name_kana_mei"]),
-        # Then full-name fallbacks
-        ("name", sender["name"], SENDER_FIELD_PATTERNS["name"]),
+        # Kana / ふりがな splits first (most specific labels)
+        ("name_furigana_sei", name_parts["name_furigana_sei"], SENDER_FIELD_PATTERNS["name_furigana_sei"]),
+        ("name_furigana_mei", name_parts["name_furigana_mei"], SENDER_FIELD_PATTERNS["name_furigana_mei"]),
+        ("name_kana_sei", name_parts["name_kana_sei"], SENDER_FIELD_PATTERNS["name_kana_sei"]),
+        ("name_kana_mei", name_parts["name_kana_mei"], SENDER_FIELD_PATTERNS["name_kana_mei"]),
+        # Full kana fields before kanji fulls (お名前（フリガナ） must get kana)
         ("name_kana", sender["name_kana"], SENDER_FIELD_PATTERNS["name_kana"]),
         ("name_furigana", sender["name_furigana"], SENDER_FIELD_PATTERNS["name_furigana"]),
+        # Kanji splits
+        ("name_sei", name_parts["name_sei"], SENDER_FIELD_PATTERNS["name_sei"]),
+        ("name_mei", name_parts["name_mei"], SENDER_FIELD_PATTERNS["name_mei"]),
+        # Then full-name fallbacks
+        ("name", sender["name"], SENDER_FIELD_PATTERNS["name"]),
         ("company", sender["company"], SENDER_FIELD_PATTERNS["company"]),
         ("role", sender["role"], SENDER_FIELD_PATTERNS["role"]),
         ("email", sender["email"], SENDER_FIELD_PATTERNS["email"]),
@@ -4248,6 +4324,12 @@ def _heuristic_fill_fallback(target: dict[str, Any], config: dict[str, Any],
     pref_res = _fill_select(sender_prefecture, label_pattern=r"都道府県|prefecture")
     if pref_res and pref_res.get("selected"):
         diagnostics["filled"].append(f"prefecture={sender_prefecture}")
+
+    # Known-label selects (従業員数, 業種, きっかけ, 予算, 連絡方法 …): answer every
+    # required or recognizable dropdown deterministically via the pure chooser,
+    # instead of leaving them for the submit-gate retry loop.
+    for entry in _auto_fill_known_selects(sender):
+        diagnostics["filled"].append(entry)
 
     # Apply overrides
     if overrides.get("category_radio"):
@@ -4292,9 +4374,10 @@ def _heuristic_fill_fallback(target: dict[str, Any], config: dict[str, Any],
         if rres and rres.get("selected"):
             diagnostics["filled"].append(f"referral_source={overrides['referral_source_radio']}")
     if overrides.get("employee_count_required"):
-        sres = _fill_select(sender["employee_count_band"], label_pattern=r"従業員")
+        band = str(sender.get("employee_count_band") or "10")
+        sres = _fill_select(band, label_pattern=r"従業員")
         if sres and sres.get("selected"):
-            diagnostics["filled"].append(f"employee_count={sender['employee_count_band']}")
+            diagnostics["filled"].append(f"employee_count={band}")
     extra_cb_labels = overrides.get("extra_checkboxes_by_label") or []
     if isinstance(extra_cb_labels, str):
         extra_cb_labels = [extra_cb_labels]
