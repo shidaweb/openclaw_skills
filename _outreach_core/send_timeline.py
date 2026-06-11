@@ -20,6 +20,7 @@ from typing import Any
 STAGE_LABELS: dict[str, str] = {
     "open": "ページを開く",
     "page_state": "ページ状態（フォーム存在）",
+    "live_state": "ライブページ状態（v24 観測）",
     "url_recovery": "URL自動リカバリ",
     "entry_click": "入口クリック（法人タブ等）",
     "pre_gates": "事前ゲート（同意・種別・ラジオ・プルダウン）",

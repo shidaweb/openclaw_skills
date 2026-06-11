@@ -35,6 +35,7 @@ from _outreach_core import content_guard as core_content_guard
 from _outreach_core import contact_url as core_contact_url
 from _outreach_core import resolve_queue as core_resolve_queue
 from _outreach_core import send_journal as core_send_journal
+from _outreach_core import send_state as core_send_state
 from _outreach_core import send_timeline as core_timeline
 from _outreach_core import submit_progress as core_submit_progress
 from _outreach_core import tab_utils as core_tab_utils
@@ -4930,54 +4931,19 @@ def _resolve_in_open_tab(
         # Safety: focused tab is not this company's form — do NOT submit.
         return {"vresult": None, "page_text": "", "status": "site_mismatch", "cur_url": cur_url}
 
-    patterns = [
-        r"^送信する$", r"^送信$", r"この内容で送信", r"内容を送信する", r"送信する",
-        r"問い合わせを送信", r"お問い合わせを送信", r"上記の内容で送信", r"submit", r"完了", r"確定",
-        r"入力内容を確認", r"内容(を|の)?確認", r"確認する",
-    ]
-    cr = _click_button_with_gate_retry(patterns, form_root_selector=d.get("form_root_selector"))
-    if not cr or not cr.get("clicked"):
-        buttons = _enumerate_buttons(
-            form_root_selector=d.get("form_root_selector"),
-            filled_names=_filled_name_hints(d),
-        )
-        if buttons:
-            cr = _llm_click_submit_candidate(
-                buttons,
-                config or {},
-                form_root_selector=d.get("form_root_selector"),
-                phase="first" if flow == "confirm" else "final",
-            )
-        if not cr or not cr.get("clicked"):
-            native = _submit_native(d, form_root_selector=d.get("form_root_selector"))
-            if native.get("clicked"):
-                cr = {"clicked": True, "text": f"[native:{native.get('method')}]"}
-    if not cr or not cr.get("clicked"):
+    # v24 §S3: hunt the submit on the preserved DOM with the closed-loop driver
+    # (observes the LIVE state — the page may be an input form, a validation
+    # bounce, or already a confirm page). mode="retry" → no double journaling.
+    _arm_dialog_autoaccept()
+    resolve_timeline: list[dict[str, Any]] = []
+    subres = _submission_loop(
+        d, config, str((d.get("draft") or {}).get("body") or ""),
+        flow=flow, mode="retry", trace=trace,
+        tid=str(d.get("id") or d.get("name") or "?"),
+        timeline=resolve_timeline,
+    )
+    if subres.get("status") == "click_failed" and int(subres.get("clicks") or 0) == 0:
         return {"vresult": None, "page_text": "", "status": "no_button"}
-    time.sleep(3)
-    # If this was an input page (confirm flow), a confirm page may now appear.
-    if flow == "confirm":
-        c2 = _click_button_with_gate_retry([
-            r"^送信する$", r"^送信$", r"この内容で送信", r"内容を送信する",
-            r"submit", r"完了", r"確定", r"問い合わせを送信",
-        ])
-        if c2 and c2.get("clicked"):
-            time.sleep(5)
-        else:
-            buttons = _enumerate_buttons(
-                form_root_selector=d.get("form_root_selector"),
-                filled_names=_filled_name_hints(d),
-            )
-            if buttons:
-                c2 = _llm_click_submit_candidate(
-                    buttons,
-                    config or {},
-                    form_root_selector=d.get("form_root_selector"),
-                    phase="final",
-                )
-            if not c2 or not c2.get("clicked"):
-                _submit_native(d, form_root_selector=d.get("form_root_selector"))
-            time.sleep(5)
     time.sleep(2)
     page_evidence = _evaluate(PAGE_EVIDENCE_JS)
     snap = oc_browser("snapshot")
@@ -5024,6 +4990,7 @@ def _deep_submit(
         _evaluate, config, stage="send", target_id=tid,
         emit_event=lambda kind, **kw: _emit_event(kind, trace_dir=trace, **kw),
     )
+    _arm_dialog_autoaccept()
     if d.get("entry_click_text"):
         for txt in (d["entry_click_text"] if isinstance(d["entry_click_text"], list) else [d["entry_click_text"]]):
             _click_button([re.escape(txt)])
@@ -5035,75 +5002,19 @@ def _deep_submit(
     fill_form_for_target(d, config, sanitized_body, trace_dir=trace, iterative_fill=iterative_fill)
     time.sleep(1.0)
 
-    plan = d.get("_llm_plan") or {}
+    # v24 §S3: the deep retry drives the SAME closed-loop state machine as the
+    # main send path — re-running the old open-loop script here was why retries
+    # deterministically hit the same wall. mode="retry" → no double journaling.
     inferred_flow = _infer_submit_flow_from_buttons(form_root_selector=d.get("form_root_selector"))
     if inferred_flow and inferred_flow != flow:
         flow = inferred_flow
-    if flow == "confirm":
-        patterns = [r"入力内容を確認", r"内容(を|の)?確認", r"確認する", r"確認$", r"同意して次へ", r"^次へ$"]
-    else:
-        patterns = [r"送信する", r"^送信$", r"submit", r"内容を送信"]
-    if plan.get("first_button_pattern"):
-        patterns = patterns + [plan["first_button_pattern"]]
-    drive = _drive_enable_sequence(d, plan, body=sanitized_body, stage="send", trace_dir=trace, max_steps=4)
-    cr = (drive.get("click_res") or {}) if drive.get("clicked") else None
-    if not cr:
-        cr = _click_button_with_gate_retry(patterns, form_root_selector=d.get("form_root_selector"))
-    if not cr or not cr.get("clicked"):
-        buttons = _enumerate_buttons(
-            form_root_selector=d.get("form_root_selector"),
-            filled_names=_filled_name_hints(d),
-        )
-        if buttons:
-            cr = _llm_click_submit_candidate(
-                buttons,
-                config or {},
-                form_root_selector=d.get("form_root_selector"),
-                phase="first" if flow == "confirm" else "final",
-            )
-        if not cr or not cr.get("clicked"):
-            native = _submit_native(d, form_root_selector=d.get("form_root_selector"))
-            if native.get("clicked"):
-                cr = {"clicked": True, "text": f"[native:{native.get('method')}]"}
-    if not cr or not cr.get("clicked"):
-        return {"vresult": None, "page_text": ""}
-    time.sleep(3)
-
-    # Validation-error recovery (mirrors stage_send §4b): fix furigana/required
-    # title errors that bounced us back, then re-click the first submit once.
-    vfix = _harvest_and_fix_validation_errors(d, config, sanitized_body, stage="send", trace_dir=trace)
-    if vfix.get("recoverable"):
-        time.sleep(0.5)
-        reclick = _click_button_with_gate_retry(patterns, form_root_selector=d.get("form_root_selector"))
-        if reclick and reclick.get("clicked"):
-            time.sleep(3)
-
-    if flow == "confirm":
-        c2 = _click_button_with_gate_retry([
-            r"^送信する$", r"^送信$", r"この内容で送信", r"内容を送信する",
-            r"上記の内容で送信", r"submit", r"完了", r"確定", r"問い合わせを送信",
-        ])
-        if not c2 or not c2.get("clicked"):
-            post = _post_form_llm_gate_action(d, config or {}, stage="send", trace_dir=trace)
-            if int(post.get("checked") or 0) > 0:
-                c2 = _click_button_with_gate_retry([
-                    r"^送信する$", r"^送信$", r"この内容で送信", r"内容を送信する",
-                    r"上記の内容で送信", r"submit", r"完了", r"確定", r"問い合わせを送信",
-                ], form_root_selector=d.get("form_root_selector"))
-            buttons = _enumerate_buttons(
-                form_root_selector=d.get("form_root_selector"),
-                filled_names=_filled_name_hints(d),
-            )
-            if buttons:
-                c2 = _llm_click_submit_candidate(
-                    buttons,
-                    config or {},
-                    form_root_selector=d.get("form_root_selector"),
-                    phase="final",
-                )
-            if not c2 or not c2.get("clicked"):
-                _submit_native(d, form_root_selector=d.get("form_root_selector"))
-        time.sleep(5)
+    deep_timeline: list[dict[str, Any]] = []
+    subres = _submission_loop(
+        d, config, sanitized_body,
+        flow=flow, mode="retry", trace=trace, tid=tid, timeline=deep_timeline,
+    )
+    if subres.get("status") == "click_failed" and int(subres.get("clicks") or 0) == 0:
+        return {"vresult": None, "page_text": "", "loop_status": subres.get("status")}
 
     time.sleep(2)
     page_evidence = _evaluate(PAGE_EVIDENCE_JS)
@@ -5182,6 +5093,352 @@ def _advance_wizard_steps(
         )
         time.sleep(3)
     return {"too_deep": _still_input_step(), "extra_steps": extra}
+
+
+# ============================================================================
+# v24 §S3 — closed-loop submission driver (observe → classify → act → re-observe)
+# ============================================================================
+# Replaces the open-loop "click first → assume confirm page → click final"
+# script. The live page is observed before EVERY action and the action is
+# chosen from the observed state — never from the enrich-time flow guess.
+
+def _arm_dialog_autoaccept() -> None:
+    """Auto-accept native JS dialogs (confirm/alert) on the CURRENT page.
+
+    CDP and Playwright both dismiss unhandled dialogs, so a submit button
+    guarded by ``onclick="return confirm('送信しますか？')"`` silently cancels —
+    the click reports success, the page never changes, and the target lands in
+    needs_attention. Must be re-armed after every navigation."""
+    try:
+        _evaluate(core_send_state.DIALOG_AUTOACCEPT_JS)
+    except Exception:  # noqa: BLE001 — arming must never break a send
+        pass
+
+
+def _read_dialog_log() -> list[dict[str, Any]]:
+    try:
+        res = _evaluate(core_send_state.READ_DIALOG_LOG_JS)
+        return res if isinstance(res, list) else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _observe_send_state(sender: dict[str, Any], body: str) -> dict[str, Any]:
+    """One evaluate round-trip → classified live page state (see send_state)."""
+    probes = core_send_state.build_probes(sender, body)
+    raw = _evaluate(core_send_state.evidence_js(probes))
+    return core_send_state.classify_send_state(raw if isinstance(raw, dict) else {})
+
+
+_FIRST_CLICK_PATTERNS = [
+    r"入力内容を確認", r"送信内容を確認", r"内容(を|の)?確認",
+    r"確認画面", r"確認する", r"確認$", r"内容の確認へ",
+    r"同意して次へ", r"^次へ$", r"次のステップへ",
+]
+_FINAL_CLICK_PATTERNS = [
+    r"^送信する$", r"^送信$", r"この内容で送信",
+    r"内容を送信する", r"上記の内容で送信", r"^回答送信$",
+    r"^送る$", r"submit", r"完了", r"確定",
+    r"内容で.*送信", r"^以上の内容", r"内容を以上で",
+    r"上記内容を送信", r"問い合わせを送信", r"お問い合わせを送信",
+    r"送信する", r"内容を送信", r"同意して.*送信",
+]
+
+
+def _click_phase_submit(
+    d: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    phase: str,
+    trace: Any,
+    tid: str,
+    scope_to_form: bool = True,
+    extra_patterns: list[str] | None = None,
+) -> dict[str, Any]:
+    """One full click cascade for the OBSERVED phase ('first' | 'final').
+
+    Order: phase regexes → opposite-phase regexes (rescues single/confirm
+    misclassification, e.g. flow=single but the page wants 「確認」) → LLM picker
+    over enumerated buttons → page-instruction click → native submit.
+    ``scope_to_form=False`` drops the (possibly stale) textarea-derived form
+    root — required on confirm pages, which usually have no textarea.
+    Returns {"clicked", "click_res", "noise_only", "native", "found_but_disabled"}.
+    """
+    primary = list(_FIRST_CLICK_PATTERNS if phase == "first" else _FINAL_CLICK_PATTERNS)
+    alternate = list(_FINAL_CLICK_PATTERNS if phase == "first" else _FIRST_CLICK_PATTERNS)
+    for p in extra_patterns or []:
+        if p and p not in primary:
+            primary.append(p)
+    root = d.get("form_root_selector") if scope_to_form else None
+
+    res = _click_button_with_gate_retry(primary, form_root_selector=root)
+    if not (res and res.get("clicked")):
+        alt = _click_button_with_gate_retry(alternate, form_root_selector=root)
+        if alt and alt.get("clicked"):
+            alt["phase_mismatch"] = True
+            res = alt
+
+    noise_only = False
+    native: dict[str, Any] | None = None
+    if not (res and res.get("clicked")):
+        buttons = _enumerate_buttons(form_root_selector=root, filled_names=_filled_name_hints(d))
+        if buttons:
+            ranked = _phase_filter_submit_candidates(buttons, phase=phase)
+            noise_only = len(ranked) == 0
+            pick = _llm_click_submit_candidate(
+                buttons, config or {}, form_root_selector=root, phase=phase,
+            )
+            if pick and pick.get("clicked"):
+                res = pick
+                picked = pick.get("picked") or {}
+                _emit_event(
+                    f"send.{'first' if phase == 'first' else 'final'}.llm_pick",
+                    stage="send", target_id=tid,
+                    payload={
+                        "picked_text": (picked.get("text") or "")[:120],
+                        "picked_selector": (picked.get("selector") or "")[:160],
+                        "clicked": True,
+                        "candidates": len(buttons),
+                    },
+                    trace_dir=trace,
+                )
+    if not (res and res.get("clicked")):
+        instr = _click_submit_by_instruction(d, phase=phase, form_root_selector=root)
+        if instr and instr.get("clicked"):
+            res = instr
+            _emit_event(
+                f"send.{'first' if phase == 'first' else 'final'}.instruction_click",
+                stage="send", target_id=tid,
+                payload={"text": (instr.get("text") or "")[:120]}, trace_dir=trace,
+            )
+    if not (res and res.get("clicked")):
+        native = _submit_native(d, form_root_selector=root)
+        if native.get("clicked"):
+            res = {
+                "clicked": True,
+                "text": f"[native:{native.get('method')}]",
+                "native_submit_method": native.get("method"),
+            }
+    return {
+        "clicked": bool(res and res.get("clicked")),
+        "click_res": res,
+        "noise_only": noise_only,
+        "native": native,
+        "found_but_disabled": bool(res and res.get("found_but_disabled")),
+    }
+
+
+def _submission_loop(
+    d: dict[str, Any],
+    config: dict[str, Any],
+    send_body: str,
+    *,
+    flow: str,
+    mode: str,
+    trace: Any,
+    tid: str,
+    timeline: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Drive the already-filled live form to completion as a state machine.
+
+    Per round: arm dialog auto-accept → observe/classify the page → act on the
+    OBSERVED state → detect whether anything actually changed. Terminal result::
+
+        {"status": "done" | "click_failed" | "validation_stuck" | "ineffective"
+                   | "lost_form" | "too_deep",
+         "state": <last observed state>, "phase": <last click phase>,
+         "clicks": n, "journal_attempted": bool, "obs": <last observation>,
+         "dialogs": [...], "noise_only": bool, "native": {...}}
+
+    The caller maps failure statuses onto the existing escalation taxonomy and
+    ALWAYS runs verify after "done"/"too_deep" — the loop never declares a send
+    successful by itself.
+    """
+    sender = (config or {}).get("sender") or {}
+    plan = d.get("_llm_plan") or {}
+    journal = {"attempted": False}
+
+    def _journal_submit_attempt() -> None:
+        if mode in ("auto", "interactive") and not journal["attempted"]:
+            core_send_journal.append_journal(
+                DATA_DIR, tid, core_send_journal.PHASE_SUBMIT_ATTEMPTED,
+                form_url=d.get("form_url"),
+            )
+            journal["attempted"] = True
+
+    def _result(status: str, obs: dict[str, Any] | None, **extra: Any) -> dict[str, Any]:
+        return {
+            "status": status,
+            "obs": obs or {},
+            "state": (obs or {}).get("state"),
+            "clicks": clicks,
+            "journal_attempted": journal["attempted"],
+            "dialogs": _read_dialog_log()[:6],
+            **extra,
+        }
+
+    last_fp: str | None = None
+    no_progress = 0
+    validation_rounds = 0
+    clicks = 0
+    confirm_seen = False
+    phase = "first" if flow == "confirm" else "final"
+
+    for step in range(MAX_FORM_STEPS + 2):
+        _arm_dialog_autoaccept()
+        obs = _observe_send_state(sender, send_body)
+        state = obs["state"]
+        _emit_event(
+            "send.state.observed", stage="send", target_id=tid,
+            payload={
+                "step": step, "state": state,
+                "visible_textareas": obs.get("visible_textareas"),
+                "editable_visible": obs.get("editable_visible"),
+                "probe_text_hits": obs.get("probe_text_hits"),
+                "probe_field_hits": obs.get("probe_field_hits"),
+                "dialog_count": obs.get("dialog_count"),
+            },
+            trace_dir=trace,
+        )
+        core_timeline.add(
+            timeline, "live_state", state not in ("no_form",),
+            step=step, state=state,
+        )
+
+        if state == "done":
+            return _result("done", obs)
+        if state == "no_form":
+            # A click may have navigated to an interstitial; treat the FIRST
+            # no_form sighting after a click as transient, the second as lost.
+            if clicks > 0 and no_progress == 0:
+                no_progress += 1
+                time.sleep(3)
+                continue
+            return _result("lost_form", obs)
+
+        fp = obs["fingerprint"]
+        if last_fp is not None and fp == last_fp:
+            no_progress += 1
+            if no_progress >= 2:
+                return _result("ineffective", obs, phase=phase)
+        else:
+            no_progress = 0
+        last_fp = fp
+
+        if state == "validation_error":
+            validation_rounds += 1
+            vfix = _harvest_and_fix_validation_errors(
+                d, config, send_body, stage="send", trace_dir=trace,
+            )
+            errs = vfix.get("errors") or []
+            if errs:
+                err_fields = ", ".join(f"{e['field'][:16]}[{e['kind']}]" for e in errs[:4])
+                print(f"  [send] ⚠ validation errors: {err_fields} → fixed={vfix.get('fixed')}")
+            core_timeline.add(
+                timeline, "validation_fix", bool(vfix.get("fixed")),
+                round=validation_rounds, fixed=vfix.get("fixed"),
+            )
+            # Beyond kana/subject guardrails, retry the generic gate auto-fill —
+            # dynamically-revealed required selects/radios live here.
+            _auto_check_submit_gates()
+            _auto_select_submit_radios()
+            _auto_select_submit_selects()
+            if validation_rounds > 2:
+                return _result(
+                    "validation_stuck", obs,
+                    errors=[{"field": e.get("field", "")[:60], "kind": e.get("kind")}
+                            for e in errs[:8]],
+                )
+            phase = "first" if (flow == "confirm" and obs.get("visible_textareas")) else "final"
+        elif state == "confirm":
+            phase = "final"
+            if not confirm_seen:
+                confirm_seen = True
+                _emit_event(
+                    "send.confirm.reached", stage="send", target_id=tid,
+                    payload={"wait_user_ms": 0, "observed": True}, trace_dir=trace,
+                )
+                core_timeline.add(timeline, "confirm_page", True)
+        else:  # input
+            phase = "first" if flow == "confirm" else "final"
+
+        # Journal before ANY click (§R3). The flow belief can be wrong: on a
+        # misclassified single-flow form a phase="first" cascade falls through
+        # to the final-pattern alternates / native submit and REALLY submits.
+        # A false "attempted" (crash before a harmless first click) costs one
+        # human check on resume; a missed journal risks a double-send.
+        _journal_submit_attempt()
+
+        # First action on the input page gets the plan-driven enable sequence
+        # (route radios / consent gates / RESCAN steps) before the cascade.
+        cl: dict[str, Any] | None = None
+        if clicks == 0 and state == "input":
+            drive = _drive_enable_sequence(
+                d, plan, body=send_body, stage="send", trace_dir=trace, max_steps=4,
+            )
+            if drive.get("clicked"):
+                cl = {
+                    "clicked": True,
+                    "click_res": {**(drive.get("click_res") or {}),
+                                  "enable_steps": int(drive.get("steps") or 0)},
+                    "noise_only": False, "native": None, "found_but_disabled": False,
+                }
+                _emit_event(
+                    "send.enable_sequence.completed", stage="send", target_id=tid,
+                    payload={"steps": int(drive.get("steps") or 0),
+                             "applied": (drive.get("applied") or [])[:8]},
+                    trace_dir=trace,
+                )
+            else:
+                d["_drive_remaining"] = drive.get("remaining") or {}
+        if cl is None:
+            cl = _click_phase_submit(
+                d, config, phase=phase, trace=trace, tid=tid,
+                scope_to_form=(state != "confirm"),
+                extra_patterns=(
+                    [str(plan.get("first_button_pattern"))]
+                    if phase == "first" and plan.get("first_button_pattern") else None
+                ),
+            )
+        if not cl["clicked"]:
+            return _result(
+                "click_failed", obs, phase=phase,
+                noise_only=cl["noise_only"], native=cl["native"],
+                found_but_disabled=cl["found_but_disabled"],
+                disabled_candidates=((cl.get("click_res") or {}).get("disabled_candidates") or [])[:3],
+            )
+
+        clicks += 1
+        click_res = cl["click_res"] or {}
+        btn_text = (click_res.get("text") or "")[:80]
+        print(f"  [send] clicked ({phase}): {btn_text}")
+        core_timeline.add(
+            timeline, "final_submit" if phase == "final" else "first_submit", True,
+            button=btn_text[:40], native=click_res.get("native_submit_method"),
+            state=state,
+        )
+        _emit_event(
+            "send.final.clicked" if phase == "final" else "send.button.clicked",
+            stage="send", target_id=tid,
+            payload={
+                "pattern_matched": not click_res.get("phase_mismatch", False),
+                "text": btn_text,
+                "observed_state": state,
+                "radio_auto_selected": int(click_res.get("radio_auto_selected") or 0),
+                "select_auto_selected": int(click_res.get("select_auto_selected") or 0),
+                "native_submit_method": click_res.get("native_submit_method"),
+            },
+            trace_dir=trace,
+        )
+        time.sleep(5 if phase == "final" else 3)
+
+    final_obs = _observe_send_state(sender, send_body)
+    if final_obs["state"] == "done":
+        return _result("done", final_obs)
+    if final_obs["state"] in ("input", "validation_error"):
+        return _result("too_deep", final_obs)
+    # confirm/no_form after the cap — let verify judge the page as-is.
+    return _result("done", final_obs, capped=True)
 
 
 def _send_one_target(
@@ -5343,6 +5600,9 @@ def _send_one_target(
         target_id=tid,
         emit_event=lambda kind, **kw: _emit_event(kind, trace_dir=trace, **kw),
     )
+    # v24: accept native confirm()/alert() from the very first interaction —
+    # entry clicks and pre-form gates can also be dialog-guarded.
+    _arm_dialog_autoaccept()
 
     pre_snap = oc_browser("snapshot")
     ev.dump_trace(trace, "form_snapshot_pre.txt", pre_snap or "")
@@ -5539,7 +5799,10 @@ def _send_one_target(
         filled_only.append(d)
         return {"outcome": "skipped"}
 
-    # 4. Click first submit button (確認 for confirm-flow, 送信 for single)
+    # 4-5. Closed-loop submission (v24 §S3). The legacy linear script (click
+    # first → assume confirm page reached → click final → wizard catch-up) is
+    # replaced by a state machine that observes the LIVE page before every
+    # action and picks the action from the observed state — see _submission_loop.
     time.sleep(1.0)
     plan = d.get("_llm_plan") or {}
     plan_flow = plan.get("next_step")
@@ -5548,410 +5811,148 @@ def _send_one_target(
     inferred_flow = _infer_submit_flow_from_buttons(form_root_selector=d.get("form_root_selector"))
     if inferred_flow and inferred_flow != flow:
         flow = inferred_flow
-    if flow == "confirm":
-        patterns = [
-            r"入力内容を確認", r"送信内容を確認", r"内容(を|の)?確認",
-            r"確認画面", r"確認する", r"確認$", r"内容の確認へ",
-            r"同意して次へ", r"^次へ$", r"次のステップへ",
-        ]
-    else:
-        patterns = [r"送信する", r"^送信$", r"submit", r"内容を送信", r"同意して.*送信"]
-    plan_first = plan.get("first_button_pattern")
-    if plan_first and plan_first not in patterns:
-        patterns = patterns + [plan_first]
-    # v15 §R3: journal BEFORE any click that can actually submit. In single
-    # flow the very first click is the real submit; in confirm flow the final
-    # click (step 5) is journaled instead. A crash between this row and the
-    # "verified" row marks the target unverified → human review on resume.
-    journal_attempted = False
-    if mode in ("auto", "interactive") and flow != "confirm":
-        core_send_journal.append_journal(
-            DATA_DIR, tid, core_send_journal.PHASE_SUBMIT_ATTEMPTED, form_url=form_url
-        )
-        journal_attempted = True
-    drive = _drive_enable_sequence(
-        d,
-        plan,
-        body=send_body,
-        stage="send",
-        trace_dir=trace,
-        max_steps=4,
+
+    subres = _submission_loop(
+        d, config, send_body,
+        flow=flow, mode=mode, trace=trace, tid=tid, timeline=timeline,
     )
-    click_res = (drive.get("click_res") or {}) if drive.get("clicked") else None
-    if click_res:
-        click_res["enable_steps"] = int(drive.get("steps") or 0)
-        _emit_event(
-            "send.enable_sequence.completed",
-            stage="send",
-            target_id=tid,
-            payload={
-                "steps": int(drive.get("steps") or 0),
-                "applied": (drive.get("applied") or [])[:8],
-            },
-            trace_dir=trace,
-        )
-    if not click_res:
-        click_res = _click_button_with_gate_retry(
-            patterns,
-            form_root_selector=d.get("form_root_selector"),
-        )
-    first_native: dict[str, Any] | None = None
-    first_noise_only = False
-    if not click_res or not click_res.get("clicked"):
-        # Strengthened detection (§3.5): before declaring failure, enumerate
-        # the form's buttons and let the LLM pick the most likely confirm/submit
-        # control — the same fallback the FINAL submit already had. Many
-        # "first submit not found" cases (e.g. オリヒロ) were mislabeled as
-        # reCAPTCHA when the button simply didn't match the regex list.
-        print(f"  [send] first submit button regex miss — LLM picker fallback")
-        buttons = _enumerate_buttons(
-            form_root_selector=d.get("form_root_selector"),
-            filled_names=_filled_name_hints(d),
-        )
-        if buttons:
-            ranked = _phase_filter_submit_candidates(
-                buttons,
-                phase="first" if flow == "confirm" else "final",
+    journal_attempted = bool(subres.get("journal_attempted"))
+    status = str(subres.get("status") or "")
+    sub_state = str(subres.get("state") or "")
+    sub_obs = subres.get("obs") or {}
+
+    def _close_journal(outcome: str) -> None:
+        if journal_attempted:
+            core_send_journal.append_journal(
+                DATA_DIR, tid, core_send_journal.PHASE_VERIFIED, outcome=outcome
             )
-            first_noise_only = len(ranked) == 0
-            click_res = _llm_click_submit_candidate(
-                buttons,
-                config or {},
-                form_root_selector=d.get("form_root_selector"),
-                phase="first" if flow == "confirm" else "final",
-            )
-            pick = (click_res or {}).get("picked") or {}
-            if click_res and click_res.get("clicked"):
-                picked_label = pick.get("text") or pick.get("selector") or click_res.get("text")
-                print(f"  [send] LLM picked first: {picked_label} ({pick.get('reason','')[:60]})")
-                _emit_event(
-                    "send.first.llm_pick", stage="send", target_id=tid,
-                    payload={
-                        "picked_text": (pick.get("text") or "")[:120],
-                        "picked_selector": (pick.get("selector") or "")[:160],
-                        "clicked": bool(click_res and click_res.get("clicked")),
-                        "candidates": len(buttons),
-                    },
-                    trace_dir=trace,
-                )
-        if not click_res or not click_res.get("clicked"):
-            # v19: page-instruction fallback (「…よろしければ送信ボタンをクリック」).
-            instr = _click_submit_by_instruction(
-                d,
-                phase="first" if flow == "confirm" else "final",
-                form_root_selector=d.get("form_root_selector"),
-            )
-            if instr and instr.get("clicked"):
-                click_res = instr
-                print(f"  [send] 指示文に従い送信ボタンをクリック: {instr.get('text')}")
-                _emit_event(
-                    "send.first.instruction_click", stage="send", target_id=tid,
-                    payload={"text": (instr.get("text") or "")[:120]}, trace_dir=trace,
-                )
-        if not click_res or not click_res.get("clicked"):
-            first_native = _submit_native(d, form_root_selector=d.get("form_root_selector"))
-            if first_native.get("clicked"):
-                click_res = {
-                    "clicked": True,
-                    "text": f"[native:{first_native.get('method')}]",
-                    "native_submit_method": first_native.get("method"),
-                }
-    if not click_res or not click_res.get("clicked"):
-        print(f"  [send] ⚠ first submit button not found (patterns={patterns})")
-        if click_res and click_res.get("found_but_disabled"):
-            print(f"  [send]    ↳ matched but disabled: {(click_res.get('disabled_candidates') or [])[:3]}")
-        if first_native:
-            print(f"  [send]    ↳ {_native_submit_diag(first_native)}")
-        # v17: re-check the page state at THIS moment — a validation bounce or
-        # session expiry may have replaced the form since fill (duskin case).
-        live_state = core_contact_url.classify_page_form_state(
-            _rescan_form_fields(d),
-            (lambda t: t if isinstance(t, str) else "")(_evaluate(_PAGE_TEXT_HEAD_JS)),
-        )
-        core_timeline.add(
-            timeline, "first_submit", False,
-            flow=flow,
-            page_state_now=live_state.get("state"),
-            inputs_now=live_state.get("inputs"),
-            buttons_now=live_state.get("submit_buttons"),
-            found_but_disabled=bool(click_res and click_res.get("found_but_disabled")) or None,
-        )
+
+    if status != "done":
         filled_only.append(d)
-        _emit_event(
-            "send.first_button_missing",
-            stage="send",
-            target_id=tid,
-            payload={
-                "patterns": patterns,
-                "flow": flow,
-                "found_but_disabled": bool(click_res and click_res.get("found_but_disabled")),
-                "native_submit_method": (first_native or {}).get("method"),
-                "native_submit_reason": (first_native or {}).get("reason"),
-                "noise_only_candidates": first_noise_only,
-                "remaining_gate_total": int((drive.get("remaining") or {}).get("total") or 0),
-            },
-            trace_dir=trace,
-        )
-        core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SUBMIT_NOT_FOUND)
         if cur_tab_id:
             resolver_tab_ids.add(cur_tab_id)
-        _live_form_gone = live_state.get("state") in ("no_form", "error_page", "empty_render")
-        _queue_for_resolver(
-            d,
-            (
-                "form_vanished_after_fill" if _live_form_gone
-                else "submit_gate_unsatisfied" if int((drive.get("remaining") or {}).get("total") or 0) > 0
-                else "first_submit_not_found"
-            ),
-            (
-                (
-                    f"フォームが消失/不在の状態でボタン探索に失敗 (page_state={live_state.get('state')}, "
-                    f"inputs={live_state.get('inputs')}, buttons={live_state.get('submit_buttons')}) — "
-                    f"バリデーション差し戻し or セッション切れ or URL不正の可能性; "
-                    if _live_form_gone else ""
-                )
-                + f"first submit button not found (flow={flow}); "
-                f"noise_only_candidates={first_noise_only}; "
-                f"remaining_gates={json.dumps((drive.get('remaining') or {}), ensure_ascii=False)[:240]}; "
-                f"{_native_submit_diag(first_native)}"
-            ),
-            trace=trace, autonomous=autonomous, tab_id=cur_tab_id,
-        )
-        if journal_attempted:
-            # No click actually happened — close the journal so this target is
-            # not flagged as an unverified prior attempt on resume (§R3).
-            core_send_journal.append_journal(
-                DATA_DIR, tid, core_send_journal.PHASE_VERIFIED, outcome="no_click"
-            )
-        return {"outcome": "skipped"}
-    print(f"  [send] clicked: {click_res.get('text')}")
-    core_timeline.add(
-        timeline, "first_submit", True,
-        flow=flow, button=(click_res.get("text") or "")[:40],
-        native=click_res.get("native_submit_method"),
-    )
-    if click_res.get("radio_auto_selected"):
-        print(f"  [send]    ↳ auto-selected radios: {(click_res.get('radio_items') or [])[:3]}")
-    if click_res.get("select_auto_selected"):
-        print(f"  [send]    ↳ auto-selected selects: {(click_res.get('select_items') or [])[:3]}")
-    _emit_event(
-        "send.button.clicked",
-        stage="send",
-        target_id=tid,
-        payload={
-            "pattern_matched": True,
-            "text": (click_res.get("text") or "")[:80],
-            "radio_auto_selected": int(click_res.get("radio_auto_selected") or 0),
-            "select_auto_selected": int(click_res.get("select_auto_selected") or 0),
-            "native_submit_method": click_res.get("native_submit_method"),
-        },
-        trace_dir=trace,
-    )
-    time.sleep(3)
 
-    # 4b. Validation-error recovery: if the form bounced us back to the input
-    # page with inline errors (e.g. furigana format / required title), harvest
-    # them, fix deterministically, and re-click the first submit ONCE. This is
-    # the general safety net beyond the proactive guardrails.
-    vfix = _harvest_and_fix_validation_errors(
-        d, config, send_body, stage="send", trace_dir=trace,
-    )
-    if vfix.get("errors"):
-        err_fields = ", ".join(
-            f"{e['field'][:16]}[{e['kind']}]" for e in vfix["errors"][:4]
-        )
-        print(f"  [send] ⚠ validation errors: {err_fields} → fixed={vfix.get('fixed')}")
-        core_timeline.add(
-            timeline, "validation_fix", bool(vfix.get("recoverable")),
-            errors=err_fields, fixed=vfix.get("fixed"),
-        )
-        if vfix.get("recoverable"):
-            time.sleep(0.5)
-            reclick = _click_button_with_gate_retry(
-                patterns, form_root_selector=d.get("form_root_selector")
-            )
-            if reclick and reclick.get("clicked"):
-                print(f"  [send] ↻ re-submitted after validation fix: {reclick.get('text')}")
-                time.sleep(3)
-
-    # 5. If confirm flow, click final submit
-    if flow == "confirm":
-        _emit_event(
-            "send.confirm.reached",
-            stage="send",
-            target_id=tid,
-            payload={"wait_user_ms": 0},
-            trace_dir=trace,
-        )
-        core_timeline.add(timeline, "confirm_page", True)
-        # v15 §R3: confirm flow — journal right before the FINAL submit click.
-        if mode in ("auto", "interactive") and not journal_attempted:
-            core_send_journal.append_journal(
-                DATA_DIR, tid, core_send_journal.PHASE_SUBMIT_ATTEMPTED, form_url=form_url
-            )
-            journal_attempted = True
-        click2 = _click_button_with_gate_retry([
-            r"^送信する$", r"^送信$", r"この内容で送信",
-            r"内容を送信する", r"上記の内容で送信", r"^回答送信$",
-            r"^送る$", r"submit", r"完了", r"確定",
-            r"内容で.*送信", r"^以上の内容", r"内容を以上で",
-            r"上記内容を送信", r"問い合わせを送信", r"お問い合わせを送信",
-        ])
-        final_native: dict[str, Any] | None = None
-        final_noise_only = False
-        if not click2 or not click2.get("clicked"):
-            print(f"  [send] ⚠ final submit not matched by patterns — falling back to LLM picker")
-            post = _post_form_llm_gate_action(
-                d,
-                config or {},
-                stage="send",
-                trace_dir=trace,
-            )
-            if int(post.get("checked") or 0) > 0:
-                click2 = _click_button_with_gate_retry([
-                    r"^送信する$", r"^送信$", r"この内容で送信",
-                    r"内容を送信する", r"上記の内容で送信", r"^回答送信$",
-                    r"^送る$", r"submit", r"完了", r"確定",
-                    r"内容で.*送信", r"^以上の内容", r"内容を以上で",
-                    r"上記内容を送信", r"問い合わせを送信", r"お問い合わせを送信",
-                ], form_root_selector=d.get("form_root_selector"))
-            buttons = _enumerate_buttons(
-                form_root_selector=d.get("form_root_selector"),
-                filled_names=_filled_name_hints(d),
-            )
-            if buttons:
-                ranked = _phase_filter_submit_candidates(buttons, phase="final")
-                final_noise_only = len(ranked) == 0
-                click2 = _llm_click_submit_candidate(
-                    buttons,
-                    config or {},
-                    form_root_selector=d.get("form_root_selector"),
-                    phase="final",
-                )
-                pick = (click2 or {}).get("picked") or {}
-                if click2 and click2.get("clicked"):
-                    picked_label = pick.get("text") or pick.get("selector") or click2.get("text")
-                    print(f"  [send] LLM picked: {picked_label} ({pick.get('reason','')[:60]})")
-                    _emit_event(
-                        "send.final.llm_pick", stage="send", target_id=tid,
-                        payload={
-                            "picked_text": (pick.get("text") or "")[:120],
-                            "picked_selector": (pick.get("selector") or "")[:160],
-                            "clicked": bool(click2 and click2.get("clicked")),
-                            "candidates": len(buttons),
-                        },
-                        trace_dir=trace,
-                    )
-            if not click2 or not click2.get("clicked"):
-                # v19: page-instruction fallback (「上記の内容でよろしければ送信ボタンを
-                # クリックしてください」) before native — confirm pages often phrase the
-                # final send this way with a generically-labelled button.
-                instr2 = _click_submit_by_instruction(
-                    d, phase="final", form_root_selector=d.get("form_root_selector"),
-                )
-                if instr2 and instr2.get("clicked"):
-                    click2 = instr2
-                    print(f"  [send] 指示文に従い最終送信をクリック: {instr2.get('text')}")
-                    _emit_event(
-                        "send.final.instruction_click", stage="send", target_id=tid,
-                        payload={"text": (instr2.get("text") or "")[:120]}, trace_dir=trace,
-                    )
-            if not click2 or not click2.get("clicked"):
-                final_native = _submit_native(d, form_root_selector=d.get("form_root_selector"))
-                if final_native.get("clicked"):
-                    click2 = {
-                        "clicked": True,
-                        "text": f"[native:{final_native.get('method')}]",
-                        "native_submit_method": final_native.get("method"),
-                    }
-            if not click2 or not click2.get("clicked"):
-                print(f"  [send] ⚠ final submit still not clickable after LLM fallback — awaiting proceed")
-                if click2 and click2.get("found_but_disabled"):
-                    print(f"  [send]    ↳ matched but disabled: {(click2.get('disabled_candidates') or [])[:3]}")
-                if final_native:
-                    print(f"  [send]    ↳ {_native_submit_diag(final_native)}")
-                core_timeline.add(
-                    timeline, "final_submit", False,
-                    noise_only=final_noise_only or None,
-                    found_but_disabled=bool(click2 and click2.get("found_but_disabled")) or None,
-                )
-                if trace:
-                    ev.dump_trace(
-                        trace, "form_snapshot_confirm.txt",
-                        oc_browser("snapshot") or "",
-                    )
-                filled_only.append(d)
-                core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SUBMIT_NOT_FOUND)
-                if cur_tab_id:
-                    resolver_tab_ids.add(cur_tab_id)
-                _queue_for_resolver(
-                    d, "confirm_submit_not_found",
-                    (
-                        "confirm-page final submit not found; "
-                        f"noise_only_candidates={final_noise_only}; {_native_submit_diag(final_native)}"
-                    ),
-                    trace=trace, autonomous=autonomous, tab_id=cur_tab_id,
-                )
-                if journal_attempted:
-                    core_send_journal.append_journal(
-                        DATA_DIR, tid, core_send_journal.PHASE_VERIFIED,
-                        outcome="no_click",
-                    )
-                return {"outcome": "skipped"}
-        print(f"  [send] clicked final: {click2.get('text')}")
-        core_timeline.add(
-            timeline, "final_submit", True,
-            button=(click2.get("text") or "")[:40],
-            native=click2.get("native_submit_method"),
-        )
-        if click2.get("radio_auto_selected"):
-            print(f"  [send]    ↳ auto-selected radios: {(click2.get('radio_items') or [])[:3]}")
-        if click2.get("select_auto_selected"):
-            print(f"  [send]    ↳ auto-selected selects: {(click2.get('select_items') or [])[:3]}")
-        _emit_event(
-            "send.final.clicked",
-            stage="send",
-            target_id=tid,
-            payload={
-                "text": (click2.get("text") or "")[:80],
-                "radio_auto_selected": int(click2.get("radio_auto_selected") or 0),
-                "select_auto_selected": int(click2.get("select_auto_selected") or 0),
-                "native_submit_method": click2.get("native_submit_method"),
-            },
-            trace_dir=trace,
-        )
-        time.sleep(5)
-
-    # 5b. v15 §S1: generalized multi-step wizard. If the page STILL shows an
-    # active form (3+ step flows beyond the single/confirm dichotomy), keep
-    # filling + clicking next/confirm/submit up to MAX_FORM_STEPS total.
-    if mode in ("auto", "interactive"):
-        wiz = _advance_wizard_steps(
-            d, config, send_body, trace=trace,
-            steps_done=2 if flow == "confirm" else 1,
-        )
-        if wiz.get("too_deep"):
-            print(f"  [send] ⚠ wizard too deep (>{MAX_FORM_STEPS} steps) — needs attention")
-            filled_only.append(d)
-            _emit_event(
-                "send.wizard_too_deep", stage="send", target_id=tid,
-                payload={"max_steps": MAX_FORM_STEPS,
-                         "extra_steps": wiz.get("extra_steps", 0)},
-                trace_dir=trace,
-            )
-            if cur_tab_id:
-                resolver_tab_ids.add(cur_tab_id)
+        if status == "click_failed" and sub_state == "confirm":
+            if trace:
+                ev.dump_trace(trace, "form_snapshot_confirm.txt", oc_browser("snapshot") or "")
+            print("  [send] ⚠ confirm page reached but final submit not clickable")
+            core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SUBMIT_NOT_FOUND)
             _queue_for_resolver(
-                d, "wizard_too_deep",
-                f"multi-step form exceeded {MAX_FORM_STEPS} steps",
+                d, "confirm_submit_not_found",
+                (
+                    "confirm-page final submit not found; "
+                    f"noise_only_candidates={bool(subres.get('noise_only'))}; "
+                    f"{_native_submit_diag(subres.get('native'))}"
+                ),
                 trace=trace, autonomous=autonomous, tab_id=cur_tab_id,
             )
-            if journal_attempted:
-                core_send_journal.append_journal(
-                    DATA_DIR, tid, core_send_journal.PHASE_VERIFIED,
-                    outcome="wizard_too_deep",
-                )
+            _close_journal("no_click" if int(subres.get("clicks") or 0) == 0 else "not_confirmed")
             return {"outcome": "skipped"}
+
+        if status == "click_failed":
+            print(f"  [send] ⚠ submit button not found (observed state={sub_state})")
+            if subres.get("found_but_disabled"):
+                print(f"  [send]    ↳ matched but disabled: {subres.get('disabled_candidates') or []}")
+            if subres.get("native"):
+                print(f"  [send]    ↳ {_native_submit_diag(subres.get('native'))}")
+            remaining = d.get("_drive_remaining") or {}
+            core_timeline.add(
+                timeline, "first_submit", False,
+                flow=flow, page_state_now=sub_state,
+                found_but_disabled=bool(subres.get("found_but_disabled")) or None,
+            )
+            _emit_event(
+                "send.first_button_missing", stage="send", target_id=tid,
+                payload={
+                    "flow": flow,
+                    "observed_state": sub_state,
+                    "found_but_disabled": bool(subres.get("found_but_disabled")),
+                    "native_submit_method": (subres.get("native") or {}).get("method"),
+                    "native_submit_reason": (subres.get("native") or {}).get("reason"),
+                    "noise_only_candidates": bool(subres.get("noise_only")),
+                    "remaining_gate_total": int(remaining.get("total") or 0),
+                },
+                trace_dir=trace,
+            )
+            core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SUBMIT_NOT_FOUND)
+            _queue_for_resolver(
+                d,
+                (
+                    "submit_gate_unsatisfied" if int(remaining.get("total") or 0) > 0
+                    else "first_submit_not_found"
+                ),
+                (
+                    f"submit button not found (flow={flow}, observed_state={sub_state}); "
+                    f"noise_only_candidates={bool(subres.get('noise_only'))}; "
+                    f"remaining_gates={json.dumps(remaining, ensure_ascii=False)[:240]}; "
+                    f"{_native_submit_diag(subres.get('native'))}"
+                ),
+                trace=trace, autonomous=autonomous, tab_id=cur_tab_id,
+            )
+            _close_journal("no_click" if int(subres.get("clicks") or 0) == 0 else "not_confirmed")
+            return {"outcome": "skipped"}
+
+        if status == "validation_stuck":
+            fields = ", ".join(
+                f"{e.get('field')}[{e.get('kind')}]" for e in (subres.get("errors") or [])[:5]
+            )
+            print(f"  [send] ⚠ validation errors persist after auto-fix — {fields}")
+            core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_WRONG_FORM)
+            _queue_for_resolver(
+                d, "validation_unrecoverable",
+                f"想定外の必須項目/バリデーションを自動修復できません: {fields}",
+                trace=trace, autonomous=autonomous, tab_id=cur_tab_id,
+            )
+            _close_journal("validation_bounced")
+            return {"outcome": "skipped"}
+
+        if status == "ineffective":
+            dialogs = subres.get("dialogs") or []
+            dlg_note = (
+                "; dialogs=" + json.dumps(dialogs[:3], ensure_ascii=False)
+                if dialogs else ""
+            )
+            print("  [send] ⚠ clicks register but the page never changes — escalating")
+            core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SUBMIT_NOT_FOUND)
+            _queue_for_resolver(
+                d, "submit_click_ineffective",
+                (
+                    f"クリックは成立するがページが遷移しません (observed_state={sub_state})"
+                    f"{dlg_note}"
+                ),
+                trace=trace, autonomous=autonomous, tab_id=cur_tab_id,
+            )
+            _close_journal("not_confirmed")
+            return {"outcome": "skipped"}
+
+        if status == "lost_form":
+            print("  [send] ⚠ form disappeared mid-flight (session expiry / redirect)")
+            core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_WRONG_FORM)
+            _queue_for_resolver(
+                d, "form_vanished_after_fill",
+                (
+                    f"フォームが送信途中で消失しました (clicks={subres.get('clicks')}, "
+                    f"url={sub_obs.get('url', '')})"
+                ),
+                trace=trace, autonomous=autonomous, tab_id=cur_tab_id,
+            )
+            _close_journal("no_click" if int(subres.get("clicks") or 0) == 0 else "not_confirmed")
+            return {"outcome": "skipped"}
+
+        # too_deep — still an input step after the click cap (§S1 successor).
+        print(f"  [send] ⚠ wizard too deep (>{MAX_FORM_STEPS} steps) — needs attention")
+        _emit_event(
+            "send.wizard_too_deep", stage="send", target_id=tid,
+            payload={"max_steps": MAX_FORM_STEPS, "clicks": int(subres.get("clicks") or 0)},
+            trace_dir=trace,
+        )
+        _queue_for_resolver(
+            d, "wizard_too_deep",
+            f"multi-step form exceeded {MAX_FORM_STEPS} steps",
+            trace=trace, autonomous=autonomous, tab_id=cur_tab_id,
+        )
+        _close_journal("wizard_too_deep")
+        return {"outcome": "skipped"}
 
     # 6. Verify send (keywords, required fields, plan gaps)
     time.sleep(2)

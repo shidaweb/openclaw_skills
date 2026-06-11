@@ -135,6 +135,7 @@ class PlaywrightBrowserAdapter:
         if self._reg.current is None:
             # reuse an existing blank page if the context opened one, else create.
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            self._hook_dialogs(page)
             if self._reg.id_of(page) is None:
                 self._reg.add(page)
             self._reg.current = page
@@ -187,9 +188,20 @@ class PlaywrightBrowserAdapter:
         return None
 
     # --- internals ----------------------------------------------------------
+    @staticmethod
+    def _hook_dialogs(page) -> None:
+        """Auto-accept native JS dialogs (v22 §SM). Playwright's default is to
+        DISMISS an unhandled dialog, so onsubmit="return confirm(...)" forms
+        were silently cancelled — the click 'succeeded' and nothing happened."""
+        try:
+            page.on("dialog", lambda d: d.accept())
+        except Exception:  # noqa: BLE001 — never let a hook break navigation
+            pass
+
     def _open(self, url: str) -> str:
         ctx = self._ensure_context()
         page = ctx.new_page()
+        self._hook_dialogs(page)
         tid = self._reg.add(page)
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=self._default_timeout_ms)

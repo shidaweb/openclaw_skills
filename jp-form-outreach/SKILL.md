@@ -405,8 +405,15 @@ The script will:
   contact_method, etc.)
 - Fill the largest textarea with the draft body
 - Check the agreement checkbox (label match: 同意 / プライバシー / etc.)
-- For `flow: confirm` — click "確認" → wait → click "送信する"
-- For `flow: single` — click "送信する" once
+- Drive submission as a **closed-loop state machine** (v24 §S3,
+  `_submission_loop`): each round it arms JS-dialog auto-accept
+  (`confirm()`/`alert()` は自動承諾・記録), observes the LIVE page and
+  classifies it (`input / validation_error / confirm / done / no_form`,
+  `_outreach_core/send_state.py`), then acts on the OBSERVED state — the
+  enrich-time `flow` (single/confirm) is only a hint, never control flow.
+  Validation bounces are auto-fixed and re-filled; clicks that don't change
+  the page are detected immediately (fingerprint) and escalated as
+  `submit_click_ineffective` instead of a misleading verify failure.
 - Verify success page (heuristic: 送信完了 / ありがとうございました / 完了画面 / THANKS)
 - Append to `data/sent_history.jsonl`
 
