@@ -81,6 +81,23 @@ def _keepalive_interval() -> int:
         return 60
 
 
+def compose_heartbeat_message(
+    task: str,
+    current: int,
+    total: int,
+    elapsed_sec: float,
+    last_action: str,
+    progress_summary: str | None = None,
+) -> str:
+    """Pure heartbeat-line builder. When a run_progress summary is available
+    (sent/skipped/needs_attention/ETA), it carries the richer status; otherwise
+    fall back to the bare current/total + elapsed line."""
+    if progress_summary:
+        return f"[{task}] {progress_summary}"
+    mins = int((elapsed_sec or 0) / 60)
+    return f"[{task}] {current}/{total} 件目 · 経過 {mins} 分 · {last_action}"
+
+
 class HeartbeatSession:
     """Context manager: progress events + optional 5-min Slack webhook pings."""
 
@@ -196,6 +213,17 @@ class HeartbeatSession:
             post(summary, level="info", thread_ts=None)
         self._sync_system_health()
 
+    def _progress_summary_line(self) -> str | None:
+        """The v22 run_progress summary for this run's data_dir, or None."""
+        try:
+            from _outreach_core import run_progress
+            snap = run_progress.read(self.data_dir)
+            if not snap:
+                return None
+            return run_progress.format_summary(snap)
+        except Exception:  # noqa: BLE001
+            return None
+
     def _refresh_from_log(self) -> None:
         """Pick up child-stage ticks written to current_task.jsonl by subprocesses."""
         path = current_task_path(self.data_dir)
@@ -230,9 +258,11 @@ class HeartbeatSession:
                 continue
             if time.time() - last_post < self._interval:
                 continue
-            mins = int(elapsed / 60)
             post(
-                f"[{self.task}] {self._current}/{self.total} 件目 · 経過 {mins} 分 · {self._last_action}",
+                compose_heartbeat_message(
+                    self.task, self._current, self.total, elapsed,
+                    self._last_action, self._progress_summary_line(),
+                ),
                 level="info",
                 thread_ts=self._thread_ts,
             )

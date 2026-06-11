@@ -11,7 +11,26 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from _outreach_core.progress import HeartbeatSession, resolve_heartbeat_mode
+from _outreach_core.progress import (
+    HeartbeatSession,
+    compose_heartbeat_message,
+    resolve_heartbeat_mode,
+)
+
+
+class TestComposeHeartbeatMessage(unittest.TestCase):
+    def test_uses_progress_summary_when_present(self):
+        msg = compose_heartbeat_message(
+            "send", 12, 30, 360, "株式会社X · sent",
+            progress_summary="send 12/30 · 送信 9 · 要対応 1",
+        )
+        self.assertEqual(msg, "[send] send 12/30 · 送信 9 · 要対応 1")
+
+    def test_falls_back_to_bare_line(self):
+        msg = compose_heartbeat_message("send", 5, 30, 120, "株式会社Y", None)
+        self.assertIn("[send] 5/30 件目", msg)
+        self.assertIn("経過 2 分", msg)
+        self.assertIn("株式会社Y", msg)
 
 
 class TestProgress(unittest.TestCase):

@@ -34,10 +34,18 @@ cd ~/.openclaw/skills && ./healthcheck touch-command
 
 ```bash
 cd ~/.openclaw/skills
+./report progress --brief torana-line-crm   # ★推奨: いまの送信進捗を1行で
+                                            #   例: send 12/30 · 送信9 · スキップ2 · 要対応1 · 経過6m · 残り目安4m · 処理中: 株式会社X
 ./healthcheck ping        # heartbeat 経過秒 / active runs / needs_attention 件数
 ./healthcheck status      # 上記 + system_health JSON + events 末尾
 ./brief status --brief torana-line-crm   # 進行中 run の stage / 件数を file から再構築
 ```
+
+**「進捗」「どこまで」「あと何件」と聞かれたら最優先で `./report progress --brief <id>` を返す**
+（v22・run_progress.json を読むだけ・ターンを占有しない）。`--json` で構造化、
+ブラウザで見たいなら `./report dashboard --brief <id>` が自動更新HTMLのパスを返す。
+送信実行中は **5分毎の心拍にもこの進捗サマリ（送信/スキップ/要対応/残り目安）が
+自動で載る**ので、エージェントからの追加投稿は不要。
 
 ---
 
