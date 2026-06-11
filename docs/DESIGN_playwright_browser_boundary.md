@@ -151,8 +151,18 @@ Playwright の `page.accessibility.snapshot()` は **JSONツリー**で、文字
 ## 9. 段階移行とロールバック
 
 1. **Phase 0**: `BrowserAdapter` seam 導入＋`OpenClawBrowserAdapter`（挙動不変）。全テスト緑を確認。← リスクほぼゼロ
-2. **Phase 1**: `PlaywrightBrowserAdapter` 実装（§3–5）。`evaluate/open/snapshot/tab` の単体テスト。
-3. **Phase 2**: `DOORMAN_BROWSER_BACKEND=playwright` で **enrich のみ**を1社→数社。snapshot/フォーム種別判定の出力を旧と突き合わせ（差分レポート）。
+2. **Phase 1**: `PlaywrightBrowserAdapter` 実装（§3–5）。`evaluate/open/snapshot/tab` の単体テスト。【実装済み】
+3. **Phase 2**: パリティ検証ハーネスで OpenClaw と Playwright の「見え方」を突き合わせる。【ツール実装済み】
+   - 両バックエンドが動く実機で:
+     ```bash
+     # 実機にPlaywright未導入なら一度だけ:
+     pip install playwright && python3 -m playwright install chromium
+     # 過去に詰まったURLで突き合わせ（exit 0=一致 / 1=乖離）:
+     python3 -m _outreach_core.tools.backend_probe https://www.gakkyusha.co.jp/contact/
+     python3 -m _outreach_core.tools.backend_probe https://cart.duskin.jp/inquiry_co_jp?shop_cd=04 --json
+     ```
+   - 比較対象は**パイプラインが実際に判断に使う信号**: page-form-state（v17）、captcha kind/blocking（v18）、textarea/submit/radio 数。
+   - 乖離が出たURLは snapshot 案A（§4）の調整対象。一致が揃ったら send へ。
 4. **Phase 3**: send を Playwright で。**fill-only → 本番テストフォーム → 実送信**の順。v20 primary-host ガード下で安全に。
 5. **Phase 4**: 既定を `playwright` に。OpenClawブラウザを停止。
 - **ロールバック**: いつでも `backend=openclaw` に戻すだけ（旧アダプタは残置）。

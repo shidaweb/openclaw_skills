@@ -29,13 +29,20 @@ def select_backend(config: dict[str, Any] | None = None) -> str:
     return "openclaw"
 
 
-def _build(config: dict[str, Any] | None):
-    backend = select_backend(config)
-    if backend == "playwright":
+def make_browser(backend: str, config: dict[str, Any] | None = None):
+    """Build a NON-singleton adapter for an explicit backend (harness / tests)."""
+    b = (backend or "").strip().lower()
+    if b == "playwright":
         from .playwright_browser import PlaywrightBrowserAdapter
         return PlaywrightBrowserAdapter(config=config)
-    from .openclaw_browser import OpenClawBrowserAdapter
-    return OpenClawBrowserAdapter()
+    if b in ("openclaw", ""):
+        from .openclaw_browser import OpenClawBrowserAdapter
+        return OpenClawBrowserAdapter()
+    raise ValueError(f"unknown browser backend: {backend!r}")
+
+
+def _build(config: dict[str, Any] | None):
+    return make_browser(select_backend(config), config)
 
 
 def get_browser(config: dict[str, Any] | None = None):
