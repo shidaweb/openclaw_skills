@@ -675,6 +675,17 @@ def cmd_progress(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    """(Re)generate the self-contained live progress dashboard + print its path."""
+    from _outreach_core import run_progress
+    data_dir = _skill_data_dir(args.skill, getattr(args, "brief", None))
+    run_progress.write_html(data_dir)
+    path = run_progress.html_path(data_dir)
+    print(f"# Doorman live dashboard\n\n開いてください: {path}")
+    print("（実行中は数秒ごとに自動更新されます）")
+    return 0
+
+
 def cmd_improvements(args: argparse.Namespace) -> int:
     """Merged brief for Slack '今週の改善ポイント'."""
     since = args.since
@@ -753,6 +764,10 @@ def main() -> None:
     p.add_argument("--skill", default="jp-form-outreach")
     p.add_argument("--json", action="store_true")
 
+    p = sub.add_parser("dashboard", help="(Re)generate the self-contained live HTML dashboard")
+    _add_brief_arg(p)
+    p.add_argument("--skill", default="jp-form-outreach")
+
     args = ap.parse_args()
     if args.cmd == "draft-quality":
         sys.exit(cmd_draft_quality(args))
@@ -772,6 +787,8 @@ def main() -> None:
         sys.exit(cmd_improvements(args))
     if args.cmd == "progress":
         sys.exit(cmd_progress(args))
+    if args.cmd == "dashboard":
+        sys.exit(cmd_dashboard(args))
     ap.print_help()
     sys.exit(1)
 

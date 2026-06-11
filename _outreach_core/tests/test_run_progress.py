@@ -91,5 +91,56 @@ class TestFormatting(unittest.TestCase):
         self.assertTrue(200 <= eta <= 280)
 
 
+class TestRenderHtml(unittest.TestCase):
+    def _running(self):
+        return {
+            "stage": "send", "total": 30, "processed": 12, "sent": 9,
+            "skipped": 2, "needs_attention": 1, "status": "running",
+            "current": "株式会社サンプル",
+            "started_at": (datetime.now(timezone.utc) - timedelta(minutes=6)).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def test_none_snapshot_renders_placeholder(self):
+        html = rp.render_html(None)
+        self.assertIn("まだ実行データがありません", html)
+        self.assertNotIn("http-equiv='refresh'", html)
+
+    def test_running_has_refresh_and_numbers(self):
+        html = rp.render_html(self._running())
+        self.assertIn("http-equiv='refresh'", html)   # auto-reload while running
+        self.assertIn("12 / 30", html)
+        self.assertIn("株式会社サンプル", html)
+        self.assertIn(">9<", html)                     # sent count card
+        self.assertIn("width:40%", html)               # 12/30 = 40%
+
+    def test_finished_has_no_refresh(self):
+        snap = self._running()
+        snap["status"] = "done"
+        snap["finished_at"] = datetime.now(timezone.utc).isoformat()
+        html = rp.render_html(snap)
+        self.assertNotIn("http-equiv='refresh'", html)
+        self.assertIn("自動更新停止", html)
+
+    def test_html_escaping_of_current(self):
+        snap = self._running()
+        snap["current"] = "<script>x</script>&co"
+        html = rp.render_html(snap)
+        self.assertNotIn("<script>x</script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+    def test_write_html_creates_file(self):
+        import tempfile
+        d = Path(tempfile.mkdtemp())
+        try:
+            rp.start(d, "send", 3)
+            rp.bump(d, outcome="sent", name="A")
+            self.assertTrue(rp.html_path(d).is_file())
+            self.assertIn("send", rp.html_path(d).read_text(encoding="utf-8"))
+        finally:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
