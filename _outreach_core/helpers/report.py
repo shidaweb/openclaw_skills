@@ -662,6 +662,19 @@ def cmd_prune(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_progress(args: argparse.Namespace) -> int:
+    """Live run-progress snapshot (v22): where the current/last batch is now."""
+    from _outreach_core import run_progress
+    data_dir = _skill_data_dir(args.skill, getattr(args, "brief", None))
+    snap = run_progress.read(data_dir)
+    if getattr(args, "json", False):
+        import json as _json
+        print(_json.dumps(snap or {}, ensure_ascii=False, indent=2))
+    else:
+        print(run_progress.format_summary(snap))
+    return 0
+
+
 def cmd_improvements(args: argparse.Namespace) -> int:
     """Merged brief for Slack '今週の改善ポイント'."""
     since = args.since
@@ -735,6 +748,11 @@ def main() -> None:
     p.add_argument("--since", default="7d")
     p.add_argument("--skill", default="jp-form-outreach")
 
+    p = sub.add_parser("progress", help="Live run-progress snapshot (current/last batch)")
+    _add_brief_arg(p)
+    p.add_argument("--skill", default="jp-form-outreach")
+    p.add_argument("--json", action="store_true")
+
     args = ap.parse_args()
     if args.cmd == "draft-quality":
         sys.exit(cmd_draft_quality(args))
@@ -752,6 +770,8 @@ def main() -> None:
         sys.exit(cmd_prune(args))
     if args.cmd == "improvements":
         sys.exit(cmd_improvements(args))
+    if args.cmd == "progress":
+        sys.exit(cmd_progress(args))
     ap.print_help()
     sys.exit(1)
 

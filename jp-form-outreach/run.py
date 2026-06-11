@@ -6230,6 +6230,8 @@ def stage_send(
     resolver_tab_ids: set[str] = set()  # error tabs kept open for the resolver
     hb = HeartbeatSession(SKILL_DIR, "send", len(targets), heartbeat=heartbeat, data_dir=DATA_DIR)
     hb.start(f"send {len(targets)} targets")
+    from _outreach_core import run_progress as core_progress
+    core_progress.start(DATA_DIR, "send", len(targets))
 
     try:
         for di, d in enumerate(targets):
@@ -6265,6 +6267,8 @@ def stage_send(
                 result = {"outcome": "crashed"}
             d.pop("_send_tab_id", None)
             hb.tick(di + 1, f"{d.get('name', '?')} · {result.get('outcome', 'done')}")
+            core_progress.bump(DATA_DIR, outcome=result.get("outcome"),
+                               name=d.get("name"))
 
             if di < len(targets) - 1:
                 print(f"  [send] sleeping 30s before next...")
@@ -6273,6 +6277,7 @@ def stage_send(
         # §R1 acceptance: hb.end always runs; partial successes are persisted
         # even when the loop dies mid-batch.
         hb.end(f"send done · sent={len(sent)} · pending={len(filled_only)}")
+        core_progress.finish(DATA_DIR, status="done")
         if sent:
             append_sent_history(sent)
     print(f"\n[send] done · sent={len(sent)} · filled-only={len(filled_only)}")
