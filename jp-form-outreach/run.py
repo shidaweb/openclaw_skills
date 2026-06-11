@@ -6126,6 +6126,29 @@ def stage_send(
         print("[send] missing config", file=sys.stderr)
         return
 
+    # v20: primary-host guard. On a non-primary machine (e.g. the dev MacBook)
+    # refuse to actually SUBMIT, so a stray command never fires real outreach.
+    # fill-only never submits, so it's allowed everywhere for local testing.
+    from _outreach_core import host_role
+    if mode in ("auto", "interactive"):
+        allowed, reason = host_role.is_send_allowed(config)
+        if not allowed:
+            host = host_role.current_host()
+            primary = host_role.configured_primary_host(config)
+            msg = (
+                f"⏭ 送信をスキップしました（このホストは実行担当ではありません）。\n"
+                f"　このマシン: {host} / 実行担当(primary): {primary}\n"
+                f"　送信は {primary} 側で実行されます。開発機からの誤送信を防ぐためのガードです。\n"
+                f"　意図的にこのマシンで送るなら DOORMAN_FORCE_SEND=1 を付けて実行してください。"
+            )
+            print(f"[send] BLOCKED by primary-host guard: {reason}")
+            try:
+                from _outreach_core.notify import post as _notify_post
+                _notify_post(msg, level="warn")
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
     drafts = [json.loads(l) for l in input_path.open()]
     sendable = [d for d in drafts if d.get("draft", {}).get("subject") != "SKIP"]
     if not sendable:
