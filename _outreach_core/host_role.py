@@ -83,3 +83,36 @@ def is_send_allowed(
     if _norm(h) == _norm(primary):
         return True, f"host_is_primary:{h}"
     return False, f"not_primary:host={h},primary={primary}"
+
+
+def _main(argv: list[str] | None = None) -> int:
+    """Print this machine's send-eligibility. Exit 0 = may send, 3 = blocked.
+
+    Run on each machine to verify the primary-host routing:
+        python3 -m _outreach_core.host_role
+    """
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Show Doorman send-eligibility for this host.")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args(argv)
+
+    host = current_host()
+    primary = configured_primary_host()
+    allowed, reason = is_send_allowed()
+    if args.json:
+        import json
+        print(json.dumps({"host": host, "primary": primary or None,
+                          "send_allowed": allowed, "reason": reason}, ensure_ascii=False))
+    else:
+        print(f"host          = {host}")
+        print(f"primary       = {primary or '(未設定 → ガード無効・全機で送信可)'}")
+        verdict = "✅ このマシンは送信担当（実行されます）" if allowed \
+            else "⛔ このマシンは送信しません（実行担当ではない）"
+        print(f"send_allowed  = {allowed}  {verdict}")
+        print(f"reason        = {reason}")
+    return 0 if allowed else 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
