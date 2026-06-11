@@ -96,3 +96,10 @@ briefs/*.yaml
 
 # Slack channel binding/state is local-only
 **/data/channel_state/*.json
+
+# v20: machine-local primary-host guard config (never commit)
+data/primary_host
+data/pw_profile/
+data/pw_shot_*.png
+data/run_progress.json
+data/run_progress.html
