@@ -163,13 +163,25 @@ def stage_history(action: str) -> None:
 # OpenClaw subprocess helpers
 # ============================================================================
 
-oc_browser = core_infer.oc_browser
 oc_infer = core_infer.oc_infer
+
+# v21: all browser I/O routes through the selected BrowserAdapter (default
+# "openclaw" → byte-identical to the historical oc_* subprocess calls; opt into
+# Playwright with DOORMAN_BROWSER_BACKEND=playwright). The call sites below
+# (oc_browser / _evaluate / tab helpers) are unchanged for the rest of run.py.
+from _outreach_core import adapters as core_adapters
+
+
+def oc_browser(*args: str, **_kwargs: Any) -> str | None:
+    """Browser verb (open/snapshot/screenshot/focus/close) via the active adapter.
+    ``profile`` kwarg is accepted for call-site compatibility and ignored (the
+    adapter owns the profile)."""
+    return core_adapters.get_browser().browser(*args)
 
 
 def _evaluate(js: str) -> Any:
-    """Browser evaluate via _outreach_core.infer.oc_evaluate (no LLM)."""
-    return core_infer.oc_evaluate(js, profile=BROWSER_PROFILE)
+    """Browser evaluate via the active BrowserAdapter (no LLM)."""
+    return core_adapters.get_browser().evaluate(js)
 
 
 # ============================================================================
@@ -4691,7 +4703,7 @@ def _tab_isolation_enabled(config: dict[str, Any] | None) -> bool:
 def _open_tab(url: str) -> str | None:
     """Open url in a new tab; return its targetId (or None → caller falls back)."""
     try:
-        payload = core_infer.oc_browser_json("open", url)
+        payload = core_adapters.get_browser().browser_json("open", url)
         return core_tab_utils.target_id_from_open(payload)
     except Exception:  # noqa: BLE001
         return None
@@ -4725,7 +4737,7 @@ def _close_tab_safely(target_id: str | None) -> None:
 
 def _list_tabs_payload() -> Any:
     try:
-        return core_infer.oc_browser_json("tabs")
+        return core_adapters.get_browser().browser_json("tabs")
     except Exception:  # noqa: BLE001
         return None
 
