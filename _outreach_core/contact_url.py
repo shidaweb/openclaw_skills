@@ -97,6 +97,41 @@ _ERROR_PAGE_KW = (
     "server error",
 )
 
+# v25: email-verification-code (OTP) gate detection. Forms like フェリシモ
+# require "メールに確認コード(6桁)を送信→入力" before the message can be
+# submitted; the pipeline cannot receive that email, so the confirm step
+# silently resets and surfaces as "form disappeared". Detect the gate upfront.
+_OTP_TEXT_KW = (
+    "確認コード",
+    "認証コード",
+    "認証番号",
+    "確認番号",
+    "ワンタイムパスワード",
+    "ワンタイムコード",
+    "verification code",
+    "one-time password",
+    "one time password",
+    "コードを送信",
+    "コードをお送り",
+    "コードを入力",
+    "6ケタの数字",
+    "6桁の数字",
+    "6桁のコード",
+    "メールに記載されたコード",
+)
+_OTP_FIELD_KW = (
+    "確認コード",
+    "認証コード",
+    "認証番号",
+    "otp",
+    "verification_code",
+    "verificationcode",
+    "auth_code",
+    "authcode",
+    "onetime",
+    "one_time",
+)
+
 
 def registrable_domain(url_or_host: str) -> str:
     host = _host_only(url_or_host)
@@ -462,6 +497,43 @@ def is_error_page(snapshot: str | None, url: str | None = None, http_status: int
         if "inquiry" not in u and "contact" not in u:
             return True
     return False
+
+
+def detect_email_verification(
+    snapshot: str | None, fields: dict | None = None
+) -> dict[str, Any]:
+    """v25: detect an email-verification-code (OTP) gate on the current page.
+
+    Returns ``{"detected": bool, "evidence": [matched keywords / field names]}``.
+    Text evidence alone requires 2+ distinct keyword hits OR 1 keyword combined
+    with a mail-send phrase, to avoid false positives on pages that merely
+    mention 確認 in passing. A dedicated code input field counts as strong
+    evidence on its own.
+    """
+    evidence: list[str] = []
+    snap = snapshot or ""
+    text_hits = [k for k in _OTP_TEXT_KW if k in snap or k in snap.lower()]
+    evidence.extend(f"text:{k}" for k in text_hits)
+
+    field_hits: list[str] = []
+    f = fields if isinstance(fields, dict) else {}
+    for inp in f.get("inputs") or []:
+        if not isinstance(inp, dict):
+            continue
+        blob = " ".join(
+            str(inp.get(k) or "") for k in ("name", "label", "placeholder", "id")
+        ).lower()
+        if any(k in blob for k in _OTP_FIELD_KW):
+            field_hits.append(str(inp.get("name") or inp.get("label") or "code"))
+    evidence.extend(f"field:{n}" for n in field_hits)
+
+    send_phrase = any(
+        p in snap for p in ("送信します", "お送りします", "メールを送信", "メールでお送り")
+    )
+    detected = bool(field_hits) or len(text_hits) >= 2 or (
+        len(text_hits) == 1 and send_phrase
+    )
+    return {"detected": detected, "evidence": evidence[:8]}
 
 
 def classify_page_form_state(fields: dict | None, snapshot: str | None) -> dict:

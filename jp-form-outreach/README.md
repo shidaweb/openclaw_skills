@@ -146,6 +146,25 @@ python run.py send --ids 1,2,3 --no-confirm    # fill-only, manual click
 All `.jsonl` files are append-safe. To restart a stage, delete its
 output file.
 
+## v25: OTP検出・URLロック・決定の永続化（2026-06-12）
+
+フェリシモ事案（フォーム消失／IRフォーム誤着地／180s stall／再質問ループ）への対策:
+
+- **OTPゲート検出** — enrich/send 時に「確認コード(6桁)送信→入力」型のメール認証
+  フローを検知し、即 `status: manual` + `blocker: email_verification_code` で記録。
+  無駄な送信試行とリゾルバ再試行を行わない。
+- **`form_url_locked`** — ユーザー確認済みURLの自動差し替えを禁止。さらに送信時の
+  URLリカバリ先はフォーム種別を再分類し、IR/採用/ログイン等への誤着地を拒否。
+- **`pin-url` / `decisions`** — `run.py pin-url --brief <id> --id <target> --url <URL>
+  --note "..."` でURLを固定（targets.yaml と leads.jsonl に即反映、`--unlock` で解除）。
+  決定は `data/briefs/<brief>/decisions.jsonl` に永続化され、`run.py decisions` で参照
+  できる。Slackで合意済みの内容を別プロセスが再質問しないための共有記録。
+- **stdoutハートビート** — enrich/send/campaign/draft/resolve-queue 実行中は60秒毎に
+  生存ログを出力し、CLI watchdog の no-output stall (180s) を防止。stdout は行バッ
+  ファリングへ強制切替。
+
+| `data/decisions.jsonl` | pin-url 等 | ユーザー決定の追記ログ（再質問防止） |
+
 ## Differences vs linkedin-outreach
 
 | linkedin-outreach | jp-form-outreach |

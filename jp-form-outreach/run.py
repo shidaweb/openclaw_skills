@@ -527,6 +527,38 @@ def _emit_event(kind: str, *, stage: str, target_id: str | None = None, **kwargs
     ev.emit(kind, stage=stage, target_id=target_id, **kwargs)
 
 
+# ---------------------------------------------------------------------------
+# v25: stdout heartbeat — CLI gateway watchdog の no-output stall (180s) 対策。
+# ブラウザ操作・LLM待ちなどで長時間 stdout が無音になると watchdog がプロセスを
+# 殺すため、長時間コマンド実行中は定期的に生存ログを flush 付きで出力する。
+# ---------------------------------------------------------------------------
+_HB_STATE: dict[str, Any] = {"label": "", "t0": 0.0}
+
+
+def _hb_stage(label: str) -> None:
+    """現在の処理ステージをハートビート表示用に更新する。"""
+    _HB_STATE["label"] = label
+
+
+def _start_stdout_heartbeat(interval: float = 60.0) -> None:
+    """Daemon thread that prints a liveness line every ``interval`` seconds."""
+    import threading
+
+    if _HB_STATE.get("_started"):
+        return
+    _HB_STATE["_started"] = True
+    _HB_STATE["t0"] = time.time()
+
+    def _beat() -> None:
+        while True:
+            time.sleep(interval)
+            elapsed = int(time.time() - float(_HB_STATE.get("t0") or time.time()))
+            label = str(_HB_STATE.get("label") or "working")
+            print(f"[heartbeat] alive · {label} · elapsed={elapsed}s", flush=True)
+
+    threading.Thread(target=_beat, daemon=True, name="stdout-heartbeat").start()
+
+
 def _list_page_links() -> list[dict[str, str]]:
     res = _evaluate(_PAGE_LINKS_JS)
     return res if isinstance(res, list) else []
@@ -663,11 +695,20 @@ def _enrich_one_target(
     Appends exactly one row to ``enriched``. Exceptions are isolated by the
     caller so one bad site cannot kill the whole enrich batch.
     """
+    _hb_stage(f"enrich {t.get('name') or t.get('id')} ({i}/{total})")
     seed_urls = _seed_form_urls(t)
     if not seed_urls:
         print(f"[enrich] ({i}/{total}) {t.get('name')}: no form_url/contact_url_candidates, skipping")
         enriched.append({**t, "_enrich_skipped": "no form_url"})
         return {"outcome": "skipped"}
+
+    # v25: form_url_locked — ユーザー確認済みURLは唯一のseedとして扱い、
+    # 自動URL補正（候補巡回）を一切行わない。
+    url_locked = bool(t.get("form_url_locked")) and bool(str(t.get("form_url") or "").strip())
+    if url_locked:
+        seed_urls = [str(t.get("form_url")).strip()]
+        print(f"[enrich] ({i}/{total}) {t.get('name')}: form_url_locked — "
+              f"自動URL補正を無効化 ({seed_urls[0]})")
 
     if t.get("category") in ("b2c_only", "iframe", "site_closed"):
         cat = t.get("category")
@@ -781,6 +822,9 @@ def _enrich_one_target(
                 print(f"[enrich]    ✅ iframe form is the contact form -> {ifr_src}")
                 break
 
+        if url_locked:
+            # v25: ロック中は候補巡回しない — このseedの結果をそのまま採用判定へ。
+            break
         links = _list_page_links()
         candidates = _build_contact_candidates(t_work, seed_url, links)
         # v15 §F1: a 法人窓口 link spotted by the LLM jumps the queue.
@@ -845,6 +889,15 @@ def _enrich_one_target(
         if form_kind == "contact":
             break
 
+    if form_kind != "contact" and url_locked and not _form_fields_empty(fields):
+        # v25: ユーザー確認済みURLは分類器の判定より優先する（ただしフォーム
+        # 要素が実在する場合のみ）。誤分類でユーザー指定窓口を捨てない。
+        print(f"[enrich] ({i}/{total}) {t_work.get('name')}: "
+              f"分類={form_kind} だが form_url_locked のためユーザー確認済みURLを信頼")
+        chosen_url = chosen_url or seed_urls[0]
+        form_kind = "contact"
+        form_reason = "form_url_locked_user_confirmed"
+
     if form_kind != "contact" and best_known:
         chosen_url = str(best_known.get("url") or chosen_url)
         fields = dict(best_known.get("fields") or fields)
@@ -908,6 +961,33 @@ def _enrich_one_target(
             stage="enrich",
             target_id=str(t_work.get("id") or ""),
             payload={"kind": form_kind, "reason": reason, "correction_attempts": correction_attempts},
+        )
+        return {"outcome": "skipped"}
+
+    # v25: メール確認コード(OTP)ゲート検出 — フェリシモ型の「確認コード(6桁)を
+    # 送信→入力」フローはパイプラインでメールを受信できないため自動送信不可。
+    # 送信ステージで「フォーム消失」として失敗する前に、enrich 段階で manual 化。
+    otp = core_contact_url.detect_email_verification(snap, fields)
+    if otp.get("detected"):
+        reason = f"email_verification_required: {', '.join(otp.get('evidence') or [])}"
+        print(
+            f"[enrich] ({i}/{total}) {t_work.get('name')}: "
+            f"OTP/メール確認コード方式を検出 — 自動送信不可のため manual 判定 ({reason})"
+        )
+        enriched.append(
+            {
+                **t_work,
+                "status": "manual",
+                "blocker": "email_verification_code",
+                "_enrich_skipped": "email_verification_required",
+                "_enrich_skip_reason": reason,
+            }
+        )
+        _emit_event(
+            "enrich.form.email_verification_detected",
+            stage="enrich",
+            target_id=str(t_work.get("id") or ""),
+            payload={"evidence": otp.get("evidence"), "url": str(t_work.get("form_url") or "")[:200]},
         )
         return {"outcome": "skipped"}
 
@@ -4779,17 +4859,20 @@ def _assess_page_and_recover(
     """
     tid = str(d.get("id") or d.get("name") or "?")
 
-    def _scan() -> dict[str, Any]:
+    def _scan() -> tuple[dict[str, Any], dict[str, Any], str]:
         fields = _rescan_form_fields(d)
         text = _evaluate(_PAGE_TEXT_HEAD_JS)
-        return core_contact_url.classify_page_form_state(
-            fields, text if isinstance(text, str) else ""
+        text_s = text if isinstance(text, str) else ""
+        return (
+            core_contact_url.classify_page_form_state(fields, text_s),
+            fields if isinstance(fields, dict) else {},
+            text_s,
         )
 
-    state = _scan()
+    state, page_fields, page_text = _scan()
     if state.get("state") == "empty_render":
         time.sleep(3)
-        state = _scan()
+        state, page_fields, page_text = _scan()
     ok = state.get("state") in ("form_ok", "gate_like")
     core_timeline.add(
         timeline, "page_state", ok,
@@ -4799,7 +4882,32 @@ def _assess_page_and_recover(
         buttons=state.get("submit_buttons"),
     )
     if ok:
+        # v25: OTP gate — メール確認コード方式は記入前に検知して中断する。
+        # (確認コード未入力のまま進むと確認画面でリセット＝「フォーム消失」)
+        otp = core_contact_url.detect_email_verification(page_text, page_fields)
+        if otp.get("detected"):
+            core_timeline.add(
+                timeline, "otp_gate", False, evidence=otp.get("evidence"),
+            )
+            _emit_event(
+                "send.otp_gate_detected", stage="send", target_id=tid,
+                payload={"evidence": otp.get("evidence")}, trace_dir=trace,
+            )
+            print(f"  [send] ⚠ OTPゲート検出（メール確認コード方式）— 自動送信不可: "
+                  f"{', '.join(otp.get('evidence') or [])}")
+            return False, {**state, "state": "otp_gate"}
         return True, state
+
+    # v25: ユーザー確認済みURLはリカバリで勝手に差し替えない（フェリシモで
+    # IRフォームへ自動補正された事故の再発防止）。
+    if d.get("form_url_locked"):
+        core_timeline.add(timeline, "url_recovery", None, skipped="form_url_locked")
+        _emit_event(
+            "send.url_recovery_skipped_locked", stage="send", target_id=tid,
+            payload={"form_url": str(d.get("form_url") or "")[:200]}, trace_dir=trace,
+        )
+        print("  [send] ✗ URLリカバリ抑止: form_url_locked（ユーザー確認済みURLのため差し替え禁止）")
+        return False, state
 
     # Recovery hop: the page itself usually links to the real form.
     cur_url = str(_evaluate("() => location.href") or d.get("form_url") or "")
@@ -4809,17 +4917,39 @@ def _assess_page_and_recover(
         tried.append(cand)
         _evaluate(f"() => {{ location.href = {json.dumps(cand)}; return true; }}")
         time.sleep(2.5)
-        st2 = _scan()
+        st2, fields2, text2 = _scan()
         if st2.get("state") in ("form_ok", "gate_like"):
+            # v25: リカバリ先のフォーム種別を再分類し、IR/採用/ログイン等の
+            # 非contactフォームへの誤着地（フェリシモIRフォーム事故）を拒否。
+            kind2, reason2 = core_contact_url.classify_form_type(fields2, text2)
+            if kind2 not in ("contact", "unknown_no_textarea"):
+                _emit_event(
+                    "send.url_recovery_rejected", stage="send", target_id=tid,
+                    payload={"to": cand[:200], "kind": kind2, "reason": reason2},
+                    trace_dir=trace,
+                )
+                print(f"  [send] ✗ リカバリ先を不採用 (form_type={kind2}): {cand}")
+                continue
+            otp2 = core_contact_url.detect_email_verification(text2, fields2)
+            if otp2.get("detected"):
+                _emit_event(
+                    "send.url_recovery_rejected", stage="send", target_id=tid,
+                    payload={"to": cand[:200], "kind": "otp_gate",
+                             "evidence": otp2.get("evidence")},
+                    trace_dir=trace,
+                )
+                print(f"  [send] ✗ リカバリ先を不採用 (OTPゲート): {cand}")
+                continue
             old_url = d.get("form_url")
             d["form_url"] = cand
             _emit_event(
                 "send.url_recovered", stage="send", target_id=tid,
-                payload={"from": old_url, "to": cand, "state": st2.get("state")},
+                payload={"from": old_url, "to": cand, "state": st2.get("state"),
+                         "form_type": kind2},
                 trace_dir=trace,
             )
             core_timeline.add(timeline, "url_recovery", True, to=cand)
-            print(f"  [send] ✓ URLリカバリ: {old_url} → {cand}")
+            print(f"  [send] ✓ URLリカバリ: {old_url} → {cand} (form_type={kind2})")
             return True, st2
     core_timeline.add(
         timeline, "url_recovery", (False if cands else None),
@@ -5464,6 +5594,7 @@ def _send_one_target(
     company can no longer kill the whole batch.
     """
     name = d.get("name", "?")
+    _hb_stage(f"send {name} (#{idx})")
     body = d["draft"]["body"]
     form_url = d["form_url"]
     flow = d.get("flow") or (d.get("_llm_plan") or {}).get("next_step") or "single"
@@ -5699,6 +5830,14 @@ def _send_one_target(
     # Catches redirects, contact GUIDE pages, expired sessions — the production
     # cases that used to surface later as "送信ボタンが見つからない（候補0）".
     page_ok, page_state = _assess_page_and_recover(d, timeline, trace)
+    if not page_ok and page_state.get("state") == "otp_gate":
+        # v25: メール確認コード方式は人手でも回避不能（メール受信が必要）。
+        # リゾルバ再試行は無駄なので即スキップ＋manual 判定で記録する。
+        print("  [send] ⚠ OTP_GATE — メール確認コード方式のため自動送信不可 → skip (manual対応)")
+        d["status"] = "manual"
+        d["blocker"] = "email_verification_code"
+        _auto_skip_and_log(d, "email_verification_code: メール確認コード方式のため自動送信不可")
+        return {"outcome": "skipped", "reason": "otp_gate"}
     if not page_ok:
         print(f"  [send] ⚠ PAGE_HAS_NO_FORM — state={page_state.get('state')} "
               f"(inputs={page_state.get('inputs')}, buttons={page_state.get('submit_buttons')})")
@@ -6566,6 +6705,128 @@ def stage_mark_sent(input_path: Path, ids: set[int]) -> None:
 # CLI
 # ============================================================================
 
+# ---------------------------------------------------------------------------
+# v25: 決定の永続化 — Slack等でユーザーと合意した内容（確定フォームURL等）を
+# brief 単位で decisions.jsonl に記録し、別プロセス/再実行でも再質問しない。
+# ---------------------------------------------------------------------------
+def _decisions_path() -> Path:
+    return DATA_DIR / "decisions.jsonl"
+
+
+def record_decision(action: str, target_id: str, payload: dict[str, Any]) -> None:
+    rec = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "brief": BRIEF_ID,
+        "action": action,
+        "target_id": target_id,
+        **payload,
+    }
+    path = _decisions_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def _update_leads_jsonl(target_id: str, updates: dict[str, Any]) -> bool:
+    """leads.jsonl に pin-url の変更を即時反映する（再bootstrap不要にする）。"""
+    leads = DATA_DIR / "leads.jsonl"
+    if not leads.exists():
+        return False
+    rows: list[str] = []
+    hit = False
+    for line in leads.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            rows.append(line)
+            continue
+        if str(row.get("id")) == target_id:
+            row.update(updates)
+            hit = True
+        rows.append(json.dumps(row, ensure_ascii=False))
+    if hit:
+        leads.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    return hit
+
+
+def stage_pin_url(args: Any) -> None:
+    """ユーザー確認済みフォームURLをターゲットへ固定（form_url_locked）。"""
+    tp = _PATHS.targets_path if _PATHS else None
+    if not tp or not tp.exists():
+        print(f"[pin-url] targets file not found: {tp}", file=sys.stderr)
+        sys.exit(2)
+    if not args.unlock and not args.url:
+        print("[pin-url] --url が必要です（解除時のみ --unlock 単独可）", file=sys.stderr)
+        sys.exit(2)
+    raw = yaml.safe_load(tp.read_text()) or {}
+    companies = raw.get("companies") if isinstance(raw, dict) else None
+    if not isinstance(companies, list):
+        print("[pin-url] companies キーが見つかりません", file=sys.stderr)
+        sys.exit(2)
+    hit = next((c for c in companies if str(c.get("id")) == args.id), None)
+    if hit is None:
+        print(f"[pin-url] id={args.id} が targets に見つかりません", file=sys.stderr)
+        sys.exit(2)
+    old_url = str(hit.get("form_url") or "")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = tp.parent / f"{tp.stem}.backup.pin-url.{stamp}{tp.suffix}"
+    backup.write_text(tp.read_text())
+    if args.unlock:
+        hit["form_url_locked"] = False
+        updates: dict[str, Any] = {"form_url_locked": False}
+        action = "unpin_url"
+        print(f"[pin-url] {args.id}: ロック解除（自動URL補正を再許可）")
+    else:
+        hit["form_url"] = args.url
+        hit["form_url_locked"] = True
+        note_line = f"{datetime.now().date().isoformat()} pin-url: {args.url}"
+        if args.note:
+            note_line += f" — {args.note}"
+        prev = str(hit.get("notes") or "").strip()
+        hit["notes"] = (prev + "\n" if prev else "") + note_line
+        updates = {"form_url": args.url, "form_url_locked": True}
+        action = "pin_url"
+        print(f"[pin-url] {args.id}: form_url を固定")
+        print(f"  old: {old_url or '(なし)'}")
+        print(f"  new: {args.url} (locked)")
+    tp.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False))
+    print(f"  backup: {backup.name}")
+    if _update_leads_jsonl(args.id, updates):
+        print("  leads.jsonl にも反映済み（再bootstrap不要）")
+    record_decision(action, args.id, {
+        "url": args.url or "",
+        "old_url": old_url,
+        "note": args.note or "",
+        "source": "cli",
+    })
+    print(f"  decision を記録 -> {_decisions_path().name}")
+
+
+def stage_decisions(args: Any) -> None:
+    """記録済みユーザー決定の一覧表示。"""
+    path = _decisions_path()
+    if not path.exists():
+        print(f"[decisions] まだ決定記録がありません: {path}")
+        return
+    n = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if args.id and str(rec.get("target_id")) != args.id:
+            continue
+        n += 1
+        note = f" — {rec.get('note')}" if rec.get("note") else ""
+        print(f"  {rec.get('ts')} [{rec.get('action')}] {rec.get('target_id')}: "
+              f"{rec.get('url') or rec.get('old_url') or ''}{note}")
+    print(f"[decisions] {n} 件")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(prog="jp-form-outreach", description=__doc__)
     brief_parent = argparse.ArgumentParser(add_help=False)
@@ -6767,6 +7028,23 @@ def main() -> None:
     p.add_argument("--status", action="store_true",
                    help="Just show the queue summary, do not resolve")
 
+    p = sub.add_parser(
+        "pin-url",
+        parents=[brief_parent],
+        help="v25: ユーザー確認済みフォームURLを固定し自動URL補正を禁止 (form_url_locked)",
+    )
+    p.add_argument("--id", required=True, help="Target id (targets/<brief>.yaml の companies[].id)")
+    p.add_argument("--url", default="", help="確定フォームURL")
+    p.add_argument("--note", default="", help="決定メモ（Slackで合意した内容など）")
+    p.add_argument("--unlock", action="store_true", help="ロック解除（自動補正を再許可）")
+
+    p = sub.add_parser(
+        "decisions",
+        parents=[brief_parent],
+        help="v25: このbriefで記録されたユーザー決定 (decisions.jsonl) を表示",
+    )
+    p.add_argument("--id", default=None, help="Target id で絞り込み")
+
     args = ap.parse_args()
     import os
 
@@ -6780,6 +7058,18 @@ def main() -> None:
     except BriefError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(2)
+
+    # v25: パイプ接続時のブロックバッファリングで出力が滞留すると watchdog の
+    # no-output stall 判定を誘発するため、行バッファリングへ強制切替。
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+        sys.stderr.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - non-reconfigurable streams
+        pass
+    # v25: 長時間コマンドでは stdout ハートビートを常時出力（180s stall 対策）。
+    if args.cmd in ("enrich", "send", "campaign", "resolve-queue", "draft"):
+        _hb_stage(f"{args.cmd} 起動")
+        _start_stdout_heartbeat(interval=60.0)
 
     if args.cmd == "bootstrap":
         only_ids = [x.strip() for x in args.only.split(",")] if args.only else None
@@ -6940,6 +7230,10 @@ def main() -> None:
             except FileNotFoundError:
                 cfg = {}
             stage_resolve_queue(cfg)
+    elif args.cmd == "pin-url":
+        stage_pin_url(args)
+    elif args.cmd == "decisions":
+        stage_decisions(args)
     elif args.cmd == "autonomy-status":
         try:
             cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
