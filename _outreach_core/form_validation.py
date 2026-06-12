@@ -178,12 +178,41 @@ def _split_kana(full: str, sender: dict[str, Any], part: str, kind: str) -> str:
     return (full[:2] if part == "sei" else full[2:]) or full
 
 
+_COMPANY_LABEL_RE = re.compile(
+    r"(会社名|法人名|団体名|企業名|店舗名|貴社名|御社名|会社\(名\)|company)",
+    re.IGNORECASE,
+)
+
+
+def is_company_label(label: str | None) -> bool:
+    """Whether the label denotes a company-name kana field (not a personal name)."""
+    if not label:
+        return False
+    return bool(_COMPANY_LABEL_RE.search(label))
+
+
 def furigana_value_for_label(label: str | None, sender: dict[str, Any]) -> str | None:
     """The correct kana string to put in a furigana field, honoring the label's
-    script (katakana/hiragana) and sei/mei split. ``None`` if not a kana field."""
+    script (katakana/hiragana) and sei/mei split. ``None`` if not a kana field.
+
+    Company-name kana fields (会社名（フリガナ）/法人名カナ etc.) are routed to
+    ``sender.company_kana`` / ``sender.company_furigana`` instead of the personal
+    name reading; without this routing the kana-guard would overwrite the
+    company-kana field with the担当者のカナ.
+    """
     kind = expected_kana_kind(label)
     if not kind:
         return None
+    if is_company_label(label):
+        if kind == "katakana":
+            val = str(sender.get("company_kana") or "")
+            if not val and sender.get("company_furigana"):
+                val = hiragana_to_katakana(str(sender["company_furigana"]))
+        else:
+            val = str(sender.get("company_furigana") or "")
+            if not val and sender.get("company_kana"):
+                val = katakana_to_hiragana(str(sender["company_kana"]))
+        return val or None
     if kind == "katakana":
         full = str(sender.get("name_kana") or "")
         if not full and sender.get("name_furigana"):
@@ -220,6 +249,11 @@ def kana_field_correction(
     if not expected:
         return None
     v = (value or "").strip()
+    # Company-name kana field: we know the canonical value — always enforce it,
+    # even when the current value is otherwise valid kana (e.g. シダノリミツ from
+    # an earlier mis-fill).
+    if is_company_label(label):
+        return expected if v != expected else None
     part = name_part(label)
     if part in ("sei", "mei"):
         return expected if v != expected else None
