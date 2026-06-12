@@ -70,7 +70,11 @@ class TestSendPerLeadIsolation(unittest.TestCase):
     def _stage_send(self, tmp: Path, drafts: Path, send_one, ids=None):
         m = self.run_mod
         _FakeHeartbeat.instances = []
-        with patch.object(m, "DATA_DIR", tmp), \
+        # v20 primary-host guard must not depend on THIS machine's hostname /
+        # data/primary_host — patch it open so the tests run on any host.
+        from _outreach_core import host_role
+        with patch.object(host_role, "is_send_allowed", return_value=(True, "test")), \
+             patch.object(m, "DATA_DIR", tmp), \
              patch.object(m, "load_sent_set", return_value=set()), \
              patch.object(m, "HeartbeatSession", _FakeHeartbeat), \
              patch.object(m, "_send_one_target", side_effect=send_one), \
@@ -119,7 +123,9 @@ class TestSendPerLeadIsolation(unittest.TestCase):
                 def tick(self, n, *a, **k):
                     raise RuntimeError("slack down")
 
-            with patch.object(m, "DATA_DIR", tmp), \
+            from _outreach_core import host_role
+            with patch.object(host_role, "is_send_allowed", return_value=(True, "test")), \
+                 patch.object(m, "DATA_DIR", tmp), \
                  patch.object(m, "load_sent_set", return_value=set()), \
                  patch.object(m, "HeartbeatSession", _ExplodingHb), \
                  patch.object(m, "_send_one_target", return_value={"outcome": "done"}), \
