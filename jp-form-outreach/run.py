@@ -396,15 +396,53 @@ _FORM_FIELDS_JS = r"""
 
   const labelFor = (el) => {
     if (el.id) {
-      const lbl = document.querySelector(`label[for="${el.id}"]`);
-      if (lbl) return lbl.textContent.trim();
+      try {
+        const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+        if (lbl) return lbl.textContent.trim();
+      } catch (e) {}
     }
     const wrap = el.closest('label');
     if (wrap) return wrap.textContent.trim();
+    const aria = el.getAttribute && el.getAttribute('aria-label');
+    if (aria) return aria.trim();
+    {
+      let sib = el.previousSibling;
+      while (sib) {
+        if (sib.nodeType === 3) {
+          const txt = sib.textContent.trim();
+          if (txt && txt !== '-' && txt !== '−' && txt !== 'ー' && txt !== '/' && txt !== '／') {
+            return txt;
+          }
+        } else if (sib.nodeType === 1) {
+          const tag = sib.tagName;
+          if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'BUTTON') break;
+          if (tag !== 'BR') {
+            const txt = (sib.textContent || '').trim();
+            if (txt) return txt;
+          }
+        }
+        sib = sib.previousSibling;
+      }
+    }
+    const row = el.closest('tr, .form-row, .field, .input, .item, dl');
+    if (row) {
+      const lbl = row.querySelector('th, label, .label, [class*="label" i], strong, dt, .title');
+      if (lbl && !lbl.contains(el)) return lbl.textContent.trim();
+    }
+    const tr = el.closest('tr');
+    if (tr) {
+      let prev = tr.previousElementSibling;
+      for (let i = 0; prev && i < 3; i++) {
+        if (prev.querySelector('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="image"]), textarea, select')) break;
+        const txt = (prev.textContent || '').replace(/\s+/g, ' ').trim();
+        if (txt) return txt;
+        prev = prev.previousElementSibling;
+      }
+    }
     // Walk up the DOM looking for a sibling/preceding label-ish element
     let cur = el.parentElement;
     for (let i = 0; i < 4 && cur; i++, cur = cur.parentElement) {
-      const lbl = cur.querySelector('label, .label, [class*="label" i]');
+      const lbl = cur.querySelector('label, .label, [class*="label" i], strong, th, dt');
       if (lbl && lbl !== el) return lbl.textContent.trim();
     }
     return null;
@@ -1813,6 +1851,18 @@ SENDER_FIELD_PATTERNS = {
     "name_furigana_sei": [r"^せい$", r"姓.{0,6}ふりがな", r"ふりがな.{0,6}姓"],
     "name_furigana_mei": [r"^めい$", r"[（(]名[)）].{0,6}ふりがな", r"ふりがな.{0,6}[（(]名[)）]"],
     "company": [r"会社名", r"法人名", r"団体名", r"貴社", r"御社", r"company"],
+    "company_kana": [
+        r"会社名.{0,6}(フリガナ|カナ)",
+        r"法人名.{0,6}(フリガナ|カナ)",
+        r"(フリガナ|カナ).{0,6}会社",
+        r"company.{0,8}(kana|katakana)",
+    ],
+    "company_furigana": [
+        r"会社名.{0,6}ふりがな",
+        r"法人名.{0,6}ふりがな",
+        r"ふりがな.{0,6}会社",
+        r"company.{0,8}(furigana|hiragana)",
+    ],
     "role": [r"役職", r"部署", r"position", r"title"],
     "email": [r"メール", r"e-?mail"],
     "email_confirm": [r"確認", r"再入力", r"confirm"],
@@ -1841,15 +1891,56 @@ _FILL_FIELD_BY_LABEL_JS = r"""
   };
   const labelFor = (el) => {
     if (el.id) {
-      const l = document.querySelector(`label[for="${el.id}"]`);
-      if (l) return (l.textContent || '').trim();
+      try {
+        const l = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+        if (l) return (l.textContent || '').trim();
+      } catch (e) {}
     }
     const wrap = el.closest('label');
     if (wrap) return (wrap.textContent || '').trim();
+    const aria = el.getAttribute && el.getAttribute('aria-label');
+    if (aria) return aria.trim();
+    // Inline preceding text within the same parent — handles 「姓 [input] 名 [input]」
+    {
+      let sib = el.previousSibling;
+      while (sib) {
+        if (sib.nodeType === 3) {
+          const txt = sib.textContent.trim();
+          if (txt && txt !== '-' && txt !== '−' && txt !== 'ー' && txt !== '/' && txt !== '／') {
+            return txt;
+          }
+        } else if (sib.nodeType === 1) {
+          const tag = sib.tagName;
+          if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'BUTTON') break;
+          if (tag !== 'BR') {
+            const txt = (sib.textContent || '').trim();
+            if (txt) return txt;
+          }
+        }
+        sib = sib.previousSibling;
+      }
+    }
+    // Same-row label (th, strong, label, dt inside the row)
+    const row = el.closest('tr, .form-row, .field, .input, .item, dl');
+    if (row) {
+      const l = row.querySelector('th, label, .label, [class*="label" i], strong, dt, .title');
+      if (l && !l.contains(el)) return (l.textContent || '').trim();
+    }
+    // Preceding-sibling <tr> with label-only content (Onward-style)
+    const tr = el.closest('tr');
+    if (tr) {
+      let prev = tr.previousElementSibling;
+      for (let i = 0; prev && i < 3; i++) {
+        if (prev.querySelector('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="image"]), textarea, select')) break;
+        const txt = (prev.textContent || '').replace(/\s+/g, ' ').trim();
+        if (txt) return txt;
+        prev = prev.previousElementSibling;
+      }
+    }
     let cur = el.parentElement;
     for (let i = 0; i < 4 && cur; i++, cur = cur.parentElement) {
-      const l = cur.querySelector('label, .label');
-      if (l) return (l.textContent || '').trim();
+      const l = cur.querySelector('label, .label, [class*="label" i], strong, th, dt');
+      if (l && !l.contains(el)) return (l.textContent || '').trim();
     }
     return el.placeholder || el.name || '';
   };
@@ -2229,14 +2320,52 @@ _READ_TEXT_FIELDS_JS = r"""
 () => {
   const labelFor = (el) => {
     if (el.id) {
-      const l = document.querySelector(`label[for="${el.id}"]`);
-      if (l) return (l.textContent || '').trim();
+      try {
+        const l = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+        if (l) return (l.textContent || '').trim();
+      } catch (e) {}
     }
     const wrap = el.closest('label');
     if (wrap) return (wrap.textContent || '').trim();
+    const aria = el.getAttribute && el.getAttribute('aria-label');
+    if (aria) return aria.trim();
+    {
+      let sib = el.previousSibling;
+      while (sib) {
+        if (sib.nodeType === 3) {
+          const txt = sib.textContent.trim();
+          if (txt && txt !== '-' && txt !== '−' && txt !== 'ー' && txt !== '/' && txt !== '／') {
+            return txt;
+          }
+        } else if (sib.nodeType === 1) {
+          const tag = sib.tagName;
+          if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'BUTTON') break;
+          if (tag !== 'BR') {
+            const txt = (sib.textContent || '').trim();
+            if (txt) return txt;
+          }
+        }
+        sib = sib.previousSibling;
+      }
+    }
+    const row = el.closest('tr, .form-row, .field, .input, .item, dl');
+    if (row) {
+      const l = row.querySelector('th, label, .label, [class*="label" i], strong, dt, .title');
+      if (l && !l.contains(el)) return (l.textContent || '').trim();
+    }
+    const tr = el.closest('tr');
+    if (tr) {
+      let prev = tr.previousElementSibling;
+      for (let i = 0; prev && i < 3; i++) {
+        if (prev.querySelector('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="image"]), textarea, select')) break;
+        const txt = (prev.textContent || '').replace(/\s+/g, ' ').trim();
+        if (txt) return txt;
+        prev = prev.previousElementSibling;
+      }
+    }
     let cur = el.parentElement;
     for (let i = 0; i < 4 && cur; i++, cur = cur.parentElement) {
-      const l = cur.querySelector('label, .label, [class*="label" i]');
+      const l = cur.querySelector('label, .label, [class*="label" i], strong, th, dt');
       if (l && l !== el) return (l.textContent || '').trim();
     }
     return el.placeholder || el.name || '';
@@ -4420,6 +4549,10 @@ def _heuristic_fill_fallback(target: dict[str, Any], config: dict[str, Any],
         ("name_furigana_mei", name_parts["name_furigana_mei"], SENDER_FIELD_PATTERNS["name_furigana_mei"]),
         ("name_kana_sei", name_parts["name_kana_sei"], SENDER_FIELD_PATTERNS["name_kana_sei"]),
         ("name_kana_mei", name_parts["name_kana_mei"], SENDER_FIELD_PATTERNS["name_kana_mei"]),
+        # Company-kana / company-furigana BEFORE bare 「フリガナ」 patterns so
+        # 「会社名（フリガナ）」 fields are taken by company_kana, not name_kana.
+        ("company_kana", sender.get("company_kana", ""), SENDER_FIELD_PATTERNS["company_kana"]),
+        ("company_furigana", sender.get("company_furigana", ""), SENDER_FIELD_PATTERNS["company_furigana"]),
         # Full kana fields before kanji fulls (お名前（フリガナ） must get kana)
         ("name_kana", sender["name_kana"], SENDER_FIELD_PATTERNS["name_kana"]),
         ("name_furigana", sender["name_furigana"], SENDER_FIELD_PATTERNS["name_furigana"]),
@@ -4440,6 +4573,8 @@ def _heuristic_fill_fallback(target: dict[str, Any], config: dict[str, Any],
         ("address_full", sender_full_address, SENDER_FIELD_PATTERNS["address_full"]),
     ]
     for kind, value, patterns in fills:
+        if not value:
+            continue
         res = _fill_field(kind, value, patterns)
         if res and res.get("filled"):
             diagnostics["filled"].append(f"{kind}={value[:30]} (label={res.get('label')})")
