@@ -2506,6 +2506,66 @@ def _apply_fill_guardrails(
     return summary
 
 
+# Phone-ish inputs with their CURRENT values — for hyphen-format toggling when
+# the page complains 「電話番号を正しく入力してください」 (petline class, v25).
+_PHONE_INPUTS_JS = r"""
+(() => {
+  const out = [];
+  const phoneRe = /(電話|tel|phone|携帯|連絡先番号)/i;
+  for (const el of document.querySelectorAll('input')) {
+    const t = (el.type || '').toLowerCase();
+    if (['hidden','submit','button','image','checkbox','radio','file'].includes(t)) continue;
+    const name = el.name || el.id || '';
+    let lbl = '';
+    if (el.id) {
+      try {
+        const l = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+        if (l) lbl = l.textContent || '';
+      } catch (e) {}
+    }
+    const blob = `${name} ${el.placeholder || ''} ${lbl}`;
+    if (t === 'tel' || phoneRe.test(blob)) {
+      out.push({ name: name, value: String(el.value || '') });
+    }
+  }
+  return out;
+})()
+"""
+
+
+def _fix_phone_format_errors(errors: list[dict[str, Any]]) -> list[str]:
+    """Toggle hyphen format on phone inputs when a format error names them.
+
+    Returns diagnostics entries for every field rewritten. Never raises.
+    """
+    from _outreach_core import form_validation as fv
+
+    try:
+        if not any(
+            e.get("kind") == "format" and fv.is_phone_field_label(e.get("field"))
+            for e in errors
+        ):
+            return []
+        rows = _evaluate(_PHONE_INPUTS_JS)
+        fixed: list[str] = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name") or "").strip()
+            cur = str(row.get("value") or "").strip()
+            if not name or not cur:
+                continue
+            new = fv.toggle_phone_hyphens(cur)
+            if new == cur:
+                continue
+            out = _apply_field_action(name, "set_text", new)
+            if out and out.get("ok"):
+                fixed.append(f"phone_format:{name[:24]}={new}")
+        return fixed
+    except Exception:  # noqa: BLE001 — recovery must not abort the send loop
+        return []
+
+
 def _harvest_and_fix_validation_errors(
     target: dict[str, Any],
     config: dict[str, Any],
@@ -2543,8 +2603,14 @@ def _harvest_and_fix_validation_errors(
     sender = config.get("sender", {}) or {}
     diagnostics: dict[str, Any] = {"filled": [], "warnings": []}
     summary = _apply_fill_guardrails(target, sender, body, diagnostics)
-    fixed = len(summary.get("kana_fixed") or []) + (1 if summary.get("subject_filled") else 0)
+    phone_fixed = _fix_phone_format_errors(errors)
+    fixed = (
+        len(summary.get("kana_fixed") or [])
+        + (1 if summary.get("subject_filled") else 0)
+        + len(phone_fixed)
+    )
     out["fixed"] = fixed
+    out["phone_fixed"] = phone_fixed
     # Recoverable if we fixed something, or if all errors are kinds our guardrails
     # target (format on a kana field / a required subject). Even with fixed==0 the
     # caller may still benefit from re-clicking once after a generic re-fill.
@@ -2560,6 +2626,7 @@ def _harvest_and_fix_validation_errors(
                     "fixed": fixed,
                     "kana_fixed": (summary.get("kana_fixed") or [])[:6],
                     "subject_filled": summary.get("subject_filled"),
+                    "phone_fixed": phone_fixed[:4],
                 },
                 trace_dir=trace_dir,
             )
@@ -2635,11 +2702,20 @@ def _set_sender_ctx(config: dict[str, Any] | None) -> None:
     _SENDER_CTX = dict((config or {}).get("sender") or {})
 
 
-def _auto_select_submit_radios() -> dict[str, Any]:
-    """Select likely radio gates (法人/提案系/その他) to unblock submit."""
+def _auto_select_submit_radios(aggressive: bool = False) -> dict[str, Any]:
+    """Select likely radio gates (法人/提案系/その他) to unblock submit.
+
+    ``aggressive=True`` (validation_error recovery): answer EVERY unselected
+    group — the page itself has said a selection is missing, so the
+    required-attribute / known-label gating no longer applies (kakuyasu class:
+    visual 必須 mark without a DOM required attribute → gate scan saw nothing).
+    """
     res = _evaluate(_LIST_RADIO_GATES_JS)
     groups = res if isinstance(res, list) else []
-    actions = core_submit_progress.pick_radio_gate_actions(groups, sender=_SENDER_CTX)
+    if aggressive:
+        actions = core_submit_progress.pick_validation_radio_actions(groups, sender=_SENDER_CTX)
+    else:
+        actions = core_submit_progress.pick_radio_gate_actions(groups, sender=_SENDER_CTX)
     selected_count = 0
     selected_items: list[str] = []
     for act in actions:
@@ -5391,8 +5467,18 @@ def _read_dialog_log() -> list[dict[str, Any]]:
 def _observe_send_state(sender: dict[str, Any], body: str) -> dict[str, Any]:
     """One evaluate round-trip → classified live page state (see send_state)."""
     probes = core_send_state.build_probes(sender, body)
-    raw = _evaluate(core_send_state.evidence_js(probes))
-    return core_send_state.classify_send_state(raw if isinstance(raw, dict) else {})
+    js = core_send_state.evidence_js(probes)
+    raw = _evaluate(js)
+    if not isinstance(raw, dict):
+        # Transient: the page may be mid-navigation when we probe. One retry —
+        # a FAILED observation must not masquerade as state=no_form, which the
+        # loop would escalate as lost_form (v25).
+        time.sleep(2.5)
+        raw = _evaluate(js)
+    obs = core_send_state.classify_send_state(raw if isinstance(raw, dict) else {})
+    if not isinstance(raw, dict):
+        obs["observe_failed"] = True
+    return obs
 
 
 _FIRST_CLICK_PATTERNS = [
@@ -5604,9 +5690,15 @@ def _submission_loop(
                 round=validation_rounds, fixed=vfix.get("fixed"),
             )
             # Beyond kana/subject guardrails, retry the generic gate auto-fill —
-            # dynamically-revealed required selects/radios live here.
+            # dynamically-revealed required selects/radios live here. Radios run
+            # AGGRESSIVE here (v25): the validation bounce itself is the evidence
+            # that an unselected group is required, even without a DOM required
+            # attribute or a known label (kakuyasu 「酒屋はありますか？」 class).
             _auto_check_submit_gates()
-            _auto_select_submit_radios()
+            radio_rescue = _auto_select_submit_radios(aggressive=True)
+            if radio_rescue.get("selected_count"):
+                print(f"  [send] validation radio rescue: "
+                      f"{', '.join(radio_rescue.get('selected_items') or [])[:120]}")
             _auto_select_submit_selects()
             if validation_rounds > 2:
                 return _result(
@@ -5617,6 +5709,15 @@ def _submission_loop(
             phase = "first" if (flow == "confirm" and obs.get("visible_textareas")) else "final"
         elif state == "confirm":
             phase = "final"
+            # Empty-echo guard (v25, baycrews class): a confirm page that echoes
+            # NONE of our probe values means the form data did not survive the
+            # POST (JS-state form, session loss). Clicking final here would send
+            # an EMPTY inquiry — escalate instead.
+            if (
+                int(obs.get("probe_text_hits") or 0) == 0
+                and int(obs.get("probe_field_hits") or 0) == 0
+            ):
+                return _result("confirm_empty_echo", obs)
             if not confirm_seen:
                 confirm_seen = True
                 _emit_event(
@@ -6211,6 +6312,21 @@ def _send_one_target(
                 trace=trace, autonomous=autonomous, tab_id=cur_tab_id,
             )
             _close_journal("no_click" if int(subres.get("clicks") or 0) == 0 else "not_confirmed")
+            return {"outcome": "skipped"}
+
+        if status == "confirm_empty_echo":
+            print("  [send] ⚠ confirm page reached but our values are NOT echoed "
+                  "— possible empty submission, escalating (no final click)")
+            core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_WRONG_FORM)
+            _queue_for_resolver(
+                d, "confirm_empty_echo",
+                (
+                    "確認ページに入力値が反映されていません（空送信の恐れがあるため"
+                    f"最終送信せず退避; url={sub_obs.get('url', '')}）"
+                ),
+                trace=trace, autonomous=autonomous, tab_id=cur_tab_id,
+            )
+            _close_journal("not_confirmed")
             return {"outcome": "skipped"}
 
         # too_deep — still an input step after the click cap (§S1 successor).

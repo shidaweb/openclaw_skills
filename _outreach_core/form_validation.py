@@ -310,6 +310,12 @@ def derive_subject(draft: dict[str, Any] | None, fallback: str = "サービス�
 _QUOTE_CHARS = "「」『』\"”“'’｢｣【】［］[]<>＜＞"
 
 _ERR_FORMAT_RE = re.compile(r"(?P<f>.+?)\s*(?:の|が)?\s*形式が正しくありません")
+# 「電話番号を正しく入力してください」 (petline 2026-06-12) — a FORMAT complaint,
+# not a required-field one. Must be tried before _ERR_REQUIRED_RE, which would
+# otherwise mis-capture 「電話番号を正しく」 as a required field name.
+_ERR_FORMAT2_RE = re.compile(
+    r"(?P<f>.+?)\s*(?:を|は|の|が)?\s*正しく\s*(?:ご)?(?:入力|記入|指定)"
+)
 _ERR_REQUIRED_RE = re.compile(
     r"(?P<f>.+?)\s*(?:を|は|の|が)?\s*(?:ご)?(?:入力|選択|指定|記入|チェック)し(?:て(?:ください)?)?"
 )
@@ -335,7 +341,7 @@ def parse_validation_errors(text: str | None) -> list[dict[str, str]]:
         line = line.strip()
         if not line:
             continue
-        m = _ERR_FORMAT_RE.search(line)
+        m = _ERR_FORMAT_RE.search(line) or _ERR_FORMAT2_RE.search(line)
         if m:
             field = _clean_field(m.group("f"))
             key = (field, "format")
@@ -355,6 +361,35 @@ def parse_validation_errors(text: str | None) -> list[dict[str, str]]:
 
 def has_validation_errors(text: str | None) -> bool:
     return bool(parse_validation_errors(text))
+
+
+_PHONE_FIELD_RE = re.compile(r"(電話|TEL|tel|phone|携帯|連絡先番号)", re.IGNORECASE)
+
+
+def is_phone_field_label(label: str | None) -> bool:
+    return bool(_PHONE_FIELD_RE.search((label or "").strip()))
+
+
+def toggle_phone_hyphens(value: str | None) -> str:
+    """Flip a JP phone number between hyphenated and digits-only form.
+
+    Sites disagree on format — petline demands ハイフンなし while others demand
+    ハイフンあり — and both forms are valid representations of the sender's own
+    number, so toggling is always content-preserving. Hyphenated → digits only;
+    digits only → 3-4-4 (11 digits, mobile/0120…) or 2-4-4 (10 digits). Values
+    that don't look like a JP phone number are returned unchanged.
+    """
+    v = (value or "").strip()
+    if not v:
+        return v
+    digits = re.sub(r"[-‐－ー\s().（）]", "", v)
+    if not digits.isdigit() or not 10 <= len(digits) <= 11:
+        return v
+    if digits != v:  # had separators → strip them
+        return digits
+    if len(digits) == 11:  # 090-1234-5678 / 0120-345-678 style → 3-4-4
+        return f"{digits[:3]}-{digits[3:7]}-{digits[7:]}"
+    return f"{digits[:2]}-{digits[2:6]}-{digits[6:]}"  # 10 digits → 2-4-4
 
 
 # --- v15 §S2: special field value helpers ------------------------------------

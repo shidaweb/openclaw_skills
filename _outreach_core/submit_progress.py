@@ -64,13 +64,16 @@ _CONFIRM_PRE_RE = re.compile(
     r"確認の上|間違いがなけれ|問題なけれ)",
 )
 _CONFIRM_SEND_RE = re.compile(
-    r"(送信|送信ボタン|お送り|送付|確定|完了)\s*(ボタン)?\s*"
+    r"(送信|送信ボタン|お送り|送付|確定|完了)(する)?[」』]?\s*(ボタン)?\s*"
     r"(を|に)?\s*(押して|押下|クリック|タップ|してください|して下さい|"
     r"ください|下さい|お願い|送信)",
 )
 # A bare imperative "送信ボタンを押してください" without the 内容 preamble.
+# (する)?[」』]? tolerates quoted button-label citations — 「この内容で送信する」
+# ボタンを押してください (baycrews 2026-06-12) — where the verb and ボタン are
+# separated by する and a closing quote.
 _CLICK_SEND_RE = re.compile(
-    r"(送信|確定|完了)(ボタン)?(を)?(押して|押下|クリックして|タップして)",
+    r"(送信|確定|完了)(する)?[」』]?(ボタン)?(を)?(押して|押下|クリックして|タップして)",
 )
 
 
@@ -229,6 +232,70 @@ def _pick_radio_option(options: list[dict[str, Any]]) -> str | None:
     if not choice:
         return None
     return choice
+
+
+# Validation-rescue option preference: when the page has ALREADY bounced us
+# with 「選択してください」, an unanswered radio group must get SOME answer.
+# Prefer neutral/negative options (no false claims like 取引実績あり or
+# メルマガ希望); fall back to the first enabled option.
+_NEUTRAL_OPTION_RE = re.compile(
+    r"(その他|該当しない|該当なし|未定|検討中|特になし|^ない$|^無し$|^なし$|いいえ|希望しない)",
+)
+
+
+def pick_validation_radio_actions(
+    groups: list[dict[str, Any]] | None,
+    sender: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
+    """Aggressive radio rescue for the validation_error state (kakuyasu class).
+
+    Unlike :func:`pick_radio_gate_actions`, this targets EVERY unselected
+    group — the page's own validation error is the evidence that a selection
+    is missing, so required-attribute / known-label gating no longer applies.
+    Choice order: label-aware chooser → B2B preference → neutral/negative
+    option → first enabled non-placeholder option.
+    """
+    from _outreach_core import form_validation as fv  # lazy: avoid import cycle
+
+    if not isinstance(groups, list):
+        return []
+    actions: list[dict[str, str]] = []
+    for g in groups:
+        if not isinstance(g, dict):
+            continue
+        name = str(g.get("name") or "").strip()
+        if not name or bool(g.get("selected")):
+            continue
+        label = str(g.get("label") or "")
+        options = g.get("options") or []
+        labelled = fv.choose_option_for_label(label, options, sender)
+        choice = str((labelled or {}).get("value") or "").strip() or _pick_radio_option(options)
+        if not choice:
+            normalized = _normalize_options(options)
+            neutral = None
+            first_ok = None
+            for opt in normalized:
+                if bool(opt.get("selected")) or bool(opt.get("disabled")):
+                    continue
+                if _is_placeholder_option(opt):
+                    continue
+                olabel = str(opt.get("label") or "").strip()
+                ovalue = str(opt.get("value") or "").strip()
+                if not olabel and not ovalue:
+                    continue
+                if first_ok is None:
+                    first_ok = opt
+                if neutral is None and (
+                    _NEUTRAL_OPTION_RE.search(olabel) or _NEUTRAL_OPTION_RE.search(ovalue)
+                ):
+                    neutral = opt
+            picked = neutral or first_ok
+            if picked:
+                choice = str(picked.get("label") or picked.get("value") or "").strip()
+        if not choice:
+            continue
+        actions.append({"name": name, "value": choice})
+    return actions
 
 
 def is_inquiry_type_field(field: dict[str, Any] | None) -> bool:
