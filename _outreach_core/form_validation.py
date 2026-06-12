@@ -320,6 +320,12 @@ _ERR_REQUIRED_RE = re.compile(
     r"(?P<f>.+?)\s*(?:を|は|の|が)?\s*(?:ご)?(?:入力|選択|指定|記入|チェック)し(?:て(?:ください)?)?"
 )
 _ERR_REQUIRED2_RE = re.compile(r"(?P<f>.+?)\s*は\s*必須")
+# 「住所（番地）は全角で入力してください」 (wacoal 2026-06-13) — a zenkaku-format
+# bounce. Checked before _ERR_REQUIRED_RE, which would swallow it as required.
+# Bare parenthesized hints 「（全角で入力してください）」 (petline static text)
+# yield a junk 1-char field and are filtered by the length guard below.
+_ERR_ZENKAKU_RE = re.compile(r"(?P<f>.+?)\s*(?:は|を)?\s*全角で(?:ご)?(?:入力|記入)")
+_JP_WORD_RE = re.compile(r"[ぁ-んァ-ヶ一-龠a-zA-Z0-9]")
 
 
 def _clean_field(raw: str) -> str:
@@ -349,6 +355,16 @@ def parse_validation_errors(text: str | None) -> list[dict[str, str]]:
                 seen.add(key)
                 out.append({"field": field, "kind": "format", "raw": line})
             continue
+        m = _ERR_ZENKAKU_RE.search(line)
+        if m:
+            field = _clean_field(m.group("f"))
+            # length/content guard: drop bare hints like 「（全角で入力してください）」
+            if len(field) >= 2 and _JP_WORD_RE.search(field):
+                key = (field, "zenkaku")
+                if key not in seen:
+                    seen.add(key)
+                    out.append({"field": field, "kind": "zenkaku", "raw": line})
+            continue
         m = _ERR_REQUIRED_RE.search(line) or _ERR_REQUIRED2_RE.search(line)
         if m:
             field = _clean_field(m.group("f"))
@@ -361,6 +377,25 @@ def parse_validation_errors(text: str | None) -> list[dict[str, str]]:
 
 def has_validation_errors(text: str | None) -> bool:
     return bool(parse_validation_errors(text))
+
+
+def to_zenkaku(value: str | None) -> str:
+    """Convert ASCII chars (digits, letters, symbols, space) to full-width.
+
+    For 「全角で入力してください」 bounces (wacoal 番地/建物名 class). Non-ASCII
+    chars (kana/kanji, existing full-width) pass through unchanged, so the
+    conversion is idempotent and safe to apply to mixed strings.
+    """
+    out: list[str] = []
+    for ch in value or "":
+        o = ord(ch)
+        if o == 0x20:
+            out.append("　")
+        elif 0x21 <= o <= 0x7E:
+            out.append(chr(o + 0xFEE0))
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 _PHONE_FIELD_RE = re.compile(r"(電話|TEL|tel|phone|携帯|連絡先番号)", re.IGNORECASE)

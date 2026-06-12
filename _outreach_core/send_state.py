@@ -46,8 +46,26 @@ DIALOG_AUTOACCEPT_JS = r"""
       window.__ocDialogLog.push({ kind, msg: String(msg == null ? '' : msg).slice(0, 200) });
     } catch (e) {}
   };
-  window.confirm = (msg) => { log('confirm', msg); return true; };
-  window.alert = (msg) => { log('alert', msg); };
+  const isNative = (fn) => {
+    try { return /\[native code\]/.test(Function.prototype.toString.call(fn)); }
+    catch (e) { return false; }
+  };
+  // Some JP sites define their OWN global confirm(form) that validates and
+  // SUBMITS the form (maruman 2026-06-13: confirm received an HTMLFormElement).
+  // Clobbering it silently breaks their submit — only replace the NATIVE
+  // blocking dialog; wrap and DELEGATE a page-defined one.
+  if (isNative(window.confirm)) {
+    window.confirm = (msg) => { log('confirm', msg); return true; };
+  } else {
+    const orig = window.confirm;
+    window.confirm = function (...a) { log('confirm', a[0]); return orig.apply(this, a); };
+  }
+  if (isNative(window.alert)) {
+    window.alert = (msg) => { log('alert', msg); };
+  } else {
+    const origAlert = window.alert;
+    window.alert = function (...a) { log('alert', a[0]); return origAlert.apply(this, a); };
+  }
   // beforeunload prompts block the navigation a successful submit triggers.
   window.onbeforeunload = null;
   window.__ocDialogArmed = true;

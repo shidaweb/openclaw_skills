@@ -2207,22 +2207,29 @@ _CLICK_BUTTON_BY_TEXT_JS = r"""
   scopes.push(document);
   let foundButDisabled = false;
   const disabledCandidates = [];
+  // Never click "go back / modify" controls from the submit cascades — actus
+  // 2026-06-13: pattern "submit" matched name="submitBack" (変更する) and
+  // bounced the confirm page back to input forever.
+  const denyRe = /(戻る|戻り|変更する|修正する|再入力|やり直|キャンセル|cancel|前の画面|入力画面に|submit_?back|go_?back|btn_?back|\bback\b|reset)/i;
   for (const scope of scopes) {
     const buttons = Array.from(scope.querySelectorAll(selector));
     for (const pat of patterns) {
       const re = new RegExp(pat, 'i');
       for (const b of buttons) {
-        const rawTxt = (
-          (b.textContent || b.value || '') + ' ' +
-          (b.getAttribute('aria-label') || '') + ' ' +
-          (b.getAttribute('title') || '') + ' ' +
-          (b.getAttribute('alt') || '') + ' ' +
-          (b.getAttribute('name') || '')
-        ).trim();
-        const txt = rawTxt.replace(/\s+/g, ' ');
+        // Match each attribute SEPARATELY: concatenating them broke anchored
+        // patterns (^送信する$ never matched "送信する submitSend").
+        const parts = [
+          (b.textContent || b.value || ''),
+          (b.getAttribute('aria-label') || ''),
+          (b.getAttribute('title') || ''),
+          (b.getAttribute('alt') || ''),
+          (b.getAttribute('name') || ''),
+        ].map((s) => s.replace(/\s+/g, ' ').trim());
+        const txt = parts.filter(Boolean).join(' ');
         // Skip elements with too much text (likely a wrapper, not a button)
         if (txt.length > 80) continue;
-        if (!re.test(txt)) continue;
+        if (denyRe.test(txt)) continue;
+        if (!parts.some((p) => p && re.test(p))) continue;
         const style = window.getComputedStyle(b);
         const blocked = Boolean(
           b.disabled ||
@@ -2533,6 +2540,69 @@ _PHONE_INPUTS_JS = r"""
 """
 
 
+# Convert ASCII→full-width in inputs whose label/row context matches a zenkaku
+# validation error (「住所（番地）は全角で入力してください」 — wacoal class, v26).
+_FIX_ZENKAKU_JS_TMPL = r"""
+(() => {
+  const fields = __FIELDS__;
+  const toZ = (s) => s
+    .replace(/[!-~]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 0xFEE0))
+    .replace(/ /g, '　');
+  const out = [];
+  for (const el of document.querySelectorAll('input[type="text"], input:not([type]), textarea')) {
+    const v = String(el.value || '');
+    if (!v || !/[!-~]/.test(v)) continue;
+    let ctx = (el.name || '') + ' ' + (el.placeholder || '');
+    if (el.id) {
+      try {
+        const l = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+        if (l) ctx += ' ' + (l.textContent || '');
+      } catch (e) {}
+    }
+    const row = el.closest('tr, dl, .form-group, .form-row, li, p');
+    if (row) {
+      const h = row.querySelector('th, dt, label, .label, [class*="label" i]');
+      if (h && !h.contains(el)) ctx += ' ' + (h.textContent || '');
+    }
+    ctx = ctx.replace(/\s+/g, '');
+    if (!fields.some((f) => f && ctx.includes(f))) continue;
+    const nv = toZ(v);
+    if (nv === v) continue;
+    const proto = el.tagName === 'TEXTAREA'
+      ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, nv);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    out.push({ name: el.name || el.id || '', value: nv.slice(0, 40) });
+  }
+  return out;
+})()
+"""
+
+
+def _fix_zenkaku_errors(errors: list[dict[str, Any]]) -> list[str]:
+    """ASCII→全角 conversion for fields named by zenkaku validation errors."""
+    try:
+        fields = [
+            re.sub(r"\s+", "", str(e.get("field") or ""))
+            for e in errors if e.get("kind") == "zenkaku"
+        ]
+        fields = [f for f in fields if len(f) >= 2]
+        if not fields:
+            return []
+        js = _FIX_ZENKAKU_JS_TMPL.replace(
+            "__FIELDS__", json.dumps(fields, ensure_ascii=False)
+        )
+        rows = _evaluate(js)
+        return [
+            f"zenkaku:{(r.get('name') or '?')[:24]}={r.get('value')}"
+            for r in (rows if isinstance(rows, list) else [])
+            if isinstance(r, dict)
+        ]
+    except Exception:  # noqa: BLE001 — recovery must not abort the send loop
+        return []
+
+
 def _fix_phone_format_errors(errors: list[dict[str, Any]]) -> list[str]:
     """Toggle hyphen format on phone inputs when a format error names them.
 
@@ -2604,13 +2674,16 @@ def _harvest_and_fix_validation_errors(
     diagnostics: dict[str, Any] = {"filled": [], "warnings": []}
     summary = _apply_fill_guardrails(target, sender, body, diagnostics)
     phone_fixed = _fix_phone_format_errors(errors)
+    zenkaku_fixed = _fix_zenkaku_errors(errors)
     fixed = (
         len(summary.get("kana_fixed") or [])
         + (1 if summary.get("subject_filled") else 0)
         + len(phone_fixed)
+        + len(zenkaku_fixed)
     )
     out["fixed"] = fixed
     out["phone_fixed"] = phone_fixed
+    out["zenkaku_fixed"] = zenkaku_fixed
     # Recoverable if we fixed something, or if all errors are kinds our guardrails
     # target (format on a kana field / a required subject). Even with fixed==0 the
     # caller may still benefit from re-clicking once after a generic re-fill.
@@ -5633,6 +5706,7 @@ def _submission_loop(
     validation_rounds = 0
     clicks = 0
     confirm_seen = False
+    input_rescue_done = False
     phase = "first" if flow == "confirm" else "final"
 
     for step in range(MAX_FORM_STEPS + 2):
@@ -5670,6 +5744,26 @@ def _submission_loop(
         fp = obs["fingerprint"]
         if last_fp is not None and fp == last_fp:
             no_progress += 1
+            # Silent-bounce rescue (v26, wacoal class): the server re-rendered
+            # the input page with inline errors our keywords don't recognize
+            # (e.g. 「住所（番地）は全角で入力してください」), so state stays
+            # "input" and the validation branch never fires. ONE harvest+fix
+            # pass before declaring the click ineffective.
+            if no_progress == 1 and state == "input" and not input_rescue_done:
+                input_rescue_done = True
+                rescue = _harvest_and_fix_validation_errors(
+                    d, config, send_body, stage="send", trace_dir=trace,
+                )
+                if rescue.get("fixed"):
+                    fixes = (
+                        (rescue.get("zenkaku_fixed") or [])
+                        + (rescue.get("phone_fixed") or [])
+                    )
+                    print(f"  [send] silent-bounce rescue: fixed={rescue.get('fixed')} "
+                          f"{', '.join(fixes[:4])}")
+                    core_timeline.add(
+                        timeline, "input_rescue", True, fixed=rescue.get("fixed"),
+                    )
             if no_progress >= 2:
                 return _result("ineffective", obs, phase=phase)
         else:
