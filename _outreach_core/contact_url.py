@@ -467,7 +467,12 @@ def classify_form_type(fields: dict, snapshot: str | None) -> tuple[str, str | N
                     continue
                 return (kind, f"heading mentions {kind}")
             if kind == "recruit":
-                return (kind, "recruit heading detected")
+                # Only declare recruit when applicant fields are also present
+                # OR there's no contact textarea at all. A bare 採用 link in
+                # the global nav must not poison a real /contact/ page.
+                if recruit_field_hit or not textareas:
+                    return (kind, "recruit heading detected")
+                continue
             if not textareas:
                 return (kind, f"heading mentions {kind}")
 
