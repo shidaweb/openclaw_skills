@@ -105,6 +105,37 @@ def _post(text: str, *, level: str = "info", thread_ts: str | None = None) -> bo
         return False
 
 
+def _host_execution_blocked(thread_ts: str | None = None) -> tuple[bool, str]:
+    """Refuse to launch ANY Doorman campaign on a non-primary host.
+
+    This is the launcher-level half of the host split: while the v20 guard in
+    ``run.py`` blocks the actual submit, this stops the dev machine (e.g.
+    ``NorimitsuM5MBP``) from even spinning up enrich/draft/send jobs. Only the
+    designated primary (``MacMiniHome``, from ``data/primary_host``) launches.
+
+    Returns ``(blocked, reason)``. Never blocks when no primary is configured
+    (guard off) or when ``DOORMAN_FORCE_SEND=1`` is set for intentional local
+    runs.
+    """
+    from _outreach_core import host_role
+
+    allowed, reason = host_role.is_send_allowed()
+    if allowed:
+        return False, reason
+    host = host_role.current_host()
+    primary = host_role.configured_primary_host()
+    _post(
+        f"⏭ このホストではDoormanを実行しません（実行担当ではありません）。\n"
+        f"　このマシン: {host} / 実行担当(primary): {primary}\n"
+        f"　Doormanの実行は {primary} 側でのみ行われます（開発機での誤実行防止）。\n"
+        f"　意図的にこのマシンで動かすなら DOORMAN_FORCE_SEND=1 を付けてください。",
+        level="warn",
+        thread_ts=thread_ts,
+    )
+    print(f"[run_job] BLOCKED by host guard: {reason}")
+    return True, reason
+
+
 def build_child_command(skill: str, run_args: list[str]) -> list[str]:
     skill_dir = _skill_dir(skill)
     py = _venv_python(skill_dir)
@@ -121,6 +152,10 @@ def start(
     """Launch run.py detached. Returns {run_id, pid, log}. Never blocks."""
     if skill not in _SKILLS:
         raise ValueError(f"unknown skill {skill!r}; expected one of {_SKILLS}")
+    blocked, reason = _host_execution_blocked(slack_thread_ts)
+    if blocked:
+        return {"run_id": None, "pid": None, "log": None,
+                "blocked": True, "reason": reason}
     skill_dir = _skill_dir(skill)
     if not (skill_dir / "run.py").is_file():
         raise FileNotFoundError(skill_dir / "run.py")
@@ -323,6 +358,9 @@ def cmd_start(args: argparse.Namespace) -> int:
         slack_channel_id=args.slack_channel_id,
         slack_thread_ts=args.slack_thread_ts,
     )
+    if info.get("blocked"):
+        print(f"skipped: host not primary ({info.get('reason')})")
+        return 0
     print(f"run_id={info['run_id']} pid={info['pid']} log={info['log']}")
     print("Job is running detached. Agent turn can end now; progress posts to Slack.")
     return 0
@@ -338,6 +376,12 @@ def cmd_drive(args: argparse.Namespace) -> int:
     skill = args.skill
     if skill not in _SKILLS:
         raise ValueError(f"unknown skill {skill!r}; expected one of {_SKILLS}")
+
+    drive_thread_ts = os.environ.get("DOORMAN_SLACK_THREAD_TS", "").strip() or None
+    blocked, reason = _host_execution_blocked(drive_thread_ts)
+    if blocked:
+        print(f"[drive] skipped: host not primary ({reason})")
+        return 0
 
     brief_id = resolve_brief_id(args.brief)
     target_sends = max(1, int(args.target_sends))

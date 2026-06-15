@@ -464,15 +464,19 @@ _FORM_FIELDS_JS = r"""
       const group = name || 'unnamed';
       result.radios[group] = result.radios[group] || [];
       result.radios[group].push({
+        selector: selector,
         value: el.value,
         label: label,
-        checked: el.checked
+        checked: el.checked,
+        required: required,
+        disabled: !!el.disabled
       });
       continue;
     }
     if (type === 'checkbox') {
       result.checkboxes.push({
-        name: name, label: label, value: el.value, checked: el.checked
+        name: name, selector: selector, label: label, value: el.value,
+        checked: el.checked, required: required, disabled: !!el.disabled
       });
       continue;
     }
@@ -815,6 +819,16 @@ def _enrich_one_target(
             )
             print(f"[enrich]    ↳ seed error page detected, skip: {seed_url}")
             continue
+        gate_adv = _advance_pre_form_phase(
+            t_work, config, stage="enrich", max_rounds=2,
+        )
+        if gate_adv.get("advanced"):
+            fields = gate_adv.get("fields") if isinstance(gate_adv.get("fields"), dict) else fields
+            snap = str(gate_adv.get("snap") or snap)
+            cur_after_gate = str(_evaluate("() => location.href") or "").strip()
+            if cur_after_gate:
+                seed_url = cur_after_gate
+            print(f"[enrich]    ↳ pre-form gate advanced -> {seed_url}")
         # v15 §F1: two-stage classification — heuristics first, LLM (Sonnet)
         # only when the heuristic verdict is uncertain; deterministic fallback.
         cls = _classify_form_type_v2_for_enrich(fields, snap, config)
@@ -902,6 +916,16 @@ def _enrich_one_target(
                     time.sleep(RATE_LIMIT_SECONDS)
                 continue
             fields2 = _evaluate(_FORM_FIELDS_JS) or {}
+            gate_adv2 = _advance_pre_form_phase(
+                t_work, config, stage="enrich", max_rounds=2,
+            )
+            if gate_adv2.get("advanced"):
+                fields2 = gate_adv2.get("fields") if isinstance(gate_adv2.get("fields"), dict) else fields2
+                snap2 = str(gate_adv2.get("snap") or snap2)
+                cur_after_gate = str(_evaluate("() => location.href") or "").strip()
+                if cur_after_gate:
+                    cand = cur_after_gate
+                print(f"[enrich]    ↳ candidate pre-form gate advanced -> {cand}")
             kind2, reason2 = _classify_form_type(fields2, snap2)
             if kind2 == "contact":
                 fields, snap = fields2, snap2
@@ -966,8 +990,11 @@ def _enrich_one_target(
     if i == 1:
         sample = DATA_DIR / "sample_form.txt"
         if snap:
-            sample.write_text(snap)
-            print(f"[enrich] saved first form snapshot -> {sample}")
+            try:
+                sample.write_text(snap)
+                print(f"[enrich] saved first form snapshot -> {sample}")
+            except OSError as exc:
+                print(f"[enrich] ⚠ could not save sample snapshot ({exc}) — continuing")
 
     if form_kind != "contact":
         reason = form_reason or "non_contact"
@@ -2048,6 +2075,30 @@ _FILL_TEXTAREA_JS = r"""
 _LIST_CHECKBOX_GATES_JS = r"""
 () => {
   const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const stableSelector = (el) => {
+    if (el.id) return `#${CSS.escape(el.id)}`;
+    const name = el.getAttribute('name');
+    if (name) return `input[type="checkbox"][name="${CSS.escape(name)}"]`;
+    let cur = el;
+    const path = [];
+    for (let depth = 0; cur && depth < 7 && cur !== document.body; depth += 1) {
+      let part = cur.tagName.toLowerCase();
+      if (cur.parentElement) {
+        const sibs = Array.from(cur.parentElement.children).filter((x) => x.tagName === cur.tagName);
+        if (sibs.length > 1) part += `:nth-of-type(${sibs.indexOf(cur) + 1})`;
+      }
+      path.unshift(part);
+      cur = cur.parentElement;
+    }
+    return path.join(' > ');
+  };
+  const contextText = (el) => {
+    const row = el.closest('tr, dl, .form-row, .form-group, .field, .input, .item, li, p, td, th, fieldset, div');
+    return row ? norm((row.textContent || '').slice(0, 240)) : '';
+  };
+  // NOTE: bare ※ is a generic footnote marker in JP forms, not a reliable
+  // required indicator, so we only treat it as required when paired with 必須.
+  const visuallyRequired = (el) => /必須|required|※[^]{0,12}必須/.test(contextText(el));
   const labelFor = (el) => {
     let txt = '';
     if (el.id) {
@@ -2074,14 +2125,17 @@ _LIST_CHECKBOX_GATES_JS = r"""
     const required = Boolean(
       cb.required ||
       cb.getAttribute('aria-required') === 'true' ||
-      cb.getAttribute('data-required') === 'true'
+      cb.getAttribute('data-required') === 'true' ||
+      visuallyRequired(cb)
     );
     out.push({
       name: cb.name || '',
       id: cb.id || '',
+      selector: stableSelector(cb),
       label: labelFor(cb),
       checked: Boolean(cb.checked),
       required: required,
+      disabled: Boolean(cb.disabled || cb.getAttribute('aria-disabled') === 'true'),
     });
   }
   return out;
@@ -2092,6 +2146,39 @@ _LIST_CHECKBOX_GATES_JS = r"""
 _LIST_RADIO_GATES_JS = r"""
 () => {
   const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const stableSelector = (el) => {
+    if (el.id) return `#${CSS.escape(el.id)}`;
+    const name = el.getAttribute('name');
+    // The name-only selector is only unique when a single radio carries that
+    // name. For real groups (the common case) it would match the first option,
+    // and `:nth-of-type` cannot index a name-filtered NodeList — so fall through
+    // to a structural path that uniquely identifies THIS option.
+    if (name) {
+      const radios = document.querySelectorAll(`input[type="radio"][name="${CSS.escape(name)}"]`);
+      if (radios.length === 1) {
+        return `input[type="radio"][name="${CSS.escape(name)}"]`;
+      }
+    }
+    let cur = el;
+    const path = [];
+    for (let depth = 0; cur && depth < 7 && cur !== document.body; depth += 1) {
+      let part = cur.tagName.toLowerCase();
+      if (cur.parentElement) {
+        const sibs = Array.from(cur.parentElement.children).filter((x) => x.tagName === cur.tagName);
+        if (sibs.length > 1) part += `:nth-of-type(${sibs.indexOf(cur) + 1})`;
+      }
+      path.unshift(part);
+      cur = cur.parentElement;
+    }
+    return path.join(' > ');
+  };
+  const contextText = (el) => {
+    const row = el.closest('fieldset, tr, dl, .form-row, .form-group, .field, .input, .item, li, p, td, th, div');
+    return row ? norm((row.textContent || '').slice(0, 260)) : '';
+  };
+  // NOTE: bare ※ is a generic footnote marker in JP forms, not a reliable
+  // required indicator, so we only treat it as required when paired with 必須.
+  const visuallyRequired = (el) => /必須|required|※[^]{0,12}必須/.test(contextText(el));
   const labelForRadio = (el) => {
     let txt = '';
     if (el.id) {
@@ -2111,10 +2198,15 @@ _LIST_RADIO_GATES_JS = r"""
       const lg = fs.querySelector('legend');
       if (lg) return norm(lg.textContent || '');
     }
+    const row = r.closest('tr, dl, .form-row, .form-group, .field, .input, .item, li, p, td');
+    if (row) {
+      const l = row.querySelector('th, dt, .label, [class*="label" i], .title, strong');
+      if (l && !l.contains(r)) return norm(l.textContent || '');
+    }
     let cur = r.parentElement;
     for (let i = 0; i < 4 && cur; i++, cur = cur.parentElement) {
       const l = cur.querySelector('label, .label, [class*="label" i], .title');
-      if (l) return norm(l.textContent || '');
+      if (l && !l.contains(r)) return norm(l.textContent || '');
     }
     return '';
   };
@@ -2130,12 +2222,16 @@ _LIST_RADIO_GATES_JS = r"""
       selected: false,
       options: [],
     };
-    item.required = item.required || Boolean(r.required || r.getAttribute('aria-required') === 'true');
+    item.required = item.required || Boolean(
+      r.required || r.getAttribute('aria-required') === 'true' || visuallyRequired(r)
+    );
     item.selected = item.selected || Boolean(r.checked);
     item.options.push({
+      selector: stableSelector(r),
       label: labelForRadio(r),
       value: r.value || '',
       checked: Boolean(r.checked),
+      disabled: Boolean(r.disabled || r.getAttribute('aria-disabled') === 'true'),
     });
     map.set(name, item);
   }
@@ -2147,6 +2243,30 @@ _LIST_RADIO_GATES_JS = r"""
 _LIST_SELECT_GATES_JS = r"""
 () => {
   const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const stableSelector = (el) => {
+    if (el.id) return `#${CSS.escape(el.id)}`;
+    const name = el.getAttribute('name');
+    if (name) return `select[name="${CSS.escape(name)}"]`;
+    let cur = el;
+    const path = [];
+    for (let depth = 0; cur && depth < 7 && cur !== document.body; depth += 1) {
+      let part = cur.tagName.toLowerCase();
+      if (cur.parentElement) {
+        const sibs = Array.from(cur.parentElement.children).filter((x) => x.tagName === cur.tagName);
+        if (sibs.length > 1) part += `:nth-of-type(${sibs.indexOf(cur) + 1})`;
+      }
+      path.unshift(part);
+      cur = cur.parentElement;
+    }
+    return path.join(' > ');
+  };
+  const contextText = (el) => {
+    const row = el.closest('tr, dl, .form-row, .form-group, .field, .input, .item, li, p, td, th, fieldset, div');
+    return row ? norm((row.textContent || '').slice(0, 260)) : '';
+  };
+  // NOTE: bare ※ is a generic footnote marker in JP forms, not a reliable
+  // required indicator, so we only treat it as required when paired with 必須.
+  const visuallyRequired = (el) => /必須|required|※[^]{0,12}必須/.test(contextText(el));
   const labelFor = (el) => {
     let txt = '';
     if (el.id) {
@@ -2168,7 +2288,8 @@ _LIST_SELECT_GATES_JS = r"""
     const required = Boolean(
       sel.required ||
       sel.getAttribute('aria-required') === 'true' ||
-      sel.getAttribute('data-required') === 'true'
+      sel.getAttribute('data-required') === 'true' ||
+      visuallyRequired(sel)
     );
     const options = Array.from(sel.options || []).map((opt) => ({
       label: norm(opt.text || ''),
@@ -2180,9 +2301,11 @@ _LIST_SELECT_GATES_JS = r"""
     out.push({
       name: sel.name || '',
       id: sel.id || '',
+      selector: stableSelector(sel),
       label: labelFor(sel),
       required: required,
       selected: selected,
+      disabled: Boolean(sel.disabled || sel.getAttribute('aria-disabled') === 'true'),
       options: options.slice(0, 120),
     });
   }
@@ -2749,6 +2872,9 @@ def _auto_check_submit_gates() -> dict[str, Any]:
     checked_count = 0
     for cb in to_check:
         name = (cb.get("name") or cb.get("id") or "").strip()
+        selector = str(cb.get("selector") or "").strip()
+        if not name and selector:
+            name = f"selector:{selector}"
         out = _check_by_name(name) if name else None
         if not (out and out.get("ok")):
             label = (cb.get("label") or "").strip()
@@ -2804,11 +2930,15 @@ def _auto_select_submit_radios(aggressive: bool = False) -> dict[str, Any]:
     }
 
 
-def _auto_select_submit_selects() -> dict[str, Any]:
-    """Select required inquiry category dropdowns to unblock submit."""
+def _auto_select_submit_selects(aggressive: bool = False) -> dict[str, Any]:
+    """Select required / known dropdown gates to unblock submit."""
     res = _evaluate(_LIST_SELECT_GATES_JS)
     groups = res if isinstance(res, list) else []
-    actions = core_submit_progress.pick_select_gate_actions(groups, sender=_SENDER_CTX)
+    actions = (
+        core_submit_progress.pick_validation_select_actions(groups, sender=_SENDER_CTX)
+        if aggressive else
+        core_submit_progress.pick_select_gate_actions(groups, sender=_SENDER_CTX)
+    )
     selected_count = 0
     selected_items: list[str] = []
     for act in actions:
@@ -2822,6 +2952,47 @@ def _auto_select_submit_selects() -> dict[str, Any]:
         "candidates": len(actions),
         "total_groups": len(groups),
     }
+
+
+def _auto_fill_live_gates(
+    *,
+    phase: str,
+    aggressive_radios: bool = False,
+    aggressive_selects: bool = False,
+    trace_dir: Path | None = None,
+    target_id: str | None = None,
+) -> dict[str, Any]:
+    """Apply the same gate-filling pass across pre/body/confirm phases."""
+    gate = _auto_check_submit_gates()
+    radios = _auto_select_submit_radios(aggressive=aggressive_radios)
+    selects = _auto_select_submit_selects(aggressive=aggressive_selects)
+    changed = (
+        int(gate.get("checked_count") or 0)
+        + int(radios.get("selected_count") or 0)
+        + int(selects.get("selected_count") or 0)
+    )
+    out = {
+        "changed": changed,
+        "checkboxes": gate,
+        "radios": radios,
+        "selects": selects,
+    }
+    if changed > 0:
+        _emit_event(
+            "send.live_gates.filled",
+            stage="send" if phase in ("send", "confirm", "validation") else phase,
+            target_id=target_id or "",
+            payload={
+                "phase": phase,
+                "checkboxes": int(gate.get("checked_count") or 0),
+                "radios": int(radios.get("selected_count") or 0),
+                "selects": int(selects.get("selected_count") or 0),
+                "aggressive_radios": bool(aggressive_radios),
+                "aggressive_selects": bool(aggressive_selects),
+            },
+            trace_dir=trace_dir,
+        )
+    return out
 
 
 def _snapshot_submit_gates() -> dict[str, Any]:
@@ -2889,6 +3060,7 @@ def _drive_enable_sequence(
     stage: str,
     trace_dir: Path | None = None,
     max_steps: int = 4,
+    extra_patterns: list[str] | None = None,
 ) -> dict[str, Any]:
     """Observe->act->re-observe loop for pre-form gate activation."""
     flow = (
@@ -2905,6 +3077,9 @@ def _drive_enable_sequence(
     plan_first = str((plan or {}).get("first_button_pattern") or "").strip()
     if plan_first and plan_first not in patterns:
         patterns.append(plan_first)
+    for pat in extra_patterns or []:
+        if pat and pat not in patterns:
+            patterns.append(pat)
     seq = list((plan or {}).get("enable_sequence") or [])
     seq_idx = 0
 
@@ -2982,16 +3157,16 @@ def _drive_enable_sequence(
             _rescan_form_fields(target)
             snap = _snapshot_submit_gates()
 
-        gate = _auto_check_submit_gates()
-        radios = _auto_select_submit_radios()
-        selects = _auto_select_submit_selects()
-        gate_changed = (
-            int(gate.get("checked_count") or 0)
-            + int(radios.get("selected_count") or 0)
-            + int(selects.get("selected_count") or 0)
+        live = _auto_fill_live_gates(
+            phase=stage,
+            trace_dir=trace_dir,
+            target_id=str(target.get("id") or target.get("name") or ""),
         )
-        if gate_changed > 0:
-            changed += gate_changed
+        if int(live.get("changed") or 0) > 0:
+            changed += int(live.get("changed") or 0)
+            gate = live.get("checkboxes") or {}
+            radios = live.get("radios") or {}
+            selects = live.get("selects") or {}
             applied.append(
                 f"gates:cb={gate.get('checked_count',0)},r={radios.get('selected_count',0)},s={selects.get('selected_count',0)}"
             )
@@ -3045,14 +3220,11 @@ def _click_button_with_gate_retry(
     if last and last.get("clicked"):
         return last
     for _ in range(max(1, retries)):
-        gate = _auto_check_submit_gates()
-        radios = _auto_select_submit_radios()
-        selects = _auto_select_submit_selects()
-        changed = (
-            gate.get("checked_count", 0)
-            + radios.get("selected_count", 0)
-            + selects.get("selected_count", 0)
-        )
+        live = _auto_fill_live_gates(phase="click_retry")
+        gate = live.get("checkboxes") or {}
+        radios = live.get("radios") or {}
+        selects = live.get("selects") or {}
+        changed = int(live.get("changed") or 0)
         if changed <= 0:
             break
         time.sleep(0.4)
@@ -3071,6 +3243,102 @@ def _click_button_with_gate_retry(
 def _try_open_pre_form_gate() -> dict[str, Any] | None:
     """Open intermediate contact-gate pages before the real textarea form."""
     return _click_button_with_gate_retry(_PRE_FORM_ENTRY_PATTERNS, retries=2)
+
+
+def _advance_pre_form_phase(
+    target: dict[str, Any],
+    config: dict[str, Any] | None,
+    *,
+    stage: str,
+    trace_dir: Path | None = None,
+    max_rounds: int = 3,
+) -> dict[str, Any]:
+    """Drive pre-form route/consent pages until the real textarea form appears.
+
+    This deliberately runs only while the page looks like a gate (no inquiry
+    textarea yet). It is used by both enrich and send so a valid contact flow is
+    not discarded just because the first URL is an intermediate "法人/同意/種別"
+    page.
+    """
+    _set_sender_ctx(config)
+    tid = str(target.get("id") or target.get("name") or "")
+    advanced = False
+    rounds: list[dict[str, Any]] = []
+    last_fields: dict[str, Any] = {}
+    last_snap = ""
+
+    for round_no in range(max(1, max_rounds)):
+        last_fields = _rescan_form_fields(target)
+        last_snap = oc_browser("snapshot") or ""
+        page_state = core_contact_url.classify_page_form_state(last_fields, last_snap)
+        kind, reason = core_contact_url.classify_form_type(last_fields, last_snap)
+        has_textarea = bool(last_fields.get("textareas") or [])
+        if has_textarea and page_state.get("state") == "form_ok":
+            return {
+                "advanced": advanced,
+                "state": "form_ok",
+                "fields": last_fields,
+                "snap": last_snap,
+                "rounds": rounds,
+            }
+        gate_like = (
+            page_state.get("state") == "gate_like"
+            or (kind == "contact" and reason == "pre_form_gate")
+        )
+        if not gate_like:
+            break
+
+        drive = _drive_enable_sequence(
+            target,
+            target.get("_llm_plan") if isinstance(target.get("_llm_plan"), dict) else None,
+            body="",
+            stage=stage,
+            trace_dir=trace_dir,
+            max_steps=3,
+            extra_patterns=_PRE_FORM_ENTRY_PATTERNS + [
+                r"法人.*お問い合わせ",
+                r"法人.*問合せ",
+                r"企業.*お問い合わせ",
+                r"お問い合わせへ進む",
+                r"次へ進む",
+            ],
+        )
+        rounds.append(
+            {
+                "round": round_no + 1,
+                "clicked": bool(drive.get("clicked")),
+                "applied": (drive.get("applied") or [])[:8],
+                "remaining": drive.get("remaining") or {},
+            }
+        )
+        if drive.get("clicked"):
+            advanced = True
+            time.sleep(2.0)
+            continue
+        if not (drive.get("applied") or []):
+            break
+        time.sleep(0.8)
+
+    last_fields = _rescan_form_fields(target)
+    last_snap = oc_browser("snapshot") or ""
+    _emit_event(
+        "send.pre_form.advance" if stage == "pre_form" else "enrich.pre_form.advance",
+        stage="send" if stage == "pre_form" else stage,
+        target_id=tid,
+        payload={
+            "advanced": advanced,
+            "rounds": rounds,
+            "current_url": str(_evaluate("() => location.href") or "")[:200],
+        },
+        trace_dir=trace_dir,
+    )
+    return {
+        "advanced": advanced,
+        "state": core_contact_url.classify_page_form_state(last_fields, last_snap).get("state"),
+        "fields": last_fields,
+        "snap": last_snap,
+        "rounds": rounds,
+    }
 
 
 _ENUMERATE_BUTTONS_JS = r"""
@@ -3897,9 +4165,14 @@ _APPLY_PLAN_FIELD_JS = r"""
         if (byCss) return byCss;
       } catch (e) {}
     }
-    let el = document.querySelector(`[name="${selectorAttr}"]`);
+    let el = null;
+    try {
+      el = document.querySelector(`[name="${CSS.escape(selectorAttr)}"]`);
+    } catch (e) {}
     if (el) return el;
-    el = document.querySelector(`#${CSS.escape(selectorAttr)}`);
+    try {
+      el = document.querySelector(`#${CSS.escape(selectorAttr)}`);
+    } catch (e) {}
     return el;
   };
 
@@ -3926,7 +4199,17 @@ _APPLY_PLAN_FIELD_JS = r"""
 
   if (action === "select_radio") {
     // For radios, "name" is the radio group name and "value" is which option
-    const radios = document.querySelectorAll(`input[type="radio"][name="${name}"]`);
+    if (args.selector) {
+      let direct = null;
+      try { direct = document.querySelector(args.selector); } catch (e) {}
+      if (direct && direct.matches && direct.matches('input[type="radio"]')) {
+        direct.checked = true;
+        direct.dispatchEvent(new Event('change', { bubbles: true }));
+        direct.dispatchEvent(new Event('click', { bubbles: true }));
+        return { ok: true, action, name, value: direct.value || value };
+      }
+    }
+    const radios = document.querySelectorAll(`input[type="radio"][name="${CSS.escape(name)}"]`);
     if (!radios.length) return { ok: false, reason: "radio group not found", name };
     for (const r of radios) {
       const labelEl = r.id ? document.querySelector(`label[for="${r.id}"]`) : r.closest('label');
@@ -3952,9 +4235,25 @@ _APPLY_PLAN_FIELD_JS = r"""
 _CHECK_BY_NAME_JS = r"""
 (args) => {
   const { name } = args;
-  let cb = document.querySelector(`input[type="checkbox"][name="${name}"]`);
-  if (!cb) cb = document.querySelector(`input[type="checkbox"]#${CSS.escape(name)}`);
+  let cb = null;
+  if (String(name || '').startsWith('selector:')) {
+    try {
+      const el = document.querySelector(String(name).slice('selector:'.length));
+      if (el && el.matches && el.matches('input[type="checkbox"]')) cb = el;
+    } catch (e) {}
+  }
+  if (!cb) {
+    try { cb = document.querySelector(`input[type="checkbox"][name="${CSS.escape(name)}"]`); }
+    catch (e) {}
+  }
+  if (!cb) {
+    try { cb = document.querySelector(`input[type="checkbox"]#${CSS.escape(name)}`); }
+    catch (e) {}
+  }
   if (!cb) return { ok: false, reason: "checkbox not found", name };
+  if (cb.disabled || cb.getAttribute('aria-disabled') === 'true') {
+    return { ok: false, reason: "checkbox disabled", name };
+  }
   if (!cb.checked) {
     cb.checked = true;
     cb.dispatchEvent(new Event('change', { bubbles: true }));
@@ -4815,11 +5114,25 @@ def _heuristic_fill_fallback(target: dict[str, Any], config: dict[str, Any],
     else:
         diagnostics["errors"].append("body textarea fill failed")
 
-    # Submit-gate checkboxes (required / privacy agreement)
-    gate = _auto_check_submit_gates()
+    # Submit-gate controls (required / privacy agreement / inquiry route).
+    live_gates = _auto_fill_live_gates(
+        phase="send",
+        target_id=str(target.get("id") or target.get("name") or ""),
+    )
+    gate = live_gates.get("checkboxes") or {}
+    radios = live_gates.get("radios") or {}
+    selects = live_gates.get("selects") or {}
     if gate.get("checked_count", 0) > 0:
         diagnostics["filled"].append(
             f"gate_checkboxes={gate.get('checked_count')} ({', '.join((gate.get('checked_labels') or [])[:2])})"
+        )
+    if radios.get("selected_count", 0) > 0:
+        diagnostics["filled"].append(
+            f"gate_radios={radios.get('selected_count')} ({', '.join((radios.get('selected_items') or [])[:2])})"
+        )
+    if selects.get("selected_count", 0) > 0:
+        diagnostics["filled"].append(
+            f"gate_selects={selects.get('selected_count')} ({', '.join((selects.get('selected_items') or [])[:2])})"
         )
 
     # v15 guardrails: correct furigana script + fill a required subject/title
@@ -5706,6 +6019,7 @@ def _submission_loop(
     validation_rounds = 0
     clicks = 0
     confirm_seen = False
+    confirm_gate_done = False
     input_rescue_done = False
     phase = "first" if flow == "confirm" else "final"
 
@@ -5788,12 +6102,21 @@ def _submission_loop(
             # AGGRESSIVE here (v25): the validation bounce itself is the evidence
             # that an unselected group is required, even without a DOM required
             # attribute or a known label (kakuyasu 「酒屋はありますか？」 class).
-            _auto_check_submit_gates()
-            radio_rescue = _auto_select_submit_radios(aggressive=True)
+            live_rescue = _auto_fill_live_gates(
+                phase="validation",
+                aggressive_radios=True,
+                aggressive_selects=True,
+                trace_dir=trace,
+                target_id=tid,
+            )
+            radio_rescue = live_rescue.get("radios") or {}
             if radio_rescue.get("selected_count"):
                 print(f"  [send] validation radio rescue: "
                       f"{', '.join(radio_rescue.get('selected_items') or [])[:120]}")
-            _auto_select_submit_selects()
+            select_rescue = live_rescue.get("selects") or {}
+            if select_rescue.get("selected_count"):
+                print(f"  [send] validation select rescue: "
+                      f"{', '.join(select_rescue.get('selected_items') or [])[:120]}")
             if validation_rounds > 2:
                 return _result(
                     "validation_stuck", obs,
@@ -5819,6 +6142,25 @@ def _submission_loop(
                     payload={"wait_user_ms": 0, "observed": True}, trace_dir=trace,
                 )
                 core_timeline.add(timeline, "confirm_page", True)
+            if not confirm_gate_done:
+                confirm_gate_done = True
+                gate_res = _auto_fill_live_gates(
+                    phase="confirm",
+                    trace_dir=trace,
+                    target_id=tid,
+                )
+                llm_gate = {"checked": 0}
+                remaining = _snapshot_submit_gates().get("remaining") or {}
+                if int(remaining.get("total") or 0) > 0:
+                    llm_gate = _post_form_llm_gate_action(
+                        d, config, stage="send", trace_dir=trace,
+                    )
+                changed = int(gate_res.get("changed") or 0) + int(llm_gate.get("checked") or 0)
+                if changed > 0:
+                    print(f"  [send] confirm gate filled: {changed}")
+                    core_timeline.add(timeline, "confirm_gate", True, changed=changed)
+                    time.sleep(0.8)
+                    continue
         else:  # input
             phase = "first" if flow == "confirm" else "final"
 
@@ -6155,6 +6497,26 @@ def _send_one_target(
             entry=d.get("entry_click_text"),
             gate_clicked=bool(gate and gate.get("clicked")),
         )
+
+    pre_adv = _advance_pre_form_phase(
+        d, config, stage="pre_form", trace_dir=trace, max_rounds=3,
+    )
+    if pre_adv.get("advanced"):
+        _emit_event(
+            "send.pre_form_advanced",
+            stage="send",
+            target_id=tid,
+            payload={
+                "state": pre_adv.get("state"),
+                "rounds": (pre_adv.get("rounds") or [])[:4],
+            },
+            trace_dir=trace,
+        )
+        core_timeline.add(
+            timeline, "pre_form_advanced", True,
+            state=pre_adv.get("state"),
+        )
+        time.sleep(1.0)
 
     # v17 URL精査: verify the page actually carries a form BEFORE filling.
     # Catches redirects, contact GUIDE pages, expired sessions — the production

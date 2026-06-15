@@ -14,6 +14,17 @@ from _outreach_core.helpers import run_job
 
 
 class TestRunJob(unittest.TestCase):
+    def setUp(self) -> None:
+        # The launcher host gate must not depend on THIS machine's hostname /
+        # data/primary_host — patch it open so the runner tests run on any host
+        # (mirrors the v20 send-guard handling in test_v15_reliability).
+        from _outreach_core import host_role
+        self._guard = mock.patch.object(
+            host_role, "is_send_allowed", return_value=(True, "test"),
+        )
+        self._guard.start()
+        self.addCleanup(self._guard.stop)
+
     def test_build_child_command_uses_run_py(self) -> None:
         cmd = run_job.build_child_command("jp-form-outreach", ["campaign", "--limit", "5"])
         self.assertTrue(cmd[1].endswith("run.py"))

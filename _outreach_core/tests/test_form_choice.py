@@ -169,6 +169,29 @@ class TestGateActionsWithSender(unittest.TestCase):
         }]
         self.assertEqual(sp.pick_select_gate_actions(groups, sender=SENDER), [])
 
+    def test_select_gate_required_unknown_uses_neutral_only(self) -> None:
+        groups = [{
+            "name": "unknown", "label": "確認事項", "required": True,
+            "selected": False, "options": _opts("はい", "いいえ"),
+        }]
+        actions = sp.pick_select_gate_actions(groups, sender=SENDER)
+        self.assertEqual(actions, [{"name": "unknown", "value": "いいえ"}])
+
+    def test_select_gate_required_unknown_does_not_guess_first_normally(self) -> None:
+        groups = [{
+            "name": "unknown", "label": "確認事項", "required": True,
+            "selected": False, "options": _opts("A", "B"),
+        }]
+        self.assertEqual(sp.pick_select_gate_actions(groups, sender=SENDER), [])
+
+    def test_validation_select_rescue_can_pick_first_enabled(self) -> None:
+        groups = [{
+            "name": "unknown", "label": "確認事項", "required": True,
+            "selected": False, "options": _opts("A", "B"),
+        }]
+        actions = sp.pick_validation_select_actions(groups, sender=SENDER)
+        self.assertEqual(actions, [{"name": "unknown", "value": "A"}])
+
     def test_radio_gate_contact_method(self) -> None:
         groups = [{
             "name": "how", "label": "ご希望の連絡方法", "required": True,

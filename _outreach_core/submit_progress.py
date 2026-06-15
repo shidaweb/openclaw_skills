@@ -298,6 +298,39 @@ def pick_validation_radio_actions(
     return actions
 
 
+def _pick_neutral_or_first_option(
+    options: list[Any] | None,
+    *,
+    allow_first: bool = False,
+) -> str | None:
+    """Pick a safe neutral option, or the first enabled option when allowed.
+
+    Normal pre-submit filling should not guess arbitrary values for unknown
+    required controls. After the page has already bounced with a validation
+    error, however, choosing the first non-placeholder option is often the only
+    way to progress through custom required selects/radios that expose no useful
+    label.
+    """
+    normalized = _normalize_options(options or [])
+    first_ok: dict[str, Any] | None = None
+    for opt in normalized:
+        if bool(opt.get("selected")) or bool(opt.get("disabled")):
+            continue
+        if _is_placeholder_option(opt):
+            continue
+        label = str(opt.get("label") or "").strip()
+        value = str(opt.get("value") or "").strip()
+        if not label and not value:
+            continue
+        if first_ok is None:
+            first_ok = opt
+        if _NEUTRAL_OPTION_RE.search(label) or _NEUTRAL_OPTION_RE.search(value):
+            return label or value
+    if allow_first and first_ok:
+        return str(first_ok.get("label") or first_ok.get("value") or "").strip() or None
+    return None
+
+
 def is_inquiry_type_field(field: dict[str, Any] | None) -> bool:
     if not isinstance(field, dict):
         return False
@@ -398,12 +431,18 @@ def choose_b2b_option(options: list[Any] | None) -> dict[str, Any] | None:
 def pick_select_gate_actions(
     groups: list[dict[str, Any]] | None,
     sender: dict[str, Any] | None = None,
+    *,
+    aggressive: bool = False,
 ) -> list[dict[str, str]]:
     """Choose select options likely required to unblock submit.
 
     Handles required selects plus any select whose label we know how to answer
     (お問い合わせ種別, 都道府県, 従業員数, きっかけ, 予算, 連絡方法 …). Label-aware
     choice first, then the B2B-preference picker.
+
+    ``aggressive=True`` is for validation recovery: if a required/unknown
+    dropdown still has no semantic answer, pick the first enabled non-placeholder
+    option rather than looping forever on the same validation bounce.
     """
     from _outreach_core import form_validation as fv  # lazy: avoid import cycle
 
@@ -415,6 +454,8 @@ def pick_select_gate_actions(
             continue
         name = str(g.get("name") or g.get("id") or "").strip()
         if not name:
+            continue
+        if bool(g.get("disabled")):
             continue
         if bool(g.get("selected")):
             continue
@@ -432,15 +473,28 @@ def pick_select_gate_actions(
             picked = choose_b2b_option(g.get("options") or [])
             choice = str((picked or {}).get("value") or "").strip()
         if not choice:
+            choice = _pick_neutral_or_first_option(
+                g.get("options") or [],
+                allow_first=bool(aggressive and required),
+            ) or ""
+        if not choice:
             continue
         actions.append({"name": name, "value": choice})
     return actions
 
 
+def pick_validation_select_actions(
+    groups: list[dict[str, Any]] | None,
+    sender: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
+    """Aggressive select rescue for pages that already emitted validation."""
+    return pick_select_gate_actions(groups, sender=sender, aggressive=True)
+
+
 def _pick_select_option(options: list[dict[str, Any]]) -> str | None:
     picked = choose_b2b_option(options)
     if not picked:
-        return None
+        return _pick_neutral_or_first_option(options, allow_first=False)
     choice = str(picked.get("value") or "").strip()
     return choice or None
 
