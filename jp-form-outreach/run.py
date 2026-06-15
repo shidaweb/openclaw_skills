@@ -44,7 +44,7 @@ from _outreach_core import preview as core_preview
 from _outreach_core import prompt as core_prompt
 from _outreach_core.config import BriefError, load_merged_config
 from _outreach_core.paths import SkillPaths, resolve_skill_paths
-from _outreach_core.progress import HeartbeatSession
+from _outreach_core.progress import HeartbeatSession, resolve_heartbeat_mode
 from _outreach_core.verify import (
     append_needs_attention,
     close_needs_attention,
@@ -7075,13 +7075,50 @@ def stage_send(
     filled_only: list[dict[str, Any]] = []
     tab_isolation = _tab_isolation_enabled(config)
     resolver_tab_ids: set[str] = set()  # error tabs kept open for the resolver
-    hb = HeartbeatSession(SKILL_DIR, "send", len(targets), heartbeat=heartbeat, data_dir=DATA_DIR)
+    # Resolve to a concrete mode ("slack"/None). Previously the raw arg (default
+    # None) was passed straight through, so the Slack progress loop never started
+    # unless the caller said --heartbeat slack → progress was silent in the
+    # thread. resolve_heartbeat_mode honors the brief's heartbeat.enabled_for and
+    # turns on Slack posting whenever the bot/webhook is configured.
+    hb_mode = resolve_heartbeat_mode(heartbeat, task="send")
+    hb = HeartbeatSession(SKILL_DIR, "send", len(targets), heartbeat=hb_mode, data_dir=DATA_DIR)
     hb.start(f"send {len(targets)} targets")
     from _outreach_core import run_progress as core_progress
     core_progress.start(DATA_DIR, "send", len(targets))
 
+    # v27: inbound thread control. A human reply in the progress thread can stop
+    # the batch between targets. Disabled (no-op) when Slack isn't configured.
+    from _outreach_core import thread_control
+    stop_watcher = thread_control.ThreadStopWatcher.from_env(config=config)
+    stopped_by_user = False
+
     try:
         for di, d in enumerate(targets):
+            # Checkpoint at the safe boundary (between targets, never mid-submit).
+            stop, why = stop_watcher.should_stop()
+            if stop:
+                stopped_by_user = True
+                msg = (
+                    f"🛑 スレッドの指示により処理を停止しました"
+                    f"（{di}/{len(targets)} 件処理済み、残り {len(targets) - di} 件は未処理）。\n"
+                    f"　指示: {why}\n　再開するには再度 send を実行してください。"
+                )
+                print(f"  [send] 🛑 stop requested via Slack thread: {why}")
+                try:
+                    from _outreach_core.notify import post as _notify_post
+                    _notify_post(msg, level="warn",
+                                 thread_ts=stop_watcher.thread_ts or None)
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    _emit_event(
+                        "send.thread_stop", stage="send",
+                        payload={"processed": di, "remaining": len(targets) - di,
+                                 "reason": str(why)[:200]},
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                break
             idx = sendable.index(d) + 1
             tid = str(d.get("id") or d.get("name", "?"))
             try:
@@ -7123,11 +7160,13 @@ def stage_send(
     finally:
         # §R1 acceptance: hb.end always runs; partial successes are persisted
         # even when the loop dies mid-batch.
-        hb.end(f"send done · sent={len(sent)} · pending={len(filled_only)}")
-        core_progress.finish(DATA_DIR, status="done")
+        _end_note = "stopped by user · " if stopped_by_user else ""
+        hb.end(f"send {_end_note}done · sent={len(sent)} · pending={len(filled_only)}")
+        core_progress.finish(DATA_DIR, status="stopped" if stopped_by_user else "done")
         if sent:
             append_sent_history(sent)
-    print(f"\n[send] done · sent={len(sent)} · filled-only={len(filled_only)}")
+    _done_label = "stopped" if stopped_by_user else "done"
+    print(f"\n[send] {_done_label} · sent={len(sent)} · filled-only={len(filled_only)}")
     if filled_only:
         names = ", ".join(d.get("name", "?") for d in filled_only)
         print(f"[send] not auto-logged: {names}")

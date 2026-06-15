@@ -45,7 +45,7 @@ browser:
   cookie_consent: "accept"
 
 heartbeat:
-  interval_sec: 300
+  interval_sec: 600
   enabled_for:
     - "all"
 

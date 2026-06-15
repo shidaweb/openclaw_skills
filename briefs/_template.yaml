@@ -48,7 +48,7 @@ slack:
   channel_id: ""
 
 heartbeat:
-  interval_sec: 300
+  interval_sec: 600
   enabled_for:
     - "all"
 

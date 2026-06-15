@@ -40,7 +40,7 @@ browser:
   cookie_consent: "accept"   # accept (default, click 同意/Accept) / reject (future) / skip (no-op)
 
 heartbeat:
-  interval_sec: 300
+  interval_sec: 600
   enabled_for:
     - "all"   # research, fetch-leads, enrich, draft, send, campaign
 
