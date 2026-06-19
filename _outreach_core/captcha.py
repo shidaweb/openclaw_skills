@@ -24,10 +24,11 @@ This module provides a **live, send-time** check that distinguishes:
     turnstile_interstitial … full-page Cloudflare managed challenge / "Verify you are
                              human" interstitial; the real page is gated behind it (blocking)
 
-Only the *blocking* kinds (``v2_challenge``, ``hcaptcha``, ``turnstile_challenge``,
-``turnstile_interstitial``) should stop an autonomous submit. Everything else means:
-if a submit fails, the cause is something other than a captcha (button detection,
-required field, wrong form …), and must be reported as such.
+Visible challenges are marked ``blocking``.  Separately, an explicit unsolved v2
+checkbox/hCaptcha is marked ``requires_human``: it should also defer an autonomous
+submit even before a popup appears.  A populated response token clears either
+condition.  This distinction keeps the log truthful without wasting a submit on
+a known-unsolved gate.
 
 We never solve or bypass a challenge. Blocking detections route to domain-level
 avoidance learning (so we stop wasting attempts) and human relay / skip. The only
@@ -71,11 +72,38 @@ LIVE_CAPTCHA_JS = r"""
   const invisibleWidget = q('.g-recaptcha[data-size="invisible"]');
   const visibleWidget = q('.g-recaptcha:not([data-size="invisible"])');
 
+  // A checkbox/widget may still be present after a human has solved it.  The
+  // response token is the reliable distinction between "human action still
+  // required" and "safe to continue".
+  const responseValue = (selectors) => {
+    for (const el of q(selectors)) {
+      const value = String(el.value || el.textContent || '').trim();
+      if (value) return value;
+    }
+    return '';
+  };
+  const recaptchaToken = responseValue(
+    'textarea[name="g-recaptcha-response"], input[name="g-recaptcha-response"]'
+  );
+  const hcaptchaToken = responseValue(
+    'textarea[name="h-captcha-response"], input[name="h-captcha-response"]'
+  );
+
   // --- Cloudflare Turnstile / managed challenge -----------------------------
   // Embedded widget: explicit .cf-turnstile container, the response input, or
   // the Turnstile iframe.
-  const tsWidgets = q('.cf-turnstile, [data-sitekey][data-callback], input[name="cf-turnstile-response"]');
+  // Do not use the generic [data-sitekey][data-callback] selector here: Google
+  // reCAPTCHA widgets commonly expose exactly those attributes.  That selector
+  // caused explicit reCAPTCHA v2 gates to be mislabeled as a non-blocking
+  // Turnstile widget in production.
+  const tsWidgets = q(
+    '.cf-turnstile, [data-response-field-name="cf-turnstile-response"], ' +
+    'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'
+  );
   const tsIframes = q('iframe[src*="challenges.cloudflare.com"]');
+  const turnstileToken = responseValue(
+    'textarea[name="cf-turnstile-response"], input[name="cf-turnstile-response"]'
+  );
   // Full-page MANAGED challenge interstitial: CF injects these on the gating page.
   const cfChallengeEls = q(
     '#challenge-running, #cf-challenge-running, #challenge-stage, #challenge-form, ' +
@@ -112,6 +140,10 @@ LIVE_CAPTCHA_JS = r"""
   else if (checkboxPresent) kind = 'v2_checkbox';
   else if (v3Scripts.length > 0 || invisibleWidget.length > 0) kind = 'v3_invisible';
 
+  const responseTokenPresent = Boolean(
+    recaptchaToken || hcaptchaToken || turnstileToken
+  );
+
   return {
     kind,
     checkbox_present: checkboxPresent,
@@ -119,6 +151,7 @@ LIVE_CAPTCHA_JS = r"""
     hcaptcha_present: hcaptchaPresent,
     turnstile_present: tsPresent,
     cf_challenge_present: cfChallengePresent,
+    response_token_present: responseTokenPresent,
     has_form: hasForm,
     counts: {
       anchor: anchors.length,
@@ -163,23 +196,50 @@ def classify_live_state(raw: Any) -> dict[str, Any]:
             "turnstile_present": False,
             "cf_challenge_present": False,
             "cloudflare": False,
+            "response_token_present": False,
+            "requires_human": False,
             "counts": {},
         }
     kind = raw.get("kind") or "none"
     checkbox_present = bool(raw.get("checkbox_present"))
     challenge_visible = bool(raw.get("challenge_visible"))
+    response_token_present = bool(raw.get("response_token_present"))
     present = kind not in ("none", "unknown")
+    # An explicit checkbox is not necessarily a *visible image challenge*, but
+    # without a response token it is still a hard submit gate for unattended
+    # automation.  Keep that distinct from ``blocking`` so callers can report
+    # the precise cause instead of claiming a challenge popup was visible.
+    requires_human = (
+        kind in {"v2_checkbox", "v2_challenge", "hcaptcha", "turnstile_challenge"}
+        and not response_token_present
+    )
     return {
         "kind": kind,
         "present": present,
-        "blocking": is_blocking(kind, challenge_visible=challenge_visible),
+        "blocking": (
+            is_blocking(kind, challenge_visible=challenge_visible)
+            and not response_token_present
+        ),
         "checkbox_present": checkbox_present,
         "challenge_visible": challenge_visible,
         "turnstile_present": bool(raw.get("turnstile_present")),
         "cf_challenge_present": bool(raw.get("cf_challenge_present")),
         "cloudflare": is_cloudflare(kind) or bool(raw.get("cf_challenge_present")),
+        "response_token_present": response_token_present,
+        "requires_human": requires_human,
         "counts": raw.get("counts") or {},
     }
+
+
+def should_defer_submit(state: dict[str, Any] | None) -> bool:
+    """Whether the current captcha state makes an automatic submit unsafe.
+
+    A visible challenge is blocking, and an unsolved explicit checkbox/hCaptcha
+    requires human interaction even before a challenge popup is shown.
+    """
+    if not isinstance(state, dict):
+        return False
+    return bool(state.get("blocking") or state.get("requires_human"))
 
 
 def is_cloudflare(kind: str) -> bool:
@@ -207,9 +267,12 @@ def is_blocking(kind: str, *, challenge_visible: bool = False, block_on_checkbox
 def reason_label(state: dict[str, Any]) -> str:
     """Human-readable, *truthful* label for logs/Slack."""
     kind = state.get("kind", "none")
+    if kind == "v2_checkbox":
+        if state.get("response_token_present"):
+            return "reCAPTCHA v2 チェックボックス（response token取得済み）"
+        return "reCAPTCHA v2 チェックボックス未解決（人手操作が必要）"
     return {
         "v2_challenge": "reCAPTCHA v2 画像チャレンジが表示（ブロッキング）",
-        "v2_checkbox": "reCAPTCHA v2 チェックボックスあり（チャレンジ非表示）",
         "v3_invisible": "reCAPTCHA v3（不可視・非ブロッキング）",
         "hcaptcha": "hCaptcha 検出",
         "turnstile_interstitial": "Cloudflare 全画面チャレンジ（Verify you are human・ブロッキング）",

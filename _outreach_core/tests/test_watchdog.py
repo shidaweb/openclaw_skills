@@ -252,6 +252,35 @@ class TestDecideAction(unittest.TestCase):
         )
 
 
+class TestStaleActiveRuns(unittest.TestCase):
+    def test_fresh_run_activity_overrides_stale_host_heartbeat(self) -> None:
+        runs = [{"run_id": "fresh", "activity_age_sec": 20}]
+        self.assertEqual(
+            wd.stale_active_runs(
+                runs, threshold_sec=300, fallback_age_sec=3000
+            ),
+            [],
+        )
+
+    def test_only_stale_run_is_returned(self) -> None:
+        runs = [
+            {"run_id": "fresh", "activity_age_sec": 20},
+            {"run_id": "stale", "activity_age_sec": 301},
+        ]
+        self.assertEqual(
+            [r["run_id"] for r in wd.stale_active_runs(runs, threshold_sec=300)],
+            ["stale"],
+        )
+
+    def test_missing_run_age_uses_host_fallback(self) -> None:
+        rows = wd.stale_active_runs(
+            [{"run_id": "legacy"}],
+            threshold_sec=300,
+            fallback_age_sec=400,
+        )
+        self.assertEqual(rows[0]["activity_age_sec"], 400)
+
+
 class TestDetectWake(unittest.TestCase):
     def test_gap_beyond_factor_is_wake(self) -> None:
         # interval 60s, factor 3 → threshold 180s; gap 300s → wake.

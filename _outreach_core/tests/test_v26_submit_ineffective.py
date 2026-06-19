@@ -103,6 +103,73 @@ class TestClickCascadeDenyAndPartsMatch(unittest.TestCase):
     def test_attributes_matched_separately(self) -> None:
         self.assertIn("parts.some", self.js)
 
+    def test_validation_status_containers_are_never_clicked(self) -> None:
+        self.assertIn("diagnosticMetaRe", self.js)
+        self.assertIn("diagnosticTextRe", self.js)
+        self.assertIn("submit[-_]?error", self.js)
+
+    def test_click_commits_active_field_and_dispatches_pointer_sequence(self) -> None:
+        self.assertIn("commitAndClick", self.js)
+        self.assertIn("pointerdown", self.js)
+        self.assertIn("active.blur", self.js)
+
+
+class TestNativeValidationDiagnostics(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        import importlib.util
+        import sys
+        import types
+        from pathlib import Path
+
+        if "yaml" not in sys.modules:
+            sys.modules["yaml"] = types.SimpleNamespace(
+                safe_dump=lambda obj, **kwargs: "{}\n",
+                safe_load=lambda s: {},
+            )
+        root = Path(__file__).resolve().parent.parent.parent
+        spec = importlib.util.spec_from_file_location(
+            "jp_form_outreach_run_native_validation", root / "jp-form-outreach" / "run.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(module)
+        cls.module = module
+
+    def test_constraint_snapshot_reads_exact_validity_reasons(self) -> None:
+        js = self.module._FORM_CONSTRAINTS_JS
+        for needle in ("willValidate", "validationMessage", "valueMissing", "customError"):
+            self.assertIn(needle, js)
+        self.assertNotIn("reportValidity", js)
+
+    def test_native_rows_convert_to_actionable_error_schema(self) -> None:
+        rows = self.module._native_validation_errors({
+            "invalid": [{
+                "name": "requestGroup[]",
+                "label": "お問い合わせ種別",
+                "reasons": ["valueMissing"],
+                "message": "このフィールドを入力してください。",
+            }]
+        })
+        self.assertEqual(rows[0]["field"], "お問い合わせ種別")
+        self.assertEqual(rows[0]["kind"], "valueMissing")
+        self.assertIn("入力", rows[0]["message"])
+
+    def test_native_radio_group_errors_are_deduplicated(self) -> None:
+        rows = self.module._native_validation_errors({
+            "invalid": [
+                {"name": "kind", "label": "種別 A", "reasons": ["valueMissing"]},
+                {"name": "kind", "label": "種別 B", "reasons": ["valueMissing"]},
+            ]
+        })
+        self.assertEqual(len(rows), 1)
+
+    def test_checkbox_scan_prefers_table_row_and_unique_selector(self) -> None:
+        js = self.module._LIST_CHECKBOX_GATES_JS
+        self.assertIn("el.closest('tr') ||", js)
+        self.assertIn("boxes.length === 1", js)
+        self.assertIn("group_label", js)
+
 
 if __name__ == "__main__":
     unittest.main()

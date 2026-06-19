@@ -10,7 +10,10 @@ asics_corp / gakkyusha). These tests pin banner tolerance with the REAL banner.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import unittest
+from unittest import mock
 
 from _outreach_core import infer
 
@@ -45,6 +48,17 @@ class TestStripCliNoise(unittest.TestCase):
         self.assertEqual(infer._strip_cli_noise("🦞 openclaw\n\n42\n"), "42")
         self.assertEqual(infer._strip_cli_noise(None), "")
         self.assertEqual(infer._strip_cli_noise(""), "")
+
+    def test_error_cleaner_keeps_cause_and_drops_migration_warning(self) -> None:
+        err = (
+            "[state-migrations] Legacy state migration warnings:\n"
+            "- Left plugin install index in place because shared SQLite state has conflicting plugin install metadata for: slack\n"
+            'GatewayClientRequestError: tab not found: browser tab "ABC" not found.\n'
+        )
+        clean = infer._clean_cli_error(err)
+        self.assertNotIn("state-migrations", clean)
+        self.assertNotIn("plugin install", clean)
+        self.assertIn("tab not found", clean)
 
 
 class TestParseEvaluateOutput(unittest.TestCase):
@@ -82,6 +96,32 @@ class TestExtractJsonPayloadBanner(unittest.TestCase):
     def test_json_with_trailing_decoration(self) -> None:
         out = DOCTOR_BANNER + '{"targetId": "X"}\n╰──────╯\n'
         self.assertEqual(infer.extract_json_payload(out), {"targetId": "X"})
+
+
+class TestBrowserErrorLogging(unittest.TestCase):
+    def test_missing_tab_during_close_is_quiet(self) -> None:
+        err = (
+            "[state-migrations] Legacy state migration warnings:\n"
+            'GatewayClientRequestError: tab not found: browser tab "ABC" not found.\n'
+        )
+        buf = io.StringIO()
+        with mock.patch.object(infer, "_run", return_value=(1, "", err)), \
+                contextlib.redirect_stderr(buf):
+            self.assertIsNone(infer.oc_browser("close", "ABC"))
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_real_browser_error_keeps_clean_cause(self) -> None:
+        err = (
+            "[state-migrations] Legacy state migration warnings:\n"
+            "GatewayClientRequestError: navigation failed\n"
+        )
+        buf = io.StringIO()
+        with mock.patch.object(infer, "_run", return_value=(1, "", err)), \
+                contextlib.redirect_stderr(buf):
+            self.assertIsNone(infer.oc_browser("open", "https://example.com"))
+        logged = buf.getvalue()
+        self.assertIn("navigation failed", logged)
+        self.assertNotIn("state-migrations", logged)
 
 
 if __name__ == "__main__":

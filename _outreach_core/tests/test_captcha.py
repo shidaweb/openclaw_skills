@@ -23,10 +23,33 @@ class TestClassifyLiveState(unittest.TestCase):
     def test_v2_checkbox_not_blocking_by_default(self):
         s = C.classify_live_state({"kind": "v2_checkbox", "checkbox_present": True, "challenge_visible": False})
         self.assertFalse(s["blocking"])  # presence of a checkbox ≠ blocking
+        self.assertTrue(s["requires_human"])  # but unattended submit must defer
+        self.assertTrue(C.should_defer_submit(s))
+
+    def test_v2_checkbox_with_response_token_can_continue(self):
+        s = C.classify_live_state({
+            "kind": "v2_checkbox",
+            "checkbox_present": True,
+            "challenge_visible": False,
+            "response_token_present": True,
+        })
+        self.assertFalse(s["blocking"])
+        self.assertFalse(s["requires_human"])
+        self.assertFalse(C.should_defer_submit(s))
 
     def test_v2_challenge_blocks(self):
         s = C.classify_live_state({"kind": "v2_challenge", "checkbox_present": True, "challenge_visible": True})
         self.assertTrue(s["blocking"])
+
+    def test_solved_visible_challenge_does_not_block(self):
+        s = C.classify_live_state({
+            "kind": "v2_challenge",
+            "checkbox_present": True,
+            "challenge_visible": True,
+            "response_token_present": True,
+        })
+        self.assertFalse(s["blocking"])
+        self.assertFalse(s["requires_human"])
 
     def test_hcaptcha_blocks(self):
         s = C.classify_live_state({"kind": "hcaptcha", "checkbox_present": False, "challenge_visible": False})
@@ -66,6 +89,13 @@ class TestReasonLabel(unittest.TestCase):
         # Sanity: the JS payload should be an arrow function returning an object.
         self.assertIn("kind", C.LIVE_CAPTCHA_JS)
         self.assertIn("bframe", C.LIVE_CAPTCHA_JS)
+
+    def test_turnstile_selector_does_not_capture_generic_recaptcha_widget(self):
+        self.assertNotIn(
+            "'.cf-turnstile, [data-sitekey][data-callback],",
+            C.LIVE_CAPTCHA_JS,
+        )
+        self.assertIn('data-response-field-name="cf-turnstile-response"', C.LIVE_CAPTCHA_JS)
 
 
 if __name__ == "__main__":

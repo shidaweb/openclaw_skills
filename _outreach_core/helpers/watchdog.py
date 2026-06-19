@@ -239,6 +239,30 @@ def overall_status(summary: dict[str, Any]) -> str:
     return "ok"
 
 
+def stale_active_runs(
+    runs: list[dict[str, Any]] | None,
+    *,
+    threshold_sec: int,
+    fallback_age_sec: int | None = None,
+) -> list[dict[str, Any]]:
+    """Return only runs whose own activity signal is stale (pure).
+
+    Older callers/tests may not provide ``activity_age_sec``; in that case the
+    host heartbeat age remains a conservative fallback.
+    """
+    stale: list[dict[str, Any]] = []
+    for run in runs or []:
+        age = run.get("activity_age_sec")
+        if age is None:
+            age = fallback_age_sec
+        try:
+            if age is not None and int(age) >= int(threshold_sec):
+                stale.append({**run, "activity_age_sec": int(age)})
+        except (TypeError, ValueError):
+            continue
+    return stale
+
+
 # --------------------------------------------------------------------------- #
 # OS command layer (mocked in tests).                                          #
 # --------------------------------------------------------------------------- #
@@ -718,17 +742,29 @@ def tick(skills_root: Path | None = None) -> str:
         health = read_health(root)
         age = heartbeat_age_seconds(health)
         active = collect_active_runs(root)
-        if active and age is not None and age >= STALE_HEARTBEAT_SEC:
+        stale_runs = stale_active_runs(
+            active,
+            threshold_sec=STALE_HEARTBEAT_SEC,
+            fallback_age_sec=age,
+        )
+        if stale_runs:
             last = _parse_ts(str(state.get("last_stuck_notify") or ""))
             if last is None or (now - last.astimezone(timezone.utc)).total_seconds() >= ABANDON_NOTIFY_INTERVAL_SEC:
+                labels = ", ".join(
+                    f"{r.get('run_id') or r.get('brief_id') or '?'}={r.get('activity_age_sec')}s"
+                    for r in stale_runs[:3]
+                )
                 notify_slack(
-                    f"⚠️ gateway は応答していますが、実行中 run の heartbeat が {age}s 前から"
-                    "更新されていません。タスクが詰まっている可能性があります。",
+                    "⚠️ gateway は応答していますが、実行中 run 固有の進捗が"
+                    f"更新されていません ({labels})。タスクが詰まっている可能性があります。",
                     level="warn",
                 )
                 state["last_stuck_notify"] = _utc_now()
             save_state(state, root)
-            append_log(f"stuck heartbeat {age}s active_runs={len(active)}", root)
+            append_log(
+                f"stuck run activity stale_runs={len(stale_runs)}/{len(active)}",
+                root,
+            )
             return "stuck"
 
         if state.get("last_stuck_notify"):

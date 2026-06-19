@@ -172,6 +172,33 @@ def test_ineffective_clicks_detected_not_misreported(monkeypatch):
     assert res["clicks"] >= 2  # it retried before giving up
 
 
+def test_silent_bounce_with_native_invalid_field_is_validation_stuck(monkeypatch):
+    fake = FakeBrowser([INPUT_PAGE], click_advances=False)
+    _wire(monkeypatch, fake)
+    monkeypatch.setattr(
+        run,
+        "_snapshot_native_validation",
+        lambda **kwargs: {
+            "valid": False,
+            "invalid_count": 1,
+            "invalid": [{
+                "name": "requestGroup[]",
+                "label": "お問い合わせ種別",
+                "type": "radio",
+                "reasons": ["valueMissing"],
+                "message": "このフィールドを入力してください。",
+            }],
+        },
+    )
+    res = run._submission_loop(
+        _target(), CONFIG, "はじめまして。",
+        flow="single", mode="auto", trace=None, tid="t1", timeline=[],
+    )
+    assert res["status"] == "validation_stuck"
+    assert res["errors"][0]["field"] == "お問い合わせ種別"
+    assert "valueMissing" in res["errors"][0]["kind"]
+
+
 def test_unfixable_validation_bounce_terminates_as_validation_stuck(monkeypatch):
     # distinct bounce pages each round (fingerprint changes) — never proceeds
     # to a blind final submit, terminates with the honest reason instead

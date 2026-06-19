@@ -147,11 +147,56 @@ def should_auto_check_checkbox(box: dict[str, Any] | None) -> bool:
 def pick_checkboxes_to_check(checkboxes: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     if not isinstance(checkboxes, list):
         return []
+    candidates = [box for box in checkboxes if should_auto_check_checkbox(box)]
     out: list[dict[str, Any]] = []
-    for box in checkboxes:
-        if should_auto_check_checkbox(box):
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for box in candidates:
+        group_label = str(box.get("group_label") or "").strip()
+        if group_label and not is_agreement_label(str(box.get("label") or "")):
+            grouped.setdefault(group_label, []).append(box)
+        else:
             out.append(box)
+
+    # A shared visual 必須 marker often means "choose at least one" for the
+    # whole checkbox group.  Checking every option fabricates preferences and
+    # can itself make a form invalid.  Pick one semantically safe option.
+    for boxes in grouped.values():
+        if len(boxes) == 1:
+            out.append(boxes[0])
+            continue
+        picked = _pick_checkbox_group_candidate(boxes)
+        if picked is not None:
+            out.append(picked)
     return out
+
+
+def _pick_checkbox_group_candidate(
+    boxes: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    options = [
+        {
+            "label": str(box.get("label") or ""),
+            "value": str(box.get("value") or ""),
+            "selected": bool(box.get("checked")),
+            "disabled": bool(box.get("disabled")),
+        }
+        for box in boxes
+    ]
+    picked = choose_b2b_option(options)
+    wanted = str((picked or {}).get("value") or "").strip()
+    if not wanted:
+        wanted = _pick_neutral_or_first_option(options, allow_first=False) or ""
+    if not wanted:
+        return None
+    for box in boxes:
+        if bool(box.get("disabled")) or bool(box.get("checked")):
+            continue
+        if wanted in {
+            str(box.get("label") or "").strip(),
+            str(box.get("value") or "").strip(),
+        }:
+            return box
+    return None
 
 
 def pick_radio_gate_actions(

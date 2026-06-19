@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -121,6 +122,58 @@ def append_sent_history(sent_drafts: list[dict[str, Any]]) -> None:
         DATA_DIR,
         extra_fields=("name", "industry", "form_url"),
     )
+    try:
+        _sync_targets_sent_status(sent_drafts)
+    except Exception as exc:  # history remains the source of truth on sync failure
+        print(f"[sent-history] ⚠ targets YAML status sync failed: {exc}", file=sys.stderr)
+
+
+def _sync_targets_sent_status(
+    sent_drafts: list[dict[str, Any]],
+    *,
+    targets_path: Path | None = None,
+    sent_at: str | None = None,
+) -> int:
+    """Atomically mirror confirmed sends into ``targets/<brief>.yaml``.
+
+    ``sent_history.jsonl`` remains the append-only delivery source of truth, but
+    keeping the curated YAML status aligned prevents operators/agents from
+    reporting confirmed sends as still pending and reduces duplicate-send risk.
+    """
+    path = targets_path or (_PATHS.targets_path if _PATHS is not None else None)
+    if not sent_drafts or path is None or not path.is_file():
+        return 0
+    ids = {str(d.get("id") or "") for d in sent_drafts if d.get("id") is not None}
+    if not ids:
+        return 0
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(raw, dict):
+        return 0
+    companies = raw.get("companies") or []
+    if not isinstance(companies, list):
+        return 0
+    stamp = sent_at or datetime.utcnow().isoformat() + "Z"
+    changed = 0
+    for company in companies:
+        if not isinstance(company, dict) or str(company.get("id") or "") not in ids:
+            continue
+        if company.get("status") != "sent" or not company.get("sent_at"):
+            company["status"] = "sent"
+            company["sent_at"] = stamp
+            changed += 1
+    if not changed:
+        return 0
+    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+    try:
+        tmp.write_text(
+            yaml.safe_dump(raw, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    print(f"[sent-history] synced {changed} target status(es) -> {path.name}")
+    return changed
 
 
 def stage_history(action: str) -> None:
@@ -2078,7 +2131,10 @@ _LIST_CHECKBOX_GATES_JS = r"""
   const stableSelector = (el) => {
     if (el.id) return `#${CSS.escape(el.id)}`;
     const name = el.getAttribute('name');
-    if (name) return `input[type="checkbox"][name="${CSS.escape(name)}"]`;
+    if (name) {
+      const boxes = document.querySelectorAll(`input[type="checkbox"][name="${CSS.escape(name)}"]`);
+      if (boxes.length === 1) return `input[type="checkbox"][name="${CSS.escape(name)}"]`;
+    }
     let cur = el;
     const path = [];
     for (let depth = 0; cur && depth < 7 && cur !== document.body; depth += 1) {
@@ -2093,7 +2149,11 @@ _LIST_CHECKBOX_GATES_JS = r"""
     return path.join(' > ');
   };
   const contextText = (el) => {
-    const row = el.closest('tr, dl, .form-row, .form-group, .field, .input, .item, li, p, td, th, fieldset, div');
+    // Prefer the semantic row over the nearest <td>/<div>.  In table forms the
+    // 必須 marker is normally in the sibling <th>, not inside the checkbox cell.
+    const row = el.closest('tr') || el.closest('fieldset') ||
+      el.closest('.form-row, .form-group, .field, .input, .item, dl') ||
+      el.closest('li, p, td, th, div');
     return row ? norm((row.textContent || '').slice(0, 240)) : '';
   };
   // NOTE: bare ※ is a generic footnote marker in JP forms, not a reliable
@@ -2120,12 +2180,32 @@ _LIST_CHECKBOX_GATES_JS = r"""
     }
     return txt;
   };
+  const groupLabelFor = (el) => {
+    const fs = el.closest('fieldset');
+    if (fs) {
+      const legend = fs.querySelector('legend');
+      if (legend) return norm(legend.textContent || '');
+    }
+    const tr = el.closest('tr');
+    if (tr) {
+      const head = tr.querySelector('th, .label, .title, dt');
+      if (head) return norm(head.textContent || '');
+    }
+    const row = el.closest('.form-row, .form-group, .field, .input, .item, dl');
+    if (row) {
+      const head = row.querySelector(':scope > label, :scope > .label, :scope > .title, :scope > dt');
+      if (head) return norm(head.textContent || '');
+    }
+    return '';
+  };
   const out = [];
   for (const cb of document.querySelectorAll('input[type="checkbox"]')) {
+    const nativeRequired = Boolean(
+      cb.required || cb.getAttribute('aria-required') === 'true' ||
+      cb.getAttribute('data-required') === 'true'
+    );
     const required = Boolean(
-      cb.required ||
-      cb.getAttribute('aria-required') === 'true' ||
-      cb.getAttribute('data-required') === 'true' ||
+      nativeRequired ||
       visuallyRequired(cb)
     );
     out.push({
@@ -2133,8 +2213,11 @@ _LIST_CHECKBOX_GATES_JS = r"""
       id: cb.id || '',
       selector: stableSelector(cb),
       label: labelFor(cb),
+      group_label: groupLabelFor(cb),
+      value: cb.value || '',
       checked: Boolean(cb.checked),
       required: required,
+      native_required: nativeRequired,
       disabled: Boolean(cb.disabled || cb.getAttribute('aria-disabled') === 'true'),
     });
   }
@@ -2314,6 +2397,82 @@ _LIST_SELECT_GATES_JS = r"""
 """
 
 
+# Side-effect-free snapshot of the browser's native Constraint Validation API.
+# Reading ValidityState/validationMessage does not show validation UI, but gives
+# us field-level reasons that generic page-text classification cannot see.
+_FORM_CONSTRAINTS_JS = r"""
+() => {
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const visible = (el) => {
+    const st = getComputedStyle(el);
+    const r = el.getBoundingClientRect();
+    return st.display !== 'none' && st.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+  };
+  const labelFor = (el) => {
+    if (el.labels && el.labels.length) {
+      const text = norm(Array.from(el.labels).map((x) => x.textContent || '').join(' '));
+      if (text) return text;
+    }
+    const aria = norm(el.getAttribute('aria-label') || '');
+    if (aria) return aria;
+    const tr = el.closest('tr');
+    if (tr) {
+      const head = tr.querySelector('th, .label, .title, dt');
+      if (head) return norm(head.textContent || '');
+    }
+    const row = el.closest('fieldset, .form-row, .form-group, .field, .input, .item, dl');
+    if (row) {
+      const head = row.querySelector('legend, :scope > label, :scope > .label, :scope > .title, :scope > dt');
+      if (head) return norm(head.textContent || '');
+    }
+    return '';
+  };
+  const forms = Array.from(document.querySelectorAll('form')).filter(visible);
+  let root = forms.find((f) => f.querySelector('textarea')) ||
+    forms.sort((a, b) => b.querySelectorAll('input,select,textarea').length -
+                         a.querySelectorAll('input,select,textarea').length)[0] || document;
+  const controls = Array.from(root.querySelectorAll('input, select, textarea'));
+  const invalid = [];
+  for (const el of controls) {
+    // Custom radio/checkbox widgets commonly hide the native input and render
+    // a styled label. Hidden-by-CSS controls still participate in validation.
+    if (el.disabled) continue;
+    const validity = el.validity || null;
+    const nativeInvalid = Boolean(el.willValidate && validity && !validity.valid);
+    const ariaInvalid = el.getAttribute('aria-invalid') === 'true';
+    if (!nativeInvalid && !ariaInvalid) continue;
+    const reasons = [];
+    if (validity) {
+      for (const key of [
+        'valueMissing', 'typeMismatch', 'patternMismatch', 'tooLong', 'tooShort',
+        'rangeUnderflow', 'rangeOverflow', 'stepMismatch', 'badInput', 'customError'
+      ]) {
+        if (validity[key]) reasons.push(key);
+      }
+    }
+    if (ariaInvalid && !reasons.length) reasons.push('ariaInvalid');
+    invalid.push({
+      name: el.name || el.id || '',
+      id: el.id || '',
+      type: (el.type || el.tagName || '').toLowerCase(),
+      label: labelFor(el),
+      reasons,
+      message: norm(el.validationMessage || '').slice(0, 240),
+      value_present: Boolean(el.type === 'checkbox' || el.type === 'radio' ? el.checked : el.value),
+      visible: visible(el),
+    });
+  }
+  return {
+    form_found: root !== document,
+    control_count: controls.length,
+    invalid_count: invalid.length,
+    valid: invalid.length === 0,
+    invalid: invalid.slice(0, 40),
+  };
+}
+"""
+
+
 _CLICK_BUTTON_BY_TEXT_JS = r"""
 (args) => {
   const { patterns, formRootSelector } = args;
@@ -2334,6 +2493,26 @@ _CLICK_BUTTON_BY_TEXT_JS = r"""
   // 2026-06-13: pattern "submit" matched name="submitBack" (変更する) and
   // bounced the confirm page back to input forever.
   const denyRe = /(戻る|戻り|変更する|修正する|再入力|やり直|キャンセル|cancel|前の画面|入力画面に|submit_?back|go_?back|btn_?back|\bback\b|reset)/i;
+  const diagnosticMetaRe = /(submit[-_]?error|validation|invalid|response[-_]?output|alert|notice|message[-_]?error|error[-_]?message|required[-_]?message)/i;
+  const diagnosticTextRe = /(未入力|入力が正しくない|入力エラー|入力内容に誤り|エラーがあります|正しく入力してください|必須項目)/i;
+  const isNativeControl = (el) => {
+    const tag = String(el.tagName || '').toLowerCase();
+    return tag === 'button' || tag === 'input' || tag === 'a' ||
+      el.getAttribute('role') === 'button' || el.hasAttribute('onclick');
+  };
+  const commitAndClick = (el) => {
+    // Commit framework-controlled fields before submit (CF7/React/Vue sites
+    // sometimes validate only after blur/change), then reproduce the pointer
+    // event sequence before the single click.
+    const active = document.activeElement;
+    if (active && active !== document.body && typeof active.blur === 'function') active.blur();
+    if (typeof el.focus === 'function') el.focus({ preventScroll: true });
+    for (const type of ['pointerdown', 'mousedown', 'mouseup', 'pointerup']) {
+      try { el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window })); }
+      catch (e) {}
+    }
+    el.click();
+  };
   for (const scope of scopes) {
     const buttons = Array.from(scope.querySelectorAll(selector));
     for (const pat of patterns) {
@@ -2352,6 +2531,14 @@ _CLICK_BUTTON_BY_TEXT_JS = r"""
         // Skip elements with too much text (likely a wrapper, not a button)
         if (txt.length > 80) continue;
         if (denyRe.test(txt)) continue;
+        const meta = `${b.id || ''} ${b.className || ''} ${b.getAttribute('role') || ''}`;
+        // [class*="submit"] also matches validation/status containers such as
+        // .submit-error.  They are diagnostics, not controls; production once
+        // logged their error sentence as the "clicked button".
+        if (!isNativeControl(b) && (diagnosticMetaRe.test(meta) || diagnosticTextRe.test(txt))) continue;
+        if (!isNativeControl(b) && b.querySelector(
+          'button, input[type="submit"], input[type="button"], input[type="image"], a, [role="button"]'
+        )) continue;
         if (!parts.some((p) => p && re.test(p))) continue;
         const style = window.getComputedStyle(b);
         const blocked = Boolean(
@@ -2362,7 +2549,7 @@ _CLICK_BUTTON_BY_TEXT_JS = r"""
           style.display === 'none'
         );
         if (!blocked && b.offsetParent !== null) {
-          b.click();
+          commitAndClick(b);
           return {
             clicked: true,
             found_but_disabled: foundButDisabled,
@@ -2873,7 +3060,9 @@ def _auto_check_submit_gates() -> dict[str, Any]:
     for cb in to_check:
         name = (cb.get("name") or cb.get("id") or "").strip()
         selector = str(cb.get("selector") or "").strip()
-        if not name and selector:
+        # Prefer the exact selector even when a name exists. Checkbox groups
+        # share names, and name-only lookup would always toggle option 1.
+        if selector:
             name = f"selector:{selector}"
         out = _check_by_name(name) if name else None
         if not (out and out.get("ok")):
@@ -2888,6 +3077,69 @@ def _auto_check_submit_gates() -> dict[str, Any]:
         "candidates": len(to_check),
         "total_checkboxes": len(checkboxes),
     }
+
+
+def _snapshot_native_validation(
+    *,
+    trace_dir: Path | None = None,
+    target_id: str | None = None,
+    phase: str = "send",
+) -> dict[str, Any]:
+    """Read field-level native validity without opening browser validation UI."""
+    raw = _evaluate(_FORM_CONSTRAINTS_JS)
+    out = raw if isinstance(raw, dict) else {
+        "form_found": False,
+        "control_count": 0,
+        "invalid_count": 0,
+        "valid": True,
+        "invalid": [],
+    }
+    invalid = out.get("invalid") if isinstance(out.get("invalid"), list) else []
+    out["invalid"] = [x for x in invalid if isinstance(x, dict)][:40]
+    out["invalid_count"] = int(out.get("invalid_count") or len(out["invalid"]))
+    if out["invalid_count"] > 0:
+        _emit_event(
+            "send.native_validation.invalid",
+            stage="send",
+            target_id=target_id or "",
+            payload={
+                "phase": phase,
+                "invalid_count": out["invalid_count"],
+                "invalid": [
+                    {
+                        "field": str(x.get("label") or x.get("name") or x.get("id") or "?")[:80],
+                        "name": str(x.get("name") or "")[:80],
+                        "type": str(x.get("type") or "")[:30],
+                        "reasons": list(x.get("reasons") or [])[:6],
+                        "message": str(x.get("message") or "")[:160],
+                    }
+                    for x in out["invalid"][:12]
+                ],
+            },
+            trace_dir=trace_dir,
+        )
+    return out
+
+
+def _native_validation_errors(snapshot: dict[str, Any] | None) -> list[dict[str, str]]:
+    """Convert native validity rows to the submission-loop error schema."""
+    if not isinstance(snapshot, dict):
+        return []
+    out: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in snapshot.get("invalid") or []:
+        if not isinstance(row, dict):
+            continue
+        field = str(row.get("label") or row.get("name") or row.get("id") or "unknown")
+        reasons = [str(x) for x in (row.get("reasons") or []) if str(x)]
+        kind = "+".join(reasons) or "invalid"
+        message = str(row.get("message") or "").strip()
+        dedupe_key = (str(row.get("name") or field).strip(), kind)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        out.append({"field": field[:80], "kind": kind[:80], "message": message[:200]})
+    return out
 
 
 # Sender context for gate auto-fill decisions. Set once per target by
@@ -6021,6 +6273,7 @@ def _submission_loop(
     confirm_seen = False
     confirm_gate_done = False
     input_rescue_done = False
+    last_validation_errors: list[dict[str, str]] = []
     phase = "first" if flow == "confirm" else "final"
 
     for step in range(MAX_FORM_STEPS + 2):
@@ -6068,17 +6321,54 @@ def _submission_loop(
                 rescue = _harvest_and_fix_validation_errors(
                     d, config, send_body, stage="send", trace_dir=trace,
                 )
-                if rescue.get("fixed"):
+                native = _snapshot_native_validation(
+                    trace_dir=trace, target_id=tid, phase="silent_bounce",
+                )
+                native_errors = _native_validation_errors(native)
+                harvested_errors = [
+                    {
+                        "field": str(e.get("field") or "unknown")[:80],
+                        "kind": str(e.get("kind") or "validation")[:80],
+                        "message": str(e.get("message") or "")[:200],
+                    }
+                    for e in (rescue.get("errors") or []) if isinstance(e, dict)
+                ]
+                last_validation_errors = native_errors or harvested_errors
+                # A server-side/custom validator can silently return to the
+                # input page without error keywords. Treat that bounce as
+                # evidence to retry newly revealed radio/select gates once.
+                live_rescue = _auto_fill_live_gates(
+                    phase="silent_bounce",
+                    aggressive_radios=True,
+                    aggressive_selects=True,
+                    trace_dir=trace,
+                    target_id=tid,
+                )
+                changed = int(rescue.get("fixed") or 0) + int(live_rescue.get("changed") or 0)
+                if changed:
                     fixes = (
                         (rescue.get("zenkaku_fixed") or [])
                         + (rescue.get("phone_fixed") or [])
                     )
-                    print(f"  [send] silent-bounce rescue: fixed={rescue.get('fixed')} "
+                    print(f"  [send] silent-bounce rescue: fixed={changed} "
                           f"{', '.join(fixes[:4])}")
                     core_timeline.add(
-                        timeline, "input_rescue", True, fixed=rescue.get("fixed"),
+                        timeline, "input_rescue", True,
+                        fixed=int(rescue.get("fixed") or 0),
+                        gates=int(live_rescue.get("changed") or 0),
+                        invalid_fields=len(native_errors),
                     )
             if no_progress >= 2:
+                native = _snapshot_native_validation(
+                    trace_dir=trace, target_id=tid, phase="stuck",
+                )
+                exact_errors = _native_validation_errors(native) or last_validation_errors
+                if exact_errors:
+                    return _result(
+                        "validation_stuck", obs,
+                        errors=exact_errors[:12],
+                        native_validation=native,
+                    )
                 return _result("ineffective", obs, phase=phase)
         else:
             no_progress = 0
@@ -6089,7 +6379,19 @@ def _submission_loop(
             vfix = _harvest_and_fix_validation_errors(
                 d, config, send_body, stage="send", trace_dir=trace,
             )
-            errs = vfix.get("errors") or []
+            native = _snapshot_native_validation(
+                trace_dir=trace, target_id=tid, phase="validation_error",
+            )
+            native_errors = _native_validation_errors(native)
+            errs = native_errors or (vfix.get("errors") or [])
+            last_validation_errors = [
+                {
+                    "field": str(e.get("field") or "unknown")[:80],
+                    "kind": str(e.get("kind") or "validation")[:80],
+                    "message": str(e.get("message") or "")[:200],
+                }
+                for e in errs if isinstance(e, dict)
+            ]
             if errs:
                 err_fields = ", ".join(f"{e['field'][:16]}[{e['kind']}]" for e in errs[:4])
                 print(f"  [send] ⚠ validation errors: {err_fields} → fixed={vfix.get('fixed')}")
@@ -6601,29 +6903,34 @@ def _send_one_target(
             "enrich_flag": bool(captcha),
             "live_kind": cap_state["kind"],
             "blocking": cap_state["blocking"],
+            "requires_human": cap_state.get("requires_human", False),
+            "response_token_present": cap_state.get("response_token_present", False),
             "counts": cap_state.get("counts", {}),
         },
         trace_dir=trace,
     )
-    if captcha and not cap_state["blocking"]:
+    captcha_deferred = core_captcha.should_defer_submit(cap_state)
+    if captcha and not captcha_deferred:
         print(f"  [send] captcha 再確認: enrich={captcha} だが live={cap_state['kind']} "
               f"（非ブロッキング）→ 続行")
     core_timeline.add(
-        timeline, "captcha", (not cap_state["blocking"]),
+        timeline, "captcha", (not captcha_deferred),
         kind=cap_state.get("kind"), blocking=cap_state["blocking"],
+        requires_human=cap_state.get("requires_human"),
     )
     if cap_state.get("cloudflare"):
         core_avoidance.mark_cloudflare(DATA_DIR, form_url)
-    if cap_state["blocking"]:
+    if captcha_deferred:
         label = core_captcha.reason_label(cap_state)
-        print(f"  [send] ⚠ {label} — 突破せず迂回/記録（完全自律・人手なし方針）")
+        reason_kind = "captcha_blocking" if cap_state.get("blocking") else "captcha_human_required"
+        print(f"  [send] ⚠ {label} — response token未取得のため送信せず退避")
         core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_CAPTCHA_BLOCKED)
         filled_only.append(d)
         if autonomous:
-            _auto_skip_and_log(d, f"captcha_blocking: {cap_state['kind']} ({label})")
+            _auto_skip_and_log(d, f"{reason_kind}: {cap_state['kind']} ({label})")
         else:
-            _escalate_await_proceed(d, f"reCAPTCHA visible challenge: {cap_state['kind']}")
-        return {"outcome": "skipped"}
+            _escalate_await_proceed(d, f"captcha human action required: {cap_state['kind']}")
+        return {"outcome": "skipped", "reason": reason_kind}
 
     if mode == "fill-only":
         print(f"  [send] ✓ filled. Click 確認/送信 manually.")
@@ -6724,9 +7031,14 @@ def _send_one_target(
             return {"outcome": "skipped"}
 
         if status == "validation_stuck":
-            fields = ", ".join(
-                f"{e.get('field')}[{e.get('kind')}]" for e in (subres.get("errors") or [])[:5]
-            )
+            field_parts: list[str] = []
+            for e in (subres.get("errors") or [])[:5]:
+                message = str(e.get("message") or "").strip()
+                part = f"{e.get('field')}[{e.get('kind')}]"
+                if message:
+                    part += f": {message[:100]}"
+                field_parts.append(part)
+            fields = ", ".join(field_parts) or "項目を特定できませんでした"
             print(f"  [send] ⚠ validation errors persist after auto-fix — {fields}")
             core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_WRONG_FORM)
             _queue_for_resolver(

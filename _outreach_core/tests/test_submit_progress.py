@@ -31,6 +31,43 @@ class TestSubmitProgress(unittest.TestCase):
         picked = sp.pick_checkboxes_to_check(boxes)
         self.assertEqual([b.get("name") for b in picked], ["a", "c"])
 
+    def test_required_checkbox_group_checks_only_safe_other_option(self) -> None:
+        boxes = [
+            {
+                "name": "service01", "label": "イベント制作", "value": "event",
+                "group_label": "ご希望のサービス 必須", "required": True,
+                "checked": False, "disabled": False,
+            },
+            {
+                "name": "service02", "label": "採用支援", "value": "recruit",
+                "group_label": "ご希望のサービス 必須", "required": True,
+                "checked": False, "disabled": False,
+            },
+            {
+                "name": "service08", "label": "その他", "value": "other",
+                "group_label": "ご希望のサービス 必須", "required": True,
+                "checked": False, "disabled": False,
+            },
+        ]
+        picked = sp.pick_checkboxes_to_check(boxes)
+        self.assertEqual(len(picked), 1)
+        self.assertEqual(picked[0]["name"], "service08")
+
+    def test_required_checkbox_group_does_not_invent_unsafe_preference(self) -> None:
+        boxes = [
+            {
+                "name": "service01", "label": "イベント制作", "value": "event",
+                "group_label": "ご希望のサービス 必須", "required": True,
+                "checked": False, "disabled": False,
+            },
+            {
+                "name": "service02", "label": "採用支援", "value": "recruit",
+                "group_label": "ご希望のサービス 必須", "required": True,
+                "checked": False, "disabled": False,
+            },
+        ]
+        self.assertEqual(sp.pick_checkboxes_to_check(boxes), [])
+
     def test_pick_radio_gate_actions_prefers_business_option(self) -> None:
         groups = [
             {

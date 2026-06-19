@@ -96,7 +96,20 @@ def oc_browser(*args: str, profile: str = BROWSER_PROFILE) -> str | None:
     cmd = ["openclaw", "browser", "--browser-profile", profile, *args]
     rc, out, err = _run(cmd)
     if rc != 0:
-        print(f"[browser err] {' '.join(args)}: {err.strip()}", file=__import__("sys").stderr)
+        clean_err = _clean_cli_error(err)
+        # Closing a resolver tab that the browser/site already closed is an
+        # idempotent cleanup result, not a campaign failure.  Suppressing only
+        # this known case keeps root-cause logs free of migration/banner noise.
+        benign_missing_close = bool(
+            args
+            and args[0] == "close"
+            and "tab not found" in clean_err.casefold()
+        )
+        if not benign_missing_close:
+            print(
+                f"[browser err] {' '.join(args)}: {clean_err or 'unknown browser error'}",
+                file=__import__("sys").stderr,
+            )
         return None
     return _strip_cli_noise(out)
 
@@ -123,6 +136,25 @@ def _strip_cli_noise(stdout: str | None) -> str:
         if all(ch in _CLI_NOISE_CHARS for ch in s):
             continue
         kept.append(line)
+    return "\n".join(kept).strip()
+
+
+def _clean_cli_error(stderr: str | None) -> str:
+    """Remove known OpenClaw state-migration warnings from an actual error."""
+    text = _strip_cli_noise(stderr)
+    if not text:
+        return ""
+    warning_prefixes = (
+        "[state-migrations] legacy state migration warnings",
+        "legacy state migration warnings",
+        "- left plugin install index in place because shared sqlite state",
+        "conflicting plugin install metadata for:",
+    )
+    kept = [
+        line
+        for line in text.splitlines()
+        if not line.strip().casefold().startswith(warning_prefixes)
+    ]
     return "\n".join(kept).strip()
 
 
