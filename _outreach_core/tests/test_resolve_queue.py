@@ -56,6 +56,12 @@ class TestQueue(unittest.TestCase):
         pend = Q.pending(self.dir)
         self.assertEqual([r["target_id"] for r in pend], ["b"])
 
+    def test_partition_pending_by_sent_blocks_stale_resolver_entry(self):
+        entries = [_entry("sent_one"), _entry("still_pending")]
+        unsent, already_sent = Q.partition_pending_by_sent(entries, {"sent_one"})
+        self.assertEqual([r["target_id"] for r in unsent], ["still_pending"])
+        self.assertEqual([r["target_id"] for r in already_sent], ["sent_one"])
+
     def test_mark_sets_status_and_note(self):
         Q.enqueue(self.dir, _entry("a"))
         self.assertTrue(Q.mark(self.dir, "a", "skipped", note="deep resolver failed"))

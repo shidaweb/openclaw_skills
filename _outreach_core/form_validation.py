@@ -325,6 +325,13 @@ _ERR_REQUIRED2_RE = re.compile(r"(?P<f>.+?)\s*は\s*必須")
 # Bare parenthesized hints 「（全角で入力してください）」 (petline static text)
 # yield a junk 1-char field and are filtered by the length guard below.
 _ERR_ZENKAKU_RE = re.compile(r"(?P<f>.+?)\s*(?:は|を)?\s*全角で(?:ご)?(?:入力|記入)")
+# 「数値を半角で入力してください」 (keeper_giken 2026-06-19).  This is a
+# format complaint, not a missing-value complaint.  It must run before the
+# generic required matcher below, whose trailing 「入力してください」 otherwise
+# misclassifies the message as ``required``.
+_ERR_HANKAKU_NUMERIC_RE = re.compile(
+    r"(?P<f>.*?)\s*数値を半角で(?:ご)?(?:入力|記入)"
+)
 _JP_WORD_RE = re.compile(r"[ぁ-んァ-ヶ一-龠a-zA-Z0-9]")
 
 
@@ -365,6 +372,14 @@ def parse_validation_errors(text: str | None) -> list[dict[str, str]]:
                     seen.add(key)
                     out.append({"field": field, "kind": "zenkaku", "raw": line})
             continue
+        m = _ERR_HANKAKU_NUMERIC_RE.search(line)
+        if m:
+            field = _clean_field(m.group("f")) or "数値"
+            key = (field, "hankaku_numeric")
+            if key not in seen:
+                seen.add(key)
+                out.append({"field": field, "kind": "hankaku_numeric", "raw": line})
+            continue
         m = _ERR_REQUIRED_RE.search(line) or _ERR_REQUIRED2_RE.search(line)
         if m:
             field = _clean_field(m.group("f"))
@@ -396,6 +411,31 @@ def to_zenkaku(value: str | None) -> str:
         else:
             out.append(ch)
     return "".join(out)
+
+
+_POSTAL_FIELD_RE = re.compile(r"(郵便番号|postal(?:code)?|post[_ -]?code|zip(?:code)?)", re.IGNORECASE)
+_FULLWIDTH_DIGIT_TRANS = str.maketrans("０１２３４５６７８９", "0123456789")
+
+
+def is_postal_field_label(label: str | None) -> bool:
+    """Whether a field label/name denotes a postal code input."""
+    return bool(_POSTAL_FIELD_RE.search((label or "").strip()))
+
+
+def normalize_postal_code(value: str | None) -> str:
+    """Return a JP postal code as seven ASCII digits when safely possible.
+
+    Inquiry forms disagree about whether ``260-0003`` is accepted, while the
+    digits-only representation is accepted by the common seven-digit validators.
+    The function is content-preserving: values that do not normalize to exactly
+    seven digits are returned unchanged.
+    """
+    original = (value or "").strip()
+    if not original:
+        return original
+    ascii_value = original.translate(_FULLWIDTH_DIGIT_TRANS)
+    digits = re.sub(r"[^0-9]", "", ascii_value)
+    return digits if len(digits) == 7 else original
 
 
 _PHONE_FIELD_RE = re.compile(r"(電話|TEL|tel|phone|携帯|連絡先番号)", re.IGNORECASE)

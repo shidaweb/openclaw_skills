@@ -34,6 +34,21 @@ class TestScriptDetection(unittest.TestCase):
         self.assertEqual(fv.hiragana_to_katakana("しだのりみち"), "シダノリミチ")
 
 
+class TestPostalNormalization(unittest.TestCase):
+    def test_postal_label_detection(self) -> None:
+        self.assertTrue(fv.is_postal_field_label("郵便番号"))
+        self.assertTrue(fv.is_postal_field_label("g_postalCode"))
+        self.assertTrue(fv.is_postal_field_label("zip_code"))
+        self.assertFalse(fv.is_postal_field_label("電話番号"))
+
+    def test_normalizes_hyphenated_and_fullwidth_postal_codes(self) -> None:
+        self.assertEqual(fv.normalize_postal_code("260-0003"), "2600003")
+        self.assertEqual(fv.normalize_postal_code("２６０－０００３"), "2600003")
+
+    def test_does_not_rewrite_non_postal_length(self) -> None:
+        self.assertEqual(fv.normalize_postal_code("03-1234-5678"), "03-1234-5678")
+
+
 class TestLabelClassification(unittest.TestCase):
     def test_expected_kana_kind(self) -> None:
         self.assertEqual(fv.expected_kana_kind("フリガナ（姓）"), "katakana")
@@ -164,6 +179,13 @@ class TestParseValidationErrors(unittest.TestCase):
     def test_dedup(self) -> None:
         text = "件名を入力してください\n件名を入力してください"
         self.assertEqual(len(fv.parse_validation_errors(text)), 1)
+
+    def test_hankaku_numeric_is_format_not_required(self) -> None:
+        errs = fv.parse_validation_errors(
+            "- generic [ref=e386]: 数値を半角で入力してください。"
+        )
+        self.assertEqual(len(errs), 1)
+        self.assertEqual(errs[0]["kind"], "hankaku_numeric")
 
 
 if __name__ == "__main__":

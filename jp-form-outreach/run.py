@@ -35,6 +35,7 @@ from _outreach_core import captcha as core_captcha
 from _outreach_core import content_guard as core_content_guard
 from _outreach_core import contact_url as core_contact_url
 from _outreach_core import resolve_queue as core_resolve_queue
+from _outreach_core import run_progress as core_progress
 from _outreach_core import send_journal as core_send_journal
 from _outreach_core import send_state as core_send_state
 from _outreach_core import send_timeline as core_timeline
@@ -1742,7 +1743,20 @@ def stage_resolve_queue(config: dict[str, Any] | None = None) -> None:
         except FileNotFoundError:
             config = {}
 
-    queue = core_resolve_queue.pending(DATA_DIR)
+    queue, already_sent = core_resolve_queue.partition_pending_by_sent(
+        core_resolve_queue.pending(DATA_DIR),
+        load_sent_set(),
+    )
+    for entry in already_sent:
+        tid = str(entry.get("target_id") or entry.get("id") or "")
+        name = str(entry.get("name") or tid)
+        core_resolve_queue.mark(
+            DATA_DIR, tid, "resolved", note="already present in sent_history; duplicate blocked"
+        )
+        close_needs_attention(
+            DATA_DIR, tid, resolution="already sent; stale resolver entry closed"
+        )
+        print(f"[resolver] duplicate blocked: {name} is already in sent_history")
     if not queue:
         print("[resolver] queue empty — nothing to resolve")
         return
@@ -2606,6 +2620,12 @@ _CLICK_BUTTON_BY_TEXT_JS = r"""
         // Skip elements with too much text (likely a wrapper, not a button)
         if (txt.length > 80) continue;
         if (denyRe.test(txt)) continue;
+        // Broad class selectors (.btn / [class*=submit]) are useful for finding
+        // styled controls, but also match passive wrappers and checkbox labels.
+        // Clicking a wrapper such as Carchs' 「この内容で送信する」 consent row
+        // toggles the gate instead of submitting.  Only click semantic/actionable
+        // controls; div-based controls remain supported via role/onclick.
+        if (!isNativeControl(b)) continue;
         const meta = `${b.id || ''} ${b.className || ''} ${b.getAttribute('role') || ''}`;
         // [class*="submit"] also matches validation/status containers such as
         // .submit-error.  They are diagnostics, not controls; production once
@@ -2847,7 +2867,7 @@ def _apply_fill_guardrails(
     Runs after both the LLM plan and the heuristic fill, so it corrects mistakes
     regardless of which path produced them. Returns a small summary dict.
     """
-    summary = {"kana_fixed": [], "subject_filled": None}
+    summary = {"kana_fixed": [], "postal_fixed": [], "subject_filled": None}
     try:
         from _outreach_core import form_validation as fv
     except Exception:
@@ -2864,10 +2884,22 @@ def _apply_fill_guardrails(
     subject_done = False
     for f in fields:
         label = f.get("label") or ""
+        name = f.get("name") or ""
         value = f.get("value") or ""
         idx = f.get("idx")
         if idx is None:
             continue
+        # Postal fields are most portable as seven ASCII digits.  LLM plans can
+        # legitimately choose sender.postal_code (260-0003), but sites such as
+        # KeePer reject the hyphen with 「数値を半角で入力してください」.  Normalize
+        # after every fill path so target-specific overrides are unnecessary.
+        if fv.is_postal_field_label(f"{label} {name}"):
+            correct_postal = fv.normalize_postal_code(value)
+            if correct_postal and correct_postal != value:
+                fixes.append({"idx": idx, "value": correct_postal})
+                summary["postal_fixed"].append(
+                    f"{(label or name)[:24]}→{correct_postal}"
+                )
         # (1) furigana fields — correct wrong script AND wrong sei/mei split, and
         #     fill required-but-empty kana fields. kana_field_correction returns
         #     the value to write (or None when the field is already correct).
@@ -2891,6 +2923,8 @@ def _apply_fill_guardrails(
         n = _set_text_fields(fixes)
         for entry in summary["kana_fixed"]:
             diagnostics.setdefault("filled", []).append(f"kana_guard:{entry}")
+        for entry in summary["postal_fixed"]:
+            diagnostics.setdefault("filled", []).append(f"postal_guard:{entry}")
         if summary["subject_filled"]:
             diagnostics.setdefault("filled", []).append(f"subject_guard:{summary['subject_filled']}")
         if n:
@@ -3710,6 +3744,11 @@ _ENUMERATE_BUTTONS_JS = r"""
     );
     return !blocked && el.offsetParent !== null;
   };
+  const actionable = (el) => {
+    const tag = String(el.tagName || '').toLowerCase();
+    return tag === 'button' || tag === 'input' || tag === 'a' ||
+      el.getAttribute('role') === 'button' || el.hasAttribute('onclick');
+  };
   const hasSubmitControl = (form) => {
     if (!form) return false;
     return !!form.querySelector('button[type="submit"],input[type="submit"],input[type="image"]');
@@ -3762,6 +3801,7 @@ _ENUMERATE_BUTTONS_JS = r"""
   const buttons = Array.from(scope.querySelectorAll(selector));
   const out = [];
   buttons.forEach((b, idx) => {
+    if (!actionable(b)) return;
     if (!visibleEnabled(b)) return;
     const txt = norm(
       (b.textContent || b.value || '') + ' ' +
@@ -4596,11 +4636,22 @@ _CHECK_BY_NAME_JS = r"""
     return { ok: false, reason: "checkbox disabled", name };
   }
   if (!cb.checked) {
-    cb.checked = true;
-    cb.dispatchEvent(new Event('change', { bubbles: true }));
-    cb.dispatchEvent(new Event('click', { bubbles: true }));
+    // A click toggles checked by itself.  The old sequence assigned true and
+    // then dispatched click, which deterministically toggled it back to false
+    // (carchs contact_us[confirm]).  Prefer a real click so framework handlers
+    // observe the same transition as a user; retain a setter fallback for
+    // custom widgets that cancel the click.
+    cb.click();
+    if (!cb.checked) {
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype, 'checked'
+      ).set;
+      setter.call(cb, true);
+      cb.dispatchEvent(new Event('input', { bubbles: true }));
+      cb.dispatchEvent(new Event('change', { bubbles: true }));
+    }
   }
-  return { ok: true, name };
+  return { ok: !!cb.checked, reason: cb.checked ? '' : 'checkbox remained unchecked', name };
 }
 """
 
@@ -4625,11 +4676,22 @@ _CHECK_BY_LABEL_JS = r"""
     }
     if (txt && txt.includes(label)) {
       if (!cb.checked) {
-        cb.checked = true;
-        cb.dispatchEvent(new Event('change', { bubbles: true }));
-        cb.dispatchEvent(new Event('click', { bubbles: true }));
+        cb.click();
+        if (!cb.checked) {
+          const setter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'checked'
+          ).set;
+          setter.call(cb, true);
+          cb.dispatchEvent(new Event('input', { bubbles: true }));
+          cb.dispatchEvent(new Event('change', { bubbles: true }));
+        }
       }
-      return { ok: true, label, text: txt.slice(0, 60) };
+      return {
+        ok: !!cb.checked,
+        reason: cb.checked ? '' : 'checkbox remained unchecked',
+        label,
+        text: txt.slice(0, 60)
+      };
     }
   }
   return { ok: false, reason: "no checkbox with label", label };
@@ -5481,16 +5543,20 @@ def _heuristic_fill_fallback(target: dict[str, Any], config: dict[str, Any],
     guard = _apply_fill_guardrails(target, sender, body, diagnostics)
     if guard.get("kana_fixed"):
         print(f"  [fill] kana-guard: {', '.join(guard['kana_fixed'][:3])}")
+    if guard.get("postal_fixed"):
+        print(f"  [fill] postal-guard: {', '.join(guard['postal_fixed'][:3])}")
     if guard.get("subject_filled"):
         print(f"  [fill] subject-guard: {guard['subject_filled']}")
 
     return diagnostics
 
 
-_WRONG_FORM_WARN_KW = (
-    "会員登録", "アカウント作成", "新規登録", "ログイン",
-    "採用", "応募", "求人", "履歴書",
-    "予約", "予約フォーム", "資料請求",
+_EXPLICIT_WRONG_FORM_WARNING_RE = re.compile(
+    r"(wrong[_ -]?form|non[_ -]?contact|"
+    r"(?:会員登録|アカウント作成|ログイン|採用|応募|求人|予約)(?:専用フォーム|フォーム専用|専用|のみ)|"
+    r"B2B(?:提案|問い合わせ).*(?:不適切|不可)|"
+    r"(?:問い合わせ|お問い合わせ)フォームではない)",
+    re.IGNORECASE,
 )
 _WRONG_FORM_SKIPPED_KW = (
     "login_pass", "password", "passwd",
@@ -5508,11 +5574,16 @@ def _detect_wrong_form_type(diag: dict[str, Any]) -> str | None:
     warnings = diag.get("warnings") or []
     skipped = diag.get("skipped") or []
 
+    # LLM warnings are free-form cautions.  A single incidental word such as
+    # 「予約日時フィールド」 or a navigation mention of 「採用」 is not evidence
+    # that the whole contact form is the wrong type (JMS/KeePer false positives).
+    # Abort only when the warning explicitly classifies the destination as a
+    # dedicated/non-contact form.  Structured page classification already ran
+    # before this guard and remains the primary wrong-form gate.
     for w in warnings:
         w_str = str(w)
-        for kw in _WRONG_FORM_WARN_KW:
-            if kw in w_str:
-                return f"warning mentions '{kw}'"
+        if _EXPLICIT_WRONG_FORM_WARNING_RE.search(w_str):
+            return f"explicit wrong-form warning: {w_str[:120]}"
 
     suspect_hits: list[str] = []
     for s in skipped:
@@ -7485,7 +7556,6 @@ def stage_send(
     hb_mode = resolve_heartbeat_mode(heartbeat, task="send")
     hb = HeartbeatSession(SKILL_DIR, "send", len(targets), heartbeat=hb_mode, data_dir=DATA_DIR)
     hb.start(f"send {len(targets)} targets")
-    from _outreach_core import run_progress as core_progress
     core_progress.start(DATA_DIR, "send", len(targets))
 
     # v27: inbound thread control. A human reply in the progress thread can stop

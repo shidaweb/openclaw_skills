@@ -82,6 +82,27 @@ def pending(data_dir: Path) -> list[dict[str, Any]]:
     return read_queue(data_dir, status="pending")
 
 
+def partition_pending_by_sent(
+    entries: list[dict[str, Any]] | None,
+    sent_ids: set[str] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split pending resolver entries into unsent and already-sent targets.
+
+    A target can be queued by one run and successfully sent by a later run before
+    the resolver drains the queue. Re-checking sent history at drain time is a
+    mandatory duplicate-send barrier; enqueue-time state is stale by definition.
+    """
+    sent = {str(x) for x in (sent_ids or set()) if str(x)}
+    unsent: list[dict[str, Any]] = []
+    already_sent: list[dict[str, Any]] = []
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        target_id = str(entry.get("target_id") or entry.get("id") or "")
+        (already_sent if target_id in sent else unsent).append(entry)
+    return unsent, already_sent
+
+
 def mark(data_dir: Path, target_id: str, status: str, *, note: str = "") -> bool:
     """Update one entry's status (e.g. 'resolved' / 'skipped' / 'failed')."""
     rows = read_queue(data_dir)
