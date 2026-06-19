@@ -1695,6 +1695,37 @@ def _run_autonomous_send(
         stage_resolve_queue(cfg)
 
 
+def _resolver_failure_detail(
+    entry: dict[str, Any],
+    result: dict[str, Any] | None,
+    vresult: dict[str, Any] | None,
+) -> str:
+    """Build a compact, evidence-backed resolver failure reason."""
+    result = result or {}
+    vresult = vresult or {}
+    parts = [f"reason_class={entry.get('reason_class') or 'unknown'}"]
+    if result.get("loop_status"):
+        parts.append(f"loop_status={result['loop_status']}")
+    if vresult.get("status"):
+        parts.append(f"verify_status={vresult['status']}")
+    errors = result.get("validation_errors") or []
+    exact: list[str] = []
+    for error in errors[:5]:
+        if not isinstance(error, dict):
+            continue
+        field = str(error.get("field") or "unknown")[:60]
+        kind = str(error.get("kind") or "validation")[:50]
+        message = str(error.get("message") or "").strip()[:100]
+        exact.append(f"{field}[{kind}]" + (f": {message}" if message else ""))
+    if exact:
+        parts.append("errors=" + " | ".join(exact))
+    evidence = vresult.get("evidence") if isinstance(vresult.get("evidence"), dict) else {}
+    verdict = evidence.get("send_verdict") or evidence.get("verdict")
+    if verdict:
+        parts.append(f"verdict={verdict}")
+    return "; ".join(parts)
+
+
 def stage_resolve_queue(config: dict[str, Any] | None = None) -> None:
     """Deep-resolve every target the main batch queued as a blocker (§16).
 
@@ -1725,6 +1756,7 @@ def stage_resolve_queue(config: dict[str, Any] | None = None) -> None:
                 drafts_by_id[str(dd.get("id"))] = dd
 
     print(f"[resolver] {len(queue)} target(s) to deep-resolve")
+    core_progress.transition(DATA_DIR, "resolve", len(queue), brief=BRIEF_ID)
     hb = HeartbeatSession(SKILL_DIR, "resolve", len(queue), heartbeat="auto", data_dir=DATA_DIR)
     hb.start(f"deep-resolve {len(queue)} targets")
     resolved, skipped = [], []
@@ -1736,6 +1768,8 @@ def stage_resolve_queue(config: dict[str, Any] | None = None) -> None:
         if not d:
             core_resolve_queue.mark(DATA_DIR, tid, "skipped", note="draft not found")
             skipped.append(name)
+            core_progress.bump(DATA_DIR, outcome="skipped", name=name)
+            hb.tick(i, f"{name} skipped: draft not found")
             continue
 
         form_url = d.get("form_url", "")
@@ -1774,17 +1808,38 @@ def stage_resolve_queue(config: dict[str, Any] | None = None) -> None:
             core_resolve_queue.mark(DATA_DIR, tid, "resolved", note="deep resolver sent")
             print(f"  [resolver] ✅ {name} 送信成功")
             resolved.append(name)
+            progress_outcome = "sent"
         else:
+            detail = _resolver_failure_detail(entry, result, vres)
             append_skip_history([{**d, "draft": {**d.get("draft", {}),
-                                                 "body": f"RESOLVER_FAILED: {entry.get('reason_class')}"}}])
-            core_resolve_queue.mark(DATA_DIR, tid, "skipped", note="deep resolver could not submit")
-            print(f"  [resolver] ⏭ {name} 自動解決できず → skip 記録")
+                                                 "body": f"RESOLVER_FAILED: {detail}"}}])
+            core_resolve_queue.mark(
+                DATA_DIR, tid, "skipped",
+                note=f"deep resolver could not submit: {detail}"[:500],
+            )
+            print(f"  [resolver] ⏭ {name} 自動解決できず → skip 記録 ({detail})")
             skipped.append(name)
+            progress_outcome = "skipped"
+        _emit_event(
+            "resolver.target_outcome",
+            stage="resolve",
+            target_id=tid,
+            outcome="sent" if outcome == "sent_ok" else "skipped",
+            payload={
+                "reason_class": entry.get("reason_class"),
+                "loop_status": result.get("loop_status"),
+                "verify_status": (vres or {}).get("status") if isinstance(vres, dict) else None,
+                "validation_errors": (result.get("validation_errors") or [])[:8],
+            },
+            trace_dir=trace,
+        )
+        core_progress.bump(DATA_DIR, outcome=progress_outcome, name=name)
         if tab_id:
             _close_tab(tab_id)  # done with this target's errored tab
         hb.tick(i, f"{name} done")
 
     hb.end(f"resolve done · sent={len(resolved)} · skipped={len(skipped)}")
+    core_progress.finish(DATA_DIR)
     msg = (f"🔧 リゾルバ完了: 自動送信 {len(resolved)} / スキップ {len(skipped)}\n"
            f"  送信: {('、'.join(resolved)) or 'なし'}\n"
            f"  スキップ: {('、'.join(skipped)) or 'なし'}")
@@ -2154,7 +2209,19 @@ _LIST_CHECKBOX_GATES_JS = r"""
     const row = el.closest('tr') || el.closest('fieldset') ||
       el.closest('.form-row, .form-group, .field, .input, .item, dl') ||
       el.closest('li, p, td, th, div');
-    return row ? norm((row.textContent || '').slice(0, 240)) : '';
+    let text = row ? norm((row.textContent || '').slice(0, 240)) : '';
+    // CF7 often puts the required group heading in the paragraph immediately
+    // before the paragraph containing the checkbox widgets.
+    let cur = el;
+    for (let depth = 0; cur && depth < 6; depth += 1, cur = cur.parentElement) {
+      const prev = cur.previousElementSibling;
+      const prevText = prev ? norm((prev.textContent || '').slice(0, 160)) : '';
+      if (prevText && /必須|required|お問い合わせ|問合せ|種別|項目/.test(prevText)) {
+        text = (prevText + ' ' + text).trim();
+        break;
+      }
+    }
+    return text;
   };
   // NOTE: bare ※ is a generic footnote marker in JP forms, not a reliable
   // required indicator, so we only treat it as required when paired with 必須.
@@ -2195,6 +2262,14 @@ _LIST_CHECKBOX_GATES_JS = r"""
     if (row) {
       const head = row.querySelector(':scope > label, :scope > .label, :scope > .title, :scope > dt');
       if (head) return norm(head.textContent || '');
+    }
+    let cur = el;
+    for (let depth = 0; cur && depth < 6; depth += 1, cur = cur.parentElement) {
+      const prev = cur.previousElementSibling;
+      const prevText = prev ? norm((prev.textContent || '').slice(0, 160)) : '';
+      if (prevText && /必須|required|お問い合わせ|問合せ|種別|項目/.test(prevText)) {
+        return prevText;
+      }
     }
     return '';
   };
@@ -2712,6 +2787,8 @@ _SET_TEXT_FIELDS_JS = r"""
       ? window.HTMLTextAreaElement.prototype
       : window.HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+    if (typeof el.focus === 'function') el.focus();
+    if (typeof el.setCustomValidity === 'function') el.setCustomValidity('');
     setter.call(el, v);
     el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
@@ -4405,9 +4482,15 @@ _APPLY_PLAN_FIELD_JS = r"""
       ? window.HTMLTextAreaElement.prototype
       : window.HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+    if (typeof el.focus === 'function') el.focus();
+    // Custom validators (notably Contact Form 7) can leave a customError on
+    // an element after a server bounce. Re-entry clears that stale validity;
+    // the site still validates the new value on the next submit.
+    if (typeof el.setCustomValidity === 'function') el.setCustomValidity('');
     setter.call(el, v);
     el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.dispatchEvent(new Event('blur', { bubbles: true }));
   };
 
   const findEl = (selectorAttr, cssSelector) => {
@@ -4441,6 +4524,12 @@ _APPLY_PLAN_FIELD_JS = r"""
     for (const opt of sel.options) {
       if (opt.text === value || opt.value === value
           || opt.text.includes(value) || opt.value.includes(value)) {
+        const text = String(opt.text || '').replace(/\s+/g, ' ').trim();
+        const val = String(opt.value || '').trim();
+        const placeholder = !val || /^(?:[-ー−‐~\s]*)?(?:以下から選択|選択してください|選択して下さい|please select|select|お選びください|指定なし)/i.test(text);
+        if (placeholder) {
+          return { ok: false, reason: "placeholder option is not a selection", name, value: text };
+        }
         sel.value = opt.value;
         sel.dispatchEvent(new Event('change', { bubbles: true }));
         return { ok: true, action, name, value: opt.text };
@@ -6397,7 +6486,9 @@ def _submission_loop(
                 print(f"  [send] ⚠ validation errors: {err_fields} → fixed={vfix.get('fixed')}")
             core_timeline.add(
                 timeline, "validation_fix", bool(vfix.get("fixed")),
-                round=validation_rounds, fixed=vfix.get("fixed"),
+                round=validation_rounds,
+                fixed=vfix.get("fixed"),
+                errors=last_validation_errors[:8] or None,
             )
             # Beyond kana/subject guardrails, retry the generic gate auto-fill —
             # dynamically-revealed required selects/radios live here. Radios run
@@ -6422,8 +6513,7 @@ def _submission_loop(
             if validation_rounds > 2:
                 return _result(
                     "validation_stuck", obs,
-                    errors=[{"field": e.get("field", "")[:60], "kind": e.get("kind")}
-                            for e in errs[:8]],
+                    errors=last_validation_errors[:8],
                 )
             phase = "first" if (flow == "confirm" and obs.get("visible_textareas")) else "final"
         elif state == "confirm":

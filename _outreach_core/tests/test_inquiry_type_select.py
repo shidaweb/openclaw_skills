@@ -137,6 +137,28 @@ class TestInquiryTypeSelect(unittest.TestCase):
         self.assertTrue(ok)
         self.assertTrue(ap.called)
 
+    def test_field_js_clears_stale_custom_error_and_rejects_placeholder(self) -> None:
+        js = self.run_mod._APPLY_PLAN_FIELD_JS
+        self.assertIn("setCustomValidity('')", js)
+        self.assertIn("new Event('blur'", js)
+        self.assertIn("placeholder option is not a selection", js)
+
+    def test_resolver_failure_detail_keeps_exact_validation_message(self) -> None:
+        detail = self.run_mod._resolver_failure_detail(
+            {"reason_class": "validation_unrecoverable"},
+            {
+                "loop_status": "validation_stuck",
+                "validation_errors": [{
+                    "field": "フリガナ",
+                    "kind": "customError",
+                    "message": "入力してください。",
+                }],
+            },
+            {"status": "blocked", "evidence": {"send_verdict": "not_sent"}},
+        )
+        self.assertIn("フリガナ[customError]: 入力してください。", detail)
+        self.assertIn("verify_status=blocked", detail)
+
     def test_llm_click_submit_prefers_selector_click(self) -> None:
         buttons = [{"text": "送信する", "selector": "button.submit"}]
         with (

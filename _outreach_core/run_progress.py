@@ -89,6 +89,55 @@ def start(data_dir: Path | str, stage: str, total: int, *, brief: str | None = N
         pass
 
 
+def transition(
+    data_dir: Path | str,
+    stage: str,
+    total: int,
+    *,
+    brief: str | None = None,
+) -> None:
+    """Start a subsequent phase without losing the completed phase summary.
+
+    A campaign's send phase can finish before its resolver begins. Previously
+    the progress snapshot said done throughout that resolver window, which made
+    healthy runs look stopped.
+    """
+    try:
+        previous = read(data_dir) or {}
+        phases = list(previous.get("phases") or [])
+        if previous.get("stage"):
+            phases.append({
+                "stage": previous.get("stage"),
+                "total": int(previous.get("total", 0)),
+                "processed": int(previous.get("processed", 0)),
+                "sent": int(previous.get("sent", 0)),
+                "skipped": int(previous.get("skipped", 0)),
+                "needs_attention": int(previous.get("needs_attention", 0)),
+                "status": previous.get("status"),
+                "started_at": previous.get("started_at"),
+                "finished_at": previous.get("finished_at"),
+            })
+        now = _now()
+        _atomic_write(progress_path(data_dir), {
+            "stage": stage,
+            "brief": brief if brief is not None else previous.get("brief"),
+            "total": int(total or 0),
+            "processed": 0,
+            "sent": 0,
+            "skipped": 0,
+            "needs_attention": 0,
+            "current": None,
+            "status": "running",
+            "started_at": now,
+            "run_started_at": previous.get("run_started_at") or previous.get("started_at") or now,
+            "updated_at": now,
+            "phases": phases[-12:],
+        })
+        write_html(data_dir)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def bump(data_dir: Path | str, *, outcome: str | None, name: str | None = None) -> None:
     """Record one finished lead. ``outcome`` is the _send_one_target outcome."""
     try:

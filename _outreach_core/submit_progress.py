@@ -52,6 +52,11 @@ _NOISE_SUBMIT_TEXT_RE = re.compile(
 _FIRST_STEP_TEXT_RE = re.compile(r"(入力内容を確認|内容(を|の)?確認|確認画面|同意して次へ|^次へ$)", re.I)
 _FINAL_STEP_TEXT_RE = re.compile(r"(送信|submit|完了|確定|問い合わせを送信|お問い合わせを送信)", re.I)
 _ROUTE_GROUP_RE = re.compile(r"(お客様|個人|法人|企業|一般|取引|お問い合わせ対象|お問い合わせ区分)", re.I)
+_SENSITIVE_DESTINATION_RE = re.compile(
+    r"(お問い合わせ先|送信先|店舗|店鋪|ホテル|施設|拠点|支店|営業所|会場|校舎|教室|"
+    r"location|store|hotel|branch|property)",
+    re.I,
+)
 
 
 # Confirmation-page instruction text. Many JP forms render a sentence telling
@@ -518,9 +523,15 @@ def pick_select_gate_actions(
             picked = choose_b2b_option(g.get("options") or [])
             choice = str((picked or {}).get("value") or "").strip()
         if not choice:
+            # A validation bounce proves the field is required, but does not
+            # authorize us to invent a destination. Picking the first hotel or
+            # store would silently route the inquiry to the wrong property.
+            destination_sensitive = bool(
+                _SENSITIVE_DESTINATION_RE.search(f"{name} {label}".strip())
+            )
             choice = _pick_neutral_or_first_option(
                 g.get("options") or [],
-                allow_first=bool(aggressive and required),
+                allow_first=bool(aggressive and required and not destination_sensitive),
             ) or ""
         if not choice:
             continue

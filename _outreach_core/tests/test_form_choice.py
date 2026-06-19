@@ -192,6 +192,38 @@ class TestGateActionsWithSender(unittest.TestCase):
         actions = sp.pick_validation_select_actions(groups, sender=SENDER)
         self.assertEqual(actions, [{"name": "unknown", "value": "A"}])
 
+    def test_validation_select_does_not_invent_hotel_destination(self) -> None:
+        groups = [{
+            "name": "input_hotel", "label": "お問い合わせ先（ホテル）", "required": True,
+            "selected": False,
+            "options": _opts("ホテルをお選びください", "ホテル札幌", "ホテル大阪"),
+        }]
+        self.assertEqual(sp.pick_validation_select_actions(groups, sender=SENDER), [])
+
+    def test_sensitive_destination_can_use_safe_general_option(self) -> None:
+        groups = [{
+            "name": "store", "label": "お問い合わせ店舗", "required": True,
+            "selected": False,
+            "options": _opts("選択してください", "本社・その他", "新宿店"),
+        }]
+        self.assertEqual(
+            sp.pick_validation_select_actions(groups, sender=SENDER),
+            [{"name": "store", "value": "本社・その他"}],
+        )
+
+    def test_required_checkbox_group_picks_b2b_option_only(self) -> None:
+        boxes = [
+            {
+                "name": "checkbox-type[]", "label": label,
+                "group_label": "お問い合わせ項目 必須",
+                "value": label, "required": True, "checked": False, "disabled": False,
+            }
+            for label in ("ご相談、ご質問", "ビジネスパートナーについて", "採用について")
+        ]
+        picked = sp.pick_checkboxes_to_check(boxes)
+        self.assertEqual(len(picked), 1)
+        self.assertEqual(picked[0]["label"], "ビジネスパートナーについて")
+
     def test_radio_gate_contact_method(self) -> None:
         groups = [{
             "name": "how", "label": "ご希望の連絡方法", "required": True,

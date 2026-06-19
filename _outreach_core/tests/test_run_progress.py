@@ -50,6 +50,20 @@ class TestSnapshotIO(unittest.TestCase):
         self.assertIsNone(snap["current"])
         self.assertIn("finished_at", snap)
 
+    def test_transition_reopens_progress_and_preserves_send_phase(self):
+        rp.start(self.dir, "send", 2, brief="acme")
+        rp.bump(self.dir, outcome="sent", name="A")
+        rp.bump(self.dir, outcome="skipped", name="B")
+        rp.finish(self.dir)
+        rp.transition(self.dir, "resolve", 1, brief="acme")
+        snap = rp.read(self.dir)
+        self.assertEqual(snap["status"], "running")
+        self.assertEqual(snap["stage"], "resolve")
+        self.assertEqual(snap["processed"], 0)
+        self.assertEqual(snap["brief"], "acme")
+        self.assertEqual(snap["phases"][-1]["stage"], "send")
+        self.assertEqual(snap["phases"][-1]["sent"], 1)
+
     def test_read_missing_is_none(self):
         self.assertIsNone(rp.read(self.dir))
 
