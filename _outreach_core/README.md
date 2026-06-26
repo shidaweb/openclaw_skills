@@ -4,7 +4,7 @@ Python utilities shared by `linkedin-outreach` and `jp-form-outreach`.
 
 **Not included here:** Slack Socket Mode / Bolt workers, list-generation LLM CLIs, Opus via `oc_infer`. Those belong to the OpenClaw agent (Opus 4.7) or Sonnet sub-tasks in `config.yaml`.
 
-## Model policy (v3)
+## Model policy
 
 | Component | Model |
 |---|---|
@@ -36,8 +36,8 @@ Python utilities shared by `linkedin-outreach` and `jp-form-outreach`.
 ## Verification
 
 ```bash
-cd ~/.openclaw/skills/linkedin-outreach
-.venv/bin/python -m unittest discover -s ../_outreach_core/tests -v
+cd ~/.openclaw/skills
+python3 -m pytest _outreach_core/tests
 
 python3 -m _outreach_core.helpers.dump_exclude_set
 

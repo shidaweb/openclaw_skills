@@ -16,6 +16,7 @@
 | `<skill>/config.yaml` | 発信者情報・pitch・モデル設定（実値） | `config.example.yaml` をコピーして記入 |
 | `sender_brief.yaml` | 全チャネル共通の発信者ブリーフ（実値） | `sender_brief.example.yaml` をコピー |
 | `briefs/<id>.yaml` | 各 brief（人格）の実定義 | `briefs/_template.yaml` から作成 / Slack onboarding |
+| `personas/<persona_id>.yaml` | 送信者の実名・連絡先・署名・口調 | `personas/_template.yaml` から作成 |
 | `briefs/_active.txt` | この環境のアクティブ brief id | `briefs/_active.txt.example` を参考に1行記入 |
 | `<skill>/targets/<id>.yaml` / `.csv` | **実ターゲット企業リスト** | リサーチで生成 / `targets.example.*` 参照 |
 | `<skill>/prompts/system_persona.local.md` | 自社の作り込みペルソナ（氏名・実事例・実URL） | `system_persona.md` をコピーして編集 |
@@ -37,8 +38,8 @@
 - テスト `_outreach_core/tests/`
 - **テンプレ/例**: `*.example.yaml` / `*.example.csv` / `briefs/_template.yaml` /
   `briefs/onboarding_answers.example.json` / `briefs/_active.txt.example` /
-  `prompts/system_persona.md` / `prompts/examples.md`（**中立**）
-- ドキュメント（README / SKILL.md / docs / CURSOR_INSTRUCTIONS*）
+  `personas/_template.yaml` / `prompts/system_persona.md` / `prompts/examples.md`（**中立**）
+- ドキュメント（README / SKILL.md / docs）
 - `.gitignore`
 
 ## 3. 新規クライアントのブートストラップ
@@ -48,6 +49,7 @@ git clone <repo> ~/.openclaw/skills && cd ~/.openclaw/skills
 cp jp-form-outreach/config.example.yaml jp-form-outreach/config.yaml   # 記入
 cp sender_brief.example.yaml sender_brief.yaml                          # 記入
 cp briefs/_template.yaml briefs/<your-id>.yaml                          # 記入
+cp personas/_template.yaml personas/<your-persona>.yaml                  # 記入
 echo "<your-id>" > briefs/_active.txt
 # 自社の作り込みプロンプトを使う場合（任意）:
 cp jp-form-outreach/prompts/system_persona.md jp-form-outreach/prompts/system_persona.local.md  # 編集

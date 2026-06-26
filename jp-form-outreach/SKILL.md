@@ -159,7 +159,7 @@ python3 -m _outreach_core.helpers.brief write-from-json <slug> \
   --bind-channel $DOORMAN_SLACK_CHANNEL_ID
 ```
 
-詳細は `CURSOR_INSTRUCTIONS.md` §14-N。
+詳細はリポジトリルートの `README.md` と `briefs/README.md`。
 
 This skill drives a full Japanese B2B inquiry-form outreach pipeline using
 the OpenClaw browser plugin (Chrome with the openclaw profile) and the

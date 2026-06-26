@@ -19,8 +19,8 @@ Slackではチャンネル全体ではなくスレッドごとに、この3点�
 
 | Skill | 実行面 | 主な成熟度 |
 |---|---|---|
-| [`jp-form-outreach`](./jp-form-outreach) | 日本企業の問い合わせフォーム送信 | v13 相当（送信レジリエンス + 2タッチLLM + valid-form保持） |
-| [`linkedin-outreach`](./linkedin-outreach) | LinkedIn InMail | v4 系 |
+| [`jp-form-outreach`](./jp-form-outreach) | 日本企業の問い合わせフォーム送信 | v28 系（信頼性・可観測性 + 送信レジリエンス） |
+| [`linkedin-outreach`](./linkedin-outreach) | LinkedIn connection request / InMail | v4 系 |
 
 > 詳細仕様は各スキルの `SKILL.md` が正典です。
 
@@ -30,6 +30,7 @@ Slackではチャンネル全体ではなくスレッドごとに、この3点�
 - **マルチ campaign / persona**: Slackスレッドごとに人格と配信チャネルを独立選択
 - **detached 実行**: 長時間ジョブを別プロセス化し、Slack 応答遅延を回避
 - **自律運用モード**: 初回承認後は自己採点・自動スキップ方針で連続処理
+- **可観測性と復旧**: healthcheck / watchdog / run supervisor / report で停止や詰まりを検知
 - **送信レジリエンス（jp-form）**:
   - captcha ライブ判定 + 回避学習
   - confirm フローの phase-aware submit 選択
@@ -65,7 +66,7 @@ Slackではチャンネル全体ではなくスレッドごとに、この3点�
 - seed URL を開いて `'_FORM_FIELDS_JS'` で構造抽出
 - `'_outreach_core/contact_url.py'` で `classify_form_type`
 - 非contact時は同一ドメイン候補を探索
-- v13 で次を強化:
+- フォーム探索の強化点:
   - `is_error_page` で 404/エラーページを即除外
   - valid form を保持し、失敗候補から復帰（best-known）
   - textarea + submit の有効フォームを過剰に捨てない
@@ -184,19 +185,29 @@ bash scripts/install-watchdog.sh
 - `_outreach_core/helpers/report.py`: 実績集計
 - `_outreach_core/tests/`: 回帰テスト群（仕様固定の要）
 
+## 開発・検証
+
+```bash
+cd ~/.openclaw/skills
+python3 -m pytest _outreach_core/tests
+```
+
+`pytest` / `pyyaml` が未導入の環境では、一時 venv かローカル venv に入れてから実行します。
+
 ## ドキュメント
 
 - [`docs/OPENCLAW_AGENT.md`](./docs/OPENCLAW_AGENT.md)
+- [`docs/CLIENT_ONBOARDING.md`](./docs/CLIENT_ONBOARDING.md)
 - [`docs/ARCHITECTURE_EXTERNAL.md`](./docs/ARCHITECTURE_EXTERNAL.md)
+- [`DISTRIBUTION.md`](./DISTRIBUTION.md)
 - [`_outreach_core/README.md`](./_outreach_core/README.md)
 - [`briefs/README.md`](./briefs/README.md)
-- [`CURSOR_INSTRUCTIONS.md`](./CURSOR_INSTRUCTIONS.md)
 
 ## Git 管理対象外
 
 `.gitignore` により、以下はローカル専用です。
 
-- 実運用 config / API keys / brief 実体
+- 実運用 config / API keys / brief 実体 / persona 実体
 - channel 状態ファイル
 - health/watchdog/job logs
 - events/traces/current_task など運用ログ
