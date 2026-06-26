@@ -175,6 +175,29 @@ class TestWatchdogTick(unittest.TestCase):
                 outcome = wd.tick()
         self.assertEqual(outcome, "error")
 
+    def test_tick_restarts_on_recent_cli_backend_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            state = {"restart_attempts": []}
+            timeout = {"marker": "m1", "epoch": 1_000_000.0, "ts": "2026-06-26T04:31:00Z"}
+            with mock.patch.object(wd, "read_state", return_value=state), \
+                _no_self_heal(), \
+                mock.patch.object(wd, "is_gateway_loaded", return_value=True), \
+                mock.patch.object(wd, "is_gateway_healthy", return_value=True), \
+                mock.patch.object(wd, "configured_but_down_channels", return_value=[]), \
+                mock.patch.object(wd, "latest_cli_backend_timeout", return_value=timeout), \
+                mock.patch.object(wd, "can_restart", return_value=True), \
+                mock.patch.object(wd, "restart_gateway", return_value=True) as kick, \
+                mock.patch.object(wd, "notify_slack", return_value=True) as notify, \
+                mock.patch.object(wd, "record_restart"), \
+                mock.patch.object(wd, "save_state"), \
+                mock.patch.object(wd, "append_log"):
+                outcome = wd.tick(root)
+            self.assertEqual(outcome, "restarted")
+            kick.assert_called_once()
+            notify.assert_called_once()
+            self.assertEqual(state["last_cli_backend_timeout_marker"], "m1")
+
     def test_rate_limit_state_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -403,6 +426,45 @@ class TestSelfHeal(unittest.TestCase):
         self.assertTrue(wd.should_reassert_keepalive(False))
         self.assertFalse(wd.should_reassert_keepalive(True))
         self.assertFalse(wd.should_reassert_keepalive(None))
+
+
+class TestOpenClawRuntimePatch(unittest.TestCase):
+    def test_patch_needed_when_runtime_settings_missing(self) -> None:
+        self.assertTrue(wd.openclaw_runtime_patch_needed({"agents": {"defaults": {}}}))
+
+    def test_apply_openclaw_runtime_patch_writes_required_values(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "openclaw.json"
+            path.write_text(json.dumps({"agents": {"defaults": {}}}), encoding="utf-8")
+            changed = wd.apply_openclaw_runtime_patch(path)
+            data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertTrue(changed)
+        defaults = data["agents"]["defaults"]
+        self.assertEqual(defaults["timeoutSeconds"], wd.OPENCLAW_AGENT_TIMEOUT_SECONDS)
+        backend = defaults["cliBackends"][wd.OPENCLAW_CLI_BACKEND_ID]
+        self.assertEqual(
+            backend["reliability"]["watchdog"]["fresh"]["noOutputTimeoutMs"],
+            wd.OPENCLAW_CLI_NO_OUTPUT_TIMEOUT_MS,
+        )
+        self.assertEqual(
+            backend["reliability"]["watchdog"]["resume"]["noOutputTimeoutMs"],
+            wd.OPENCLAW_CLI_NO_OUTPUT_TIMEOUT_MS,
+        )
+        self.assertEqual(defaults["heartbeat"]["every"], "10m")
+        self.assertIn("日本語", defaults["heartbeat"]["prompt"])
+
+    def test_latest_cli_backend_timeout_reads_recent_json_log_line(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "openclaw.log"
+            log.write_text(
+                '{"time":"2026-06-26T04:31:00Z","message":"CLI subprocess: '
+                'timed out after 180s (no-output stall)."}\n',
+                encoding="utf-8",
+            )
+            now = wd._parse_ts("2026-06-26T04:32:00Z").timestamp()
+            item = wd.latest_cli_backend_timeout(log_paths=[log], now_epoch=now, lookback_sec=600)
+        self.assertIsNotNone(item)
+        self.assertEqual(item["ts"], "2026-06-26T04:31:00Z")
 
 
 class TestWatchdogLiveness(unittest.TestCase):

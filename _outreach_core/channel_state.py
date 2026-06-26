@@ -11,6 +11,7 @@ from typing import Any
 from _outreach_core.config import ACTIVE_BRIEF_FILE, BRIEFS_DIR, SKILLS_ROOT, BriefError, resolve_brief_id
 
 CHANNEL_STATE_DIR = SKILLS_ROOT / "data" / "channel_state"
+THREAD_STATE_DIR = SKILLS_ROOT / "data" / "thread_state"
 
 
 def state_path(channel_id: str) -> Path:
@@ -38,6 +39,63 @@ def save_state(channel_id: str, state: dict[str, Any]) -> Path:
     return path
 
 
+def thread_state_path(channel_id: str, thread_ts: str) -> Path:
+    cid = channel_id.strip().upper()
+    if not cid.startswith("C"):
+        raise ValueError(f"invalid Slack channel id: {channel_id!r}")
+    ts = str(thread_ts or "").strip()
+    if not ts:
+        raise ValueError("Slack thread_ts is required")
+    safe_ts = "".join(ch if ch.isalnum() else "_" for ch in ts)
+    directory = THREAD_STATE_DIR / cid
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"{safe_ts}.json"
+
+
+def load_thread_state(channel_id: str, thread_ts: str) -> dict[str, Any] | None:
+    path = thread_state_path(channel_id, thread_ts)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def bind_thread(
+    channel_id: str,
+    thread_ts: str,
+    *,
+    brief_id: str,
+    persona_id: str | None,
+    channel: str,
+    operator_user_id: str = "",
+) -> Path:
+    """Bind one Slack thread to an independent campaign/persona/channel tuple."""
+    from _outreach_core.persona import resolve_persona_id
+    from _outreach_core.routing import normalize_channel
+
+    bid = resolve_brief_id(brief_id)
+    persona = resolve_persona_id(persona_id) if persona_id else None
+    outreach_channel = normalize_channel(channel)
+    assert outreach_channel is not None
+    now = datetime.utcnow().isoformat() + "Z"
+    state = {
+        "slack_channel_id": channel_id.strip().upper(),
+        "slack_thread_ts": str(thread_ts).strip(),
+        "brief_id": bid,
+        "persona_id": persona,
+        "channel": outreach_channel,
+        "operator_user_id": operator_user_id,
+        "bound_at": now,
+        "last_used_at": now,
+    }
+    path = thread_state_path(channel_id, thread_ts)
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
 def load_active_brief_fallback() -> str:
     """CLI fallback when no Slack channel context."""
     if not ACTIVE_BRIEF_FILE.is_file():
@@ -54,6 +112,7 @@ def load_active_brief_fallback() -> str:
 
 def resolve_brief_for_channel(
     slack_channel_id: str | None,
+    slack_thread_ts: str | None = None,
 ) -> tuple[str | None, list[str], bool]:
     """
     Returns (brief_id, default_channels, is_new_channel).
@@ -61,6 +120,12 @@ def resolve_brief_for_channel(
     """
     if not slack_channel_id or not str(slack_channel_id).strip():
         return load_active_brief_fallback(), [], False
+
+    if slack_thread_ts:
+        thread = load_thread_state(slack_channel_id, slack_thread_ts)
+        if thread and thread.get("brief_id"):
+            channel = str(thread.get("channel") or "").strip()
+            return str(thread["brief_id"]), [channel] if channel else [], False
 
     state = load_state(slack_channel_id)
     if state is None:
@@ -74,7 +139,13 @@ def resolve_brief_for_channel(
     return brief, channels, False
 
 
-def touch_last_used(channel_id: str) -> None:
+def touch_last_used(channel_id: str, thread_ts: str | None = None) -> None:
+    if thread_ts:
+        thread = load_thread_state(channel_id, thread_ts)
+        if thread:
+            thread["last_used_at"] = datetime.utcnow().isoformat() + "Z"
+            path = thread_state_path(channel_id, thread_ts)
+            path.write_text(json.dumps(thread, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     state = load_state(channel_id)
     if not state:
         return
@@ -139,3 +210,7 @@ def channels_for_brief(brief_id: str) -> list[str]:
 
 def slack_channel_id_from_env() -> str:
     return os.environ.get("DOORMAN_SLACK_CHANNEL_ID", "").strip()
+
+
+def slack_thread_ts_from_env() -> str:
+    return os.environ.get("DOORMAN_SLACK_THREAD_TS", "").strip()

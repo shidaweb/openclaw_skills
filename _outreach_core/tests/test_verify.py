@@ -48,12 +48,36 @@ class TestVerify(unittest.TestCase):
             )
             from _outreach_core.verify import handle_verify_result
 
-            with mock.patch("_outreach_core.notify.post", return_value=True):
+            with mock.patch("_outreach_core.notify.post", return_value=True), \
+                    mock.patch("_outreach_core.notify.post_problem", return_value=True):
                 handle_verify_result(target, result, data, channel="jp_form")
             path = data / "needs_attention.jsonl"
             self.assertTrue(path.exists())
             row = json.loads(path.read_text().strip().splitlines()[-1])
             self.assertEqual(row["status"], "open")
+
+    def test_handle_verify_result_can_suppress_attention_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            target = {"id": "t4", "name": "リゾルバ確認用株式会社"}
+            result = {
+                "status": "uncertain",
+                "reason": "リゾルバ確認用株式会社: 送信完了画面が確認できません",
+            }
+            from _outreach_core.verify import handle_verify_result
+
+            with mock.patch("_outreach_core.notify.post_problem", return_value=True) as post_problem:
+                outcome = handle_verify_result(
+                    target,
+                    result,
+                    data,
+                    channel="jp_form",
+                    record_attention=False,
+                )
+
+            self.assertEqual(outcome, "uncertain")
+            self.assertFalse((data / "needs_attention.jsonl").exists())
+            post_problem.assert_not_called()
 
     def test_linkedin_success_keyword_in_snapshot(self) -> None:
         target = {"id": "li1", "name": "Ada Lovelace"}
@@ -117,6 +141,74 @@ class TestVerify(unittest.TestCase):
             browser_verify={"url": "https://www.example.co.jp/entry/inquiry", "text": snap},
         )
         self.assertEqual(result["status"], "needs_attention")
+
+    def test_jp_form_thanks_with_unrelated_search_form_is_ok(self) -> None:
+        target = {"id": "h1", "name": "はるやま", "form_fields": {"inputs": []}}
+        snap = "お問い合わせありがとうございました。内容を確認次第、ご連絡させて頂きます。"
+        result = verify_send_completed(
+            target,
+            "jp_form",
+            snapshot=snap,
+            browser_verify={"url": "https://example.co.jp/contact/index.php?status=dec", "text": snap},
+            evaluate_fn=lambda _js: {
+                "visible_forms": 1,
+                "visible_textareas": 0,
+                "editable_visible": 1,
+                "submit_controls": 1,
+                "final_submit_controls": 0,
+                "empty_required": [],
+            },
+        )
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("success_without_pending_submit", result["evidence"]["send_signals"])
+
+    def test_jp_form_pre_submit_intro_is_not_success(self) -> None:
+        target = {"id": "y1", "name": "山田CG", "form_fields": {"inputs": []}}
+        snap = (
+            "お問い合わせ（注意事項）\n"
+            "当社グループのサービスや採用情報などに関してお問い合わせを受け付けております。\n"
+            "お問い合わせをお送りいただく前に、注意事項をお読みください。\n"
+            "上記に同意してフォームに進む"
+        )
+        result = verify_send_completed(
+            target,
+            "jp_form",
+            snapshot=snap,
+            browser_verify={
+                "url": "https://www.yamada-cg.co.jp/contact/",
+                "text": snap,
+                "visible_forms": 0,
+                "visible_textareas": 0,
+                "editable_visible": 0,
+                "submit_controls": 0,
+                "final_submit_controls": 0,
+            },
+        )
+        self.assertEqual(result["status"], "uncertain")
+        self.assertIn(
+            "pre_submit_intro_success_ignored",
+            result["evidence"]["send_signals"],
+        )
+
+    def test_jp_form_progress_done_label_with_pending_submit_is_not_ok(self) -> None:
+        target = {"id": "p1", "name": "PDP", "form_fields": {"inputs": []}}
+        snap = "入力画面 確認画面 送信完了 志田典道 shida@torana.co.jp 送信する"
+        result = verify_send_completed(
+            target,
+            "jp_form",
+            snapshot=snap,
+            browser_verify={"url": "https://example.co.jp/contact/confirm", "text": snap},
+            evaluate_fn=lambda _js: {
+                "visible_forms": 1,
+                "visible_textareas": 0,
+                "editable_visible": 0,
+                "submit_controls": 2,
+                "final_submit_controls": 1,
+                "empty_required": [],
+            },
+        )
+        self.assertNotEqual(result["status"], "ok")
+        self.assertIn("pending_submit_control", result["evidence"]["send_signals"])
 
 
 if __name__ == "__main__":

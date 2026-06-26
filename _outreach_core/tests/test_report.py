@@ -135,6 +135,7 @@ class TestSendPeriodSummary(unittest.TestCase):
         self.assertEqual(summary["failures"], 1)
         self.assertEqual(summary["sent_companies"][0]["company"], "株式会社A")
         self.assertEqual(summary["sent_companies"][0]["content"], "ご提案A")
+        self.assertEqual(summary["sent_companies"][0]["source"], "sent_history")
         self.assertIn("first submit button not found", summary["failure_reasons"])
 
     def test_send_summary_all_period_includes_old_rows(self):
@@ -144,6 +145,65 @@ class TestSendPeriodSummary(unittest.TestCase):
         summary = send_period_summary(sent_rows, [], [], period="all")
         self.assertEqual(summary["successes"], 1)
         self.assertEqual(summary["sent_companies"][0]["company"], "古い会社")
+
+    def test_verify_ok_event_counts_as_success_without_sent_history(self):
+        events = [
+            {
+                "kind": "send.verify.completed",
+                "ts": "2026-06-10T01:02:05Z",
+                "target_id": "verified_only",
+                "payload": {
+                    "status": "ok",
+                    "reason": "Generic 株式会社: 送信完了を確認",
+                    "name": "Generic 株式会社",
+                    "subject": "ご提案Generic",
+                    "send_verdict": "sent_ok",
+                    "send_score": 5,
+                    "send_reason": "explicit_sent_status",
+                },
+            }
+        ]
+        now = datetime(2026, 6, 15, 0, 0, tzinfo=timezone.utc)
+        summary = send_period_summary([], [], events, period="this_month", now=now)
+        self.assertEqual(summary["attempts"], 1)
+        self.assertEqual(summary["successes"], 1)
+        self.assertEqual(summary["failures"], 0)
+        self.assertEqual(summary["success_sources"]["verify_event"], 1)
+        self.assertEqual(summary["sent_companies"][0]["company"], "Generic 株式会社")
+        self.assertEqual(summary["sent_companies"][0]["source"], "verify_event")
+        self.assertEqual(summary["sent_companies"][0]["send_reason"], "explicit_sent_status")
+
+    def test_sent_history_wins_over_stale_skip_and_failure_event(self):
+        sent_rows = [
+            {
+                "id": "bookoff_group",
+                "name": "ブックオフグループホールディングス株式会社",
+                "subject": "ご提案",
+                "sent_at": "2026-06-16T20:30:03Z",
+            }
+        ]
+        skip_rows = [
+            {
+                "id": "bookoff_group",
+                "name": "ブックオフグループホールディングス株式会社",
+                "reason": "RESOLVER_FAILED: wizard_too_deep",
+                "skipped_at": "2026-06-16T12:03:04Z",
+            }
+        ]
+        events = [
+            {
+                "kind": "send.queued_for_resolver",
+                "ts": "2026-06-16T11:31:56Z",
+                "target_id": "bookoff_group",
+                "payload": {"reason": "multi-step form exceeded 4 steps"},
+            }
+        ]
+        now = datetime(2026, 6, 17, 0, 0, tzinfo=timezone.utc)
+        summary = send_period_summary(sent_rows, skip_rows, events, period="this_month", now=now)
+        self.assertEqual(summary["attempts"], 1)
+        self.assertEqual(summary["successes"], 1)
+        self.assertEqual(summary["failures"], 0)
+        self.assertEqual(summary["failed_companies"], [])
 
 
 class TestResearchQualitySummary(unittest.TestCase):

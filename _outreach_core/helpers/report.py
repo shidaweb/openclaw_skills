@@ -14,6 +14,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from _outreach_core import history
+from _outreach_core import outcomes as core_outcomes
 from _outreach_core.config import resolve_brief_id
 from _outreach_core.events import load_events, parse_since, prune_data
 from _outreach_core.paths import brief_data_dir
@@ -137,7 +138,6 @@ def send_period_summary(
         if str(e.get("kind") or "") in attempt_kinds:
             attempt_events.append(e)
 
-    success_by_id = {str(r.get("id")): r for r in sent_in if r.get("id") is not None}
     # map id -> best-known company display name
     name_by_id: dict[str, str] = {}
     for r in sent_in + skip_in:
@@ -148,14 +148,60 @@ def send_period_summary(
         if nm:
             name_by_id[str(rid)] = nm
 
+    success_by_id: dict[str, dict[str, Any]] = {}
+    for r in sent_in:
+        rid = r.get("id")
+        if rid is None:
+            continue
+        key = str(rid)
+        success_by_id[key] = {
+            "id": key,
+            "company": str(r.get("name") or r.get("company") or r.get("id") or "unknown"),
+            "content": str(r.get("subject") or ""),
+            "sent_at": str(r.get("sent_at") or ""),
+            "source": "sent_history",
+            "send_verdict": "sent_ok",
+            "send_score": None,
+            "send_reason": "sent_history",
+        }
+
+    for idx, e in enumerate(attempt_events):
+        if str(e.get("kind") or "") != "send.verify.completed":
+            continue
+        payload = e.get("payload") or {}
+        if str(payload.get("status") or "") != "ok":
+            continue
+        tid = str(e.get("target_id") or "")
+        key = tid or f"event:{e.get('ts') or idx}"
+        if tid and tid in success_by_id:
+            continue
+        event_name = str(payload.get("name") or "").strip()
+        if tid and event_name:
+            name_by_id[tid] = event_name
+        success_by_id[key] = {
+            "id": tid,
+            "company": event_name or name_by_id.get(tid) or tid or "unknown",
+            "content": str(payload.get("subject") or ""),
+            "sent_at": str(e.get("ts") or ""),
+            "source": "verify_event",
+            "send_verdict": str(payload.get("send_verdict") or "sent_ok"),
+            "send_score": payload.get("send_score"),
+            "send_reason": str(payload.get("send_reason") or payload.get("reason") or ""),
+        }
+
     failure_reasons: Counter[str] = Counter()
     failed_companies: list[dict[str, Any]] = []
     attempt_ids = {str(e.get("target_id") or "") for e in attempt_events if e.get("target_id") is not None}
+    failed_ids: set[str] = set()
     for e in attempt_events:
+        tid = str(e.get("target_id") or "")
+        if tid and tid in success_by_id:
+            continue
+        if tid:
+            failed_ids.add(tid)
         reason = _failure_reason_from_event(e).strip()
         if not reason:
             continue
-        tid = str(e.get("target_id") or "")
         company = name_by_id.get(tid) or tid or "unknown"
         failure_reasons[reason[:120]] += 1
         failed_companies.append({"id": tid, "company": company, "reason": reason[:160]})
@@ -163,12 +209,16 @@ def send_period_summary(
     # Include skip_history reasons too (for failures that never reached verify event).
     for r in skip_in:
         rid = str(r.get("id") or "")
+        if rid and rid in success_by_id:
+            continue
         if rid and rid in attempt_ids:
             continue
         reason = str(r.get("reason") or "").strip()
         if not reason:
             continue
         failure_reasons[reason[:120]] += 1
+        if rid:
+            failed_ids.add(rid)
         failed_companies.append(
             {
                 "id": str(r.get("id") or ""),
@@ -177,26 +227,19 @@ def send_period_summary(
             }
         )
 
-    sent_companies = []
-    for r in sent_in:
-        sent_companies.append(
-            {
-                "id": str(r.get("id") or ""),
-                "company": str(r.get("name") or r.get("company") or r.get("id") or "unknown"),
-                "content": str(r.get("subject") or ""),
-                "sent_at": str(r.get("sent_at") or ""),
-            }
-        )
+    sent_companies = list(success_by_id.values())
 
-    attempts = len(attempt_events) + sum(1 for r in skip_in if str(r.get("id") or "") not in attempt_ids)
-    successes = len(sent_in)
+    attempts = len(success_by_id) + len(failed_ids)
+    successes = len(success_by_id)
     failures = max(0, attempts - successes)
+    source_counts = Counter(str(r.get("source") or "unknown") for r in sent_companies)
 
     return {
         "period": period,
         "attempts": attempts,
         "successes": successes,
         "failures": failures,
+        "success_sources": dict(source_counts),
         "sent_companies": sent_companies[:100],
         "failed_companies": failed_companies[:100],
         "failure_reasons": dict(failure_reasons.most_common(20)),
@@ -346,11 +389,133 @@ def inquiry_type_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def summarize_outcomes(events: list[dict[str, Any]], *, top_n: int = 20) -> dict[str, Any]:
+    """Aggregate v28 canonical ``send.target_outcome`` events.
+
+    Returns bucket → outcome counts with ratios and up to three representative
+    companies, plus root-cause frequencies. Pure so report tests can pin the
+    reporting contract without file I/O.
+    """
+    target_events = [e for e in events if e.get("kind") == "send.target_outcome"]
+    total = len(target_events)
+    buckets: dict[str, dict[str, Any]] = {}
+    outcomes: dict[str, dict[str, Any]] = {}
+    roots: Counter[str] = Counter()
+
+    for e in target_events:
+        p = e.get("payload") or {}
+        code = str(p.get("outcome") or e.get("outcome") or core_outcomes.UNKNOWN)
+        if code not in core_outcomes.OUTCOMES:
+            code = core_outcomes.UNKNOWN
+        bucket = str(p.get("bucket") or core_outcomes.outcome_bucket(code))
+        company = str(p.get("company") or e.get("target_id") or "unknown")
+        root = str(p.get("root_cause") or "").strip()
+        if root:
+            roots[root[:160]] += 1
+
+        b = buckets.setdefault(bucket, {"count": 0, "ratio": 0.0, "outcomes": {}})
+        b["count"] += 1
+        ob = b["outcomes"].setdefault(
+            code,
+            {
+                "count": 0,
+                "ratio": 0.0,
+                "label": core_outcomes.outcome_label_ja(code),
+                "companies": [],
+            },
+        )
+        ob["count"] += 1
+        if company and company not in ob["companies"] and len(ob["companies"]) < 3:
+            ob["companies"].append(company)
+
+        o = outcomes.setdefault(
+            code,
+            {
+                "count": 0,
+                "ratio": 0.0,
+                "label": core_outcomes.outcome_label_ja(code),
+                "companies": [],
+            },
+        )
+        o["count"] += 1
+        if company and company not in o["companies"] and len(o["companies"]) < 3:
+            o["companies"].append(company)
+
+    if total:
+        for b in buckets.values():
+            b["ratio"] = round(b["count"] / total, 4)
+            for ob in b["outcomes"].values():
+                ob["ratio"] = round(ob["count"] / total, 4)
+        for o in outcomes.values():
+            o["ratio"] = round(o["count"] / total, 4)
+
+    return {
+        "total": total,
+        "buckets": buckets,
+        "outcomes": outcomes,
+        "root_causes": dict(roots.most_common(top_n)),
+    }
+
+
+def diff_against_snapshot(curr: dict[str, Any], prev: dict[str, Any] | None) -> dict[str, Any]:
+    """Small previous-run delta for Slack-readable reports."""
+    prev = prev or {}
+    if not prev:
+        return {"baseline": True, "total_delta": None, "outcome_deltas": {}}
+    curr_out = curr.get("outcomes") or {}
+    prev_out = prev.get("outcomes") or {}
+    codes = set(curr_out) | set(prev_out)
+    return {
+        "baseline": False,
+        "total_delta": int(curr.get("total") or 0) - int(prev.get("total") or 0),
+        "outcome_deltas": {
+            code: int((curr_out.get(code) or {}).get("count") or 0)
+            - int((prev_out.get(code) or {}).get("count") or 0)
+            for code in sorted(codes)
+        },
+    }
+
+
+def _send_funnel_snapshot_path(data_dir: Path) -> Path:
+    return data_dir / "send_funnel_latest.json"
+
+
+def _read_send_funnel_snapshot(data_dir: Path) -> dict[str, Any] | None:
+    path = _send_funnel_snapshot_path(data_dir)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if isinstance(data, dict):
+        summary = data.get("summary")
+        return summary if isinstance(summary, dict) else data
+    return None
+
+
+def _write_send_funnel_snapshot(data_dir: Path, summary: dict[str, Any]) -> None:
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "summary": summary,
+    }
+    try:
+        _send_funnel_snapshot_path(data_dir).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
 def cmd_send_funnel(args: argparse.Namespace) -> int:
     data_dir = _skill_data_dir(args.skill, getattr(args, "brief", None))
     since = parse_since(args.since)
     events = load_events(data_dir, since=since, skill=args.skill)
     kinds = Counter(e.get("kind") for e in events if str(e.get("kind", "")).startswith("send."))
+    outcome_summary = summarize_outcomes(events)
+    prev_outcome_summary = _read_send_funnel_snapshot(data_dir)
+    outcome_diff = diff_against_snapshot(outcome_summary, prev_outcome_summary)
 
     verify = [e for e in events if e.get("kind") == "send.verify.completed"]
     ok = sum(1 for e in verify if (e.get("payload") or {}).get("status") == "ok")
@@ -364,6 +529,39 @@ def cmd_send_funnel(args: argparse.Namespace) -> int:
         f"skill: {args.skill}",
         "",
     ]
+    if outcome_summary["total"]:
+        lines.append("## target outcomes (v28)")
+        total = outcome_summary["total"]
+        delta = outcome_diff.get("total_delta")
+        if outcome_diff.get("baseline"):
+            lines.append(f"- total targets: {total} (baseline)")
+        else:
+            sign = "+" if int(delta or 0) >= 0 else ""
+            lines.append(f"- total targets: {total} ({sign}{delta} vs previous)")
+        for bucket in sorted(outcome_summary["buckets"]):
+            b = outcome_summary["buckets"][bucket]
+            lines.append(f"- {bucket}: {b['count']} ({b['ratio']:.1%})")
+            for code, item in sorted(
+                (b.get("outcomes") or {}).items(),
+                key=lambda kv: (-int(kv[1].get("count") or 0), kv[0]),
+            ):
+                reps = ", ".join(item.get("companies") or [])
+                od = (outcome_diff.get("outcome_deltas") or {}).get(code)
+                diff_txt = ""
+                if od is not None and not outcome_diff.get("baseline"):
+                    diff_txt = f" ({'+' if od >= 0 else ''}{od})"
+                lines.append(
+                    f"    · {code}: {item['count']} ({item['ratio']:.1%})"
+                    f"{diff_txt} — {reps or '-'}"
+                )
+        if outcome_summary["root_causes"]:
+            lines.append("")
+            lines.append("## root causes")
+            for root, n in outcome_summary["root_causes"].items():
+                lines.append(f"- {root}: {n}")
+        lines.append("")
+
+    lines.append("## send event counts")
     for kind in sorted(kinds):
         lines.append(f"- {kind}: {kinds[kind]}")
     lines.extend(
@@ -417,6 +615,8 @@ def cmd_send_funnel(args: argparse.Namespace) -> int:
     if not kinds and not auto.get("active"):
         lines.append("_No send events in range._")
     print("\n".join(lines))
+    if outcome_summary["total"]:
+        _write_send_funnel_snapshot(data_dir, outcome_summary)
     return 0
 
 
@@ -439,12 +639,25 @@ def _render_send_summary(summary: dict[str, Any], *, skill: str, brief: str | No
         f"- attempts: {summary['attempts']}",
         f"- successes: {summary['successes']}",
         f"- failures: {summary['failures']}",
-        "",
     ]
+    sources = summary.get("success_sources") or {}
+    if sources:
+        src = ", ".join(f"{k}: {v}" for k, v in sorted(sources.items()))
+        lines.append(f"- success_sources: {src}")
+    lines.append("")
     lines.append("## successes (company / content)")
     if summary["sent_companies"]:
         for r in summary["sent_companies"][:20]:
-            lines.append(f"- {r['company']} / {r['content']}")
+            source = r.get("source") or "unknown"
+            score = r.get("send_score")
+            reason = r.get("send_reason") or ""
+            meta = f" [{source}"
+            if score is not None:
+                meta += f", score={score}"
+            if reason:
+                meta += f", {str(reason)[:60]}"
+            meta += "]"
+            lines.append(f"- {r['company']} / {r['content']}{meta}")
     else:
         lines.append("_No successful sends in period._")
     lines.append("")
@@ -489,6 +702,10 @@ def cmd_send_summary(args: argparse.Namespace) -> int:
         blocks.append(_render_send_summary(summary, skill=args.skill, brief=brief))
     print("\n\n".join(blocks))
     _write_send_summary_snapshot(data_dir, out_payload)
+    if getattr(args, "post_slack", False):
+        from _outreach_core.notify import post as notify_post
+
+        notify_post("\n\n".join(blocks), level="info")
     if args.json:
         print(json.dumps(out_payload, ensure_ascii=False, indent=2))
     return 0
@@ -737,6 +954,7 @@ def main() -> None:
     )
     p.add_argument("--all-periods", action="store_true")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--post-slack", action="store_true", help="Post the rendered summary to Slack")
 
     p = sub.add_parser("needs-attention")
     _add_brief_arg(p)

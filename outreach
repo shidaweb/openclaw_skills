@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import runpy
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+runpy.run_module("_outreach_core.helpers.outreach", run_name="__main__")

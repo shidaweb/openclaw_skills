@@ -44,6 +44,20 @@ class TestLocalOverride(unittest.TestCase):
         self.assertIn("LOCAL FEWSHOT", block)
         self.assertNotIn("SHARED NEUTRAL", block)
 
+    def test_campaign_persona_uses_exact_override_and_drops_global_examples(self):
+        (self.dir / "system_persona.tenbin.md").write_text(
+            "TENBIN PERSONA", encoding="utf-8"
+        )
+        config = {
+            "prompts_overrides": {
+                "linkedin_system_persona": "prompts/system_persona.tenbin.md"
+            }
+        }
+        block = P.build_system_block(config, self.dir)
+        self.assertIn("TENBIN PERSONA", block)
+        self.assertNotIn("SHARED NEUTRAL", block)
+        self.assertNotIn("SHARED EXAMPLES", block)
+
 
 if __name__ == "__main__":
     unittest.main()

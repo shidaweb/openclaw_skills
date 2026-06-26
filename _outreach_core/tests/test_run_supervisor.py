@@ -25,6 +25,24 @@ class TestIsStalled(unittest.TestCase):
         self.assertTrue(RS.is_stalled(999, 100))
 
 
+class TestTargetAbort(unittest.TestCase):
+    def test_limit_disabled(self):
+        self.assertFalse(RS.should_abort_target(0, 10**9, 0))
+        self.assertFalse(RS.should_abort_target(0, 10**9, -1))
+
+    def test_below_limit_continues(self):
+        self.assertFalse(RS.should_abort_target(100.0, 279.9, 180))
+
+    def test_equal_or_over_limit_aborts(self):
+        self.assertTrue(RS.should_abort_target(100.0, 280.0, 180))
+        self.assertTrue(RS.should_abort_target(100.0, 281.0, 180))
+
+    def test_bad_values_are_safe(self):
+        self.assertFalse(RS.should_abort_target(None, 200.0, 180))
+        self.assertFalse(RS.should_abort_target(100.0, None, 180))
+        self.assertFalse(RS.should_abort_target(100.0, 200.0, "bad"))
+
+
 class TestLatestActivityAge(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -128,6 +146,44 @@ class TestDecide(unittest.TestCase):
         self.assertTrue(RS.is_restart(RS.ACTION_RESTART_CRASH))
         self.assertFalse(RS.is_restart(RS.ACTION_CONTINUE))
         self.assertFalse(RS.is_restart(RS.ACTION_SUCCEEDED))
+
+
+class TestGiveUpProblem(unittest.TestCase):
+    def test_none_for_non_give_up(self):
+        self.assertIsNone(
+            RS.build_give_up_problem(
+                RS.ACTION_RESTART_CRASH, exit_code=1, activity_age_sec=None
+            )
+        )
+
+    def test_stalled_payload(self):
+        payload = RS.build_give_up_problem(
+            RS.ACTION_GIVE_UP_STALLED,
+            exit_code=None,
+            activity_age_sec=999,
+            recent_outcomes=[
+                {"outcome": "network_error"},
+                {"payload": {"outcome": "validation_stuck"}},
+                {"payload": {"outcome": "network_error"}},
+            ],
+        )
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual(payload["kind"], "run_give_up_stalled")
+        self.assertEqual(payload["detail"]["recent_outcomes"]["network_error"], 2)
+        self.assertIn("999", payload["detail"]["root_cause"])
+
+    def test_crash_payload(self):
+        payload = RS.build_give_up_problem(
+            RS.ACTION_GIVE_UP_CRASH,
+            exit_code=2,
+            activity_age_sec=None,
+            recent_outcomes=[],
+        )
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual(payload["kind"], "run_give_up_crash")
+        self.assertEqual(payload["detail"]["exit_code"], 2)
 
 
 class TestPersistence(unittest.TestCase):

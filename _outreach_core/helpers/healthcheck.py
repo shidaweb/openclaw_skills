@@ -66,6 +66,39 @@ def _progress_from_task(data_dir: Path) -> tuple[int, int]:
         return 0, 0
 
 
+def run_activity_age_seconds(
+    data_dir: Path,
+    *,
+    now_epoch: float | None = None,
+) -> int | None:
+    """Age of the freshest run-owned progress signal.
+
+    The gateway/system health heartbeat is host-level and can be stale even
+    while a campaign is actively writing per-brief progress.  Using the
+    current-task/run-progress/event mtimes prevents the watchdog from reporting
+    a healthy, advancing campaign as stuck.
+    """
+    candidates = (
+        current_task_path(data_dir),
+        data_dir / "run_progress.json",
+        data_dir / "events.jsonl",
+        data_dir / "active_run.lock",
+    )
+    mtimes: list[float] = []
+    for path in candidates:
+        try:
+            if path.is_file():
+                mtimes.append(path.stat().st_mtime)
+        except OSError:
+            continue
+    if not mtimes:
+        return None
+    import time
+
+    now = time.time() if now_epoch is None else float(now_epoch)
+    return max(0, int(now - max(mtimes)))
+
+
 def collect_active_runs(skills_root: Path | None = None) -> list[dict[str, Any]]:
     root = skills_root or SKILLS_ROOT
     runs: list[dict[str, Any]] = []
@@ -91,6 +124,7 @@ def collect_active_runs(skills_root: Path | None = None) -> list[dict[str, Any]]
                     "current": current,
                     "total": total,
                     "thread_ts": lock.get("slack_thread_ts") or None,
+                    "activity_age_sec": run_activity_age_seconds(brief_dir),
                 }
             )
     return runs
@@ -198,25 +232,43 @@ def heartbeat_age_seconds(health: dict[str, Any] | None) -> int | None:
     return int((datetime.now(timezone.utc) - ts.astimezone(timezone.utc)).total_seconds())
 
 
+def _fmt_age(seconds: int | None) -> str:
+    if seconds is None:
+        return "不明"
+    if seconds < 60:
+        return f"{seconds}秒前"
+    if seconds < 3600:
+        return f"{seconds // 60}分前"
+    return f"{seconds // 3600}時間{(seconds % 3600) // 60}分前"
+
+
 def format_ping_line(health: dict[str, Any] | None) -> str:
     age = heartbeat_age_seconds(health)
     if health is None:
-        return "⚠️ no heartbeat file yet — run: python3 -m _outreach_core.helpers.healthcheck write-heartbeat"
-    age_s = f"{age}s ago" if age is not None else "unknown"
+        return "⚠️ 稼働記録がまだありません（復旧: ./healthcheck write-heartbeat）"
     runs = health.get("active_runs") or []
     run_bits: list[str] = []
     for r in runs[:3]:
-        skill = (r.get("skill") or "?").replace("-outreach", "")
-        run_bits.append(
-            f"{skill} {r.get('stage', '?')} {r.get('current', 0)}/{r.get('total', 0)}"
+        skill = (r.get("skill") or "?").replace("jp-form-outreach", "JPフォーム").replace(
+            "linkedin-outreach", "LinkedIn"
         )
-    runs_txt = ", ".join(run_bits) if run_bits else "none"
+        stage = {
+            "campaign": "キャンペーン",
+            "send": "送信",
+            "draft": "ドラフト",
+            "enrich": "調査",
+            "resolve": "リゾルバ",
+        }.get(str(r.get("stage") or ""), str(r.get("stage") or "?"))
+        run_bits.append(
+            f"{skill} {stage} {r.get('current', 0)}/{r.get('total', 0)}"
+        )
+    runs_txt = "、".join(run_bits) if run_bits else "なし"
     na = int(health.get("open_needs_attention_count") or 0)
     last_ev = _latest_event_kind()
-    ev_txt = f" / last event: {last_ev}" if last_ev else ""
+    ev_txt = f" / 最終イベント: {last_ev}" if last_ev else ""
     return (
-        f"✅ alive. heartbeat {age_s} / active runs: {len(runs)} ({runs_txt}) / "
-        f"open needs_attention: {na}{ev_txt}"
+        f"✅ 稼働中。heartbeat {_fmt_age(age)} / 実行中 {len(runs)}件（{runs_txt}） / "
+        f"要対応 {na}件{ev_txt}"
     )
 
 
@@ -241,7 +293,7 @@ def _latest_event_kind(skills_root: Path | None = None) -> str | None:
                 if ts and (best_ts is None or ts > best_ts):
                     best_ts = ts
                     tid = ev.get("target_id") or "?"
-                    best_label = f"{ev.get('kind', '?')} ({tid})"
+                    best_label = f"{_event_kind_label(ev.get('kind'))} ({tid})"
             except (OSError, json.JSONDecodeError):
                 continue
     return best_label
@@ -250,13 +302,28 @@ def _latest_event_kind(skills_root: Path | None = None) -> str | None:
 def format_status(health: dict[str, Any] | None) -> str:
     lines = [format_ping_line(health), ""]
     if health:
-        lines.append("## system_health")
+        lines.append("## system_health（内部状態）")
         lines.append(json.dumps(health, ensure_ascii=False, indent=2))
     lines.append("")
-    lines.append("## recent events (last 5)")
+    lines.append("## 最近のイベント（5件）")
     for row in _recent_events(5):
         lines.append(f"- {row}")
     return "\n".join(lines)
+
+
+def _event_kind_label(kind: Any) -> str:
+    return {
+        "slack.notified": "Slack通知",
+        "slack.problem_notified": "Slack要確認通知",
+        "slack.problem_deduped": "Slack重複通知抑制",
+        "send.target_outcome": "送信結果",
+        "send.target_timeout": "1社タイムアウト",
+        "send.lead_crashed": "1社エラー",
+        "send.unverified_prior_attempt": "未検証送信候補",
+        "send.interrupted_before_submit_resume_skip": "中断復帰スキップ",
+        "campaign.awaiting_upfront_approval": "承認待ち",
+        "heartbeat.tick": "ハートビート",
+    }.get(str(kind or ""), str(kind or "?"))
 
 
 def _recent_events(limit: int, skills_root: Path | None = None) -> list[str]:
@@ -277,7 +344,7 @@ def _recent_events(limit: int, skills_root: Path | None = None) -> list[str]:
                     ts = _parse_ts(ev.get("ts"))
                     if ts:
                         label = (
-                            f"{ev.get('ts')} {ev.get('kind')} "
+                            f"{ev.get('ts')} {_event_kind_label(ev.get('kind'))} "
                             f"brief={brief_dir.name} target={ev.get('target_id', '-')}"
                         )
                         collected.append((ts, label))
@@ -363,7 +430,7 @@ def _refresh_then_read() -> dict[str, Any] | None:
     refresh fails for any reason.
     """
     try:
-        write_heartbeat()
+        write_heartbeat(touch_command=True)
     except Exception:
         pass
     return read_health()

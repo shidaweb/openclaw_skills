@@ -76,10 +76,14 @@ def build_status_report(
     brief_id: str | None = None,
     *,
     channel_id: str | None = None,
-    skill: str = "jp-form-outreach",
+    thread_ts: str | None = None,
+    skill: str | None = None,
 ) -> str:
     """Markdown summary for OpenClaw agent / Slack."""
-    bid = resolve_brief_id(brief_id)
+    thread_state: dict[str, Any] = {}
+    if channel_id and thread_ts:
+        thread_state = channel_state.load_thread_state(channel_id, thread_ts) or {}
+    bid = resolve_brief_id(brief_id or str(thread_state.get("brief_id") or "") or None)
     lines = [f"# Doorman status — brief `{bid}`", ""]
 
     if channel_id:
@@ -90,9 +94,27 @@ def build_status_report(
             lines.append(f"- channels: {', '.join(state.get('default_channels') or [])}")
             lines.append(f"- last_used_at: {state.get('last_used_at', '')}")
         else:
-            lines.append("_Channel not bound. Run `brief bind`._")
+            lines.append("_No channel-wide default; a thread binding may still be active._")
         lines.append("")
 
+    selected_channel = str(thread_state.get("channel") or "").strip()
+    selected_persona = str(thread_state.get("persona_id") or "").strip()
+    if thread_ts:
+        lines.append(f"## thread `{thread_ts}`")
+        if thread_state:
+            lines.append(f"- campaign: {bid}")
+            lines.append(f"- persona: {selected_persona or '(legacy inline sender)'}")
+            lines.append(f"- outreach_channel: {selected_channel or '(not selected)'}")
+            lines.append(f"- last_used_at: {thread_state.get('last_used_at', '')}")
+        else:
+            lines.append("_Thread not bound. Run `outreach bind`._")
+        lines.append("")
+
+    if skill is None:
+        skill = {
+            "jp_form": "jp-form-outreach",
+            "linkedin": "linkedin-outreach",
+        }.get(selected_channel, "jp-form-outreach")
     skill_dir = SKILLS_ROOT / skill
     data = brief_data_dir(skill_dir, bid)
 

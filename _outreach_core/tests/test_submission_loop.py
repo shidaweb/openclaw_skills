@@ -60,6 +60,37 @@ DONE_PAGE = {
     "probe_field_hits": 0,
     "dialog_count": 0,
 }
+CF7_STICKY_DONE_PAGE = {
+    "url": "https://example.co.jp/contact/",
+    "title": "お問い合わせ",
+    "text": "お問い合わせフォーム",
+    "visible_forms": 1,
+    "visible_textareas": 1,
+    "editable_visible": 8,
+    "submit_controls": 1,
+    "probe_text_hits": 0,
+    "probe_field_hits": 0,
+    "dialog_count": 0,
+    "cf7_sent": True,
+    "cf7_invalid": False,
+    "cf7_statuses": ["sent wpcf7-form sent"],
+    "cf7_response_text": "ありがとうございます。メッセージは送信されました。",
+}
+GENERIC_STICKY_DONE_PAGE = {
+    "url": "https://example.co.jp/contact/",
+    "title": "お問い合わせ",
+    "text": "お問い合わせフォーム",
+    "visible_forms": 1,
+    "visible_textareas": 1,
+    "editable_visible": 8,
+    "submit_controls": 1,
+    "probe_text_hits": 0,
+    "probe_field_hits": 0,
+    "dialog_count": 0,
+    "submission_sent": True,
+    "submission_statuses": ["success form-success submitted"],
+    "submission_status_text": "お問い合わせを受け付けました。",
+}
 
 
 def _validation_page(n: int) -> dict:
@@ -158,6 +189,42 @@ def test_single_flow_mislabeled_as_confirm_still_completes(monkeypatch):
     )
     assert res["status"] == "done"
     assert res["clicks"] == 1
+
+
+def test_cf7_ajax_success_with_visible_form_completes(monkeypatch):
+    # Bookoff-class: CF7 Ajax success leaves the form visible, so DOM visibility
+    # alone would loop until wizard_too_deep.
+    fake = FakeBrowser([INPUT_PAGE, CF7_STICKY_DONE_PAGE])
+    _wire(monkeypatch, fake)
+    timeline: list = []
+    res = run._submission_loop(
+        _target(), CONFIG, "はじめまして。",
+        flow="single", mode="auto", trace=None, tid="t1", timeline=timeline,
+    )
+    assert res["status"] == "done"
+    assert res["clicks"] == 1
+    live = [
+        (t.get("detail") or {}).get("state")
+        for t in timeline if t.get("stage") == "live_state"
+    ]
+    assert live[:2] == ["input", "done"]
+
+
+def test_generic_ajax_success_with_visible_form_completes(monkeypatch):
+    fake = FakeBrowser([INPUT_PAGE, GENERIC_STICKY_DONE_PAGE])
+    _wire(monkeypatch, fake)
+    timeline: list = []
+    res = run._submission_loop(
+        _target(), CONFIG, "はじめまして。",
+        flow="single", mode="auto", trace=None, tid="t1", timeline=timeline,
+    )
+    assert res["status"] == "done"
+    assert res["clicks"] == 1
+    live = [
+        (t.get("detail") or {}).get("state")
+        for t in timeline if t.get("stage") == "live_state"
+    ]
+    assert live[:2] == ["input", "done"]
 
 
 def test_ineffective_clicks_detected_not_misreported(monkeypatch):

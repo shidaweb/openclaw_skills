@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -49,7 +51,20 @@ class TestHealthcheck(unittest.TestCase):
                 runs = hc.collect_active_runs(root)
             self.assertEqual(len(runs), 1)
             self.assertEqual(runs[0]["brief_id"], "test-brief")
+            self.assertIsNotNone(runs[0]["activity_age_sec"])
             remove_lock(data)
+
+    def test_run_activity_prefers_fresh_per_brief_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            data = Path(td)
+            task = progress.current_task_path(data)
+            task.write_text('{}\n', encoding="utf-8")
+            now = time.time()
+            os.utime(task, (now - 12, now - 12))
+            self.assertEqual(
+                hc.run_activity_age_seconds(data, now_epoch=now),
+                12,
+            )
 
     def test_format_ping_line(self) -> None:
         line = hc.format_ping_line(
@@ -59,8 +74,10 @@ class TestHealthcheck(unittest.TestCase):
                 "open_needs_attention_count": 0,
             }
         )
-        self.assertIn("alive", line)
+        self.assertIn("稼働中", line)
         self.assertIn("heartbeat", line)
+        self.assertIn("実行中", line)
+        self.assertIn("要対応", line)
 
     def test_heartbeat_session_syncs_health(self) -> None:
         with tempfile.TemporaryDirectory() as td:

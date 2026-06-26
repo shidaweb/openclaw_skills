@@ -56,6 +56,20 @@ ABANDON_COOLDOWN_MIN = 30
 ABANDON_NOTIFY_INTERVAL_SEC = 300
 WATCHDOG_LABEL = "com.doorman.watchdog"
 WATCHDOG_PLIST = Path.home() / "Library" / "LaunchAgents" / "com.doorman.watchdog.plist"
+OPENCLAW_AGENT_TIMEOUT_SECONDS = 1800
+OPENCLAW_CLI_NO_OUTPUT_TIMEOUT_MS = 900_000
+OPENCLAW_HEARTBEAT_EVERY = "10m"
+OPENCLAW_HEARTBEAT_TIMEOUT_SECONDS = 600
+OPENCLAW_CLI_BACKEND_ID = "claude-cli"
+OPENCLAW_HEARTBEAT_PROMPT = (
+    "現在の作業状況を日本語で1-2行だけ簡潔に報告してください。"
+    "実行中の作業がなければ「待機中です」とだけ返してください。"
+)
+_OPENCLAW_CLI_TIMEOUT_PATTERNS = (
+    "cli watchdog timeout",
+    "cli subprocess: timed out",
+    "no-output stall",
+)
 
 
 def _utc_now() -> str:
@@ -103,6 +117,214 @@ def save_state(state: dict[str, Any], skills_root: Path | None = None) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, path)
+
+
+def openclaw_config_path() -> Path:
+    return Path(os.environ.get("OPENCLAW_CONFIG", Path.home() / ".openclaw" / "openclaw.json")).expanduser()
+
+
+def required_cli_backend_config(existing: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return a conservative claude-cli config with a longer no-output watchdog.
+
+    Existing non-watchdog fields are preserved where present so local runtime
+    customizations are not stomped; missing fields are filled with the known
+    stream-json Claude CLI contract OpenClaw already uses.
+    """
+    backend = dict(existing or {})
+    backend.setdefault("command", "claude")
+    backend.setdefault("args", ["--print", "--output-format", "stream-json", "--verbose"])
+    backend.setdefault("output", "jsonl")
+    backend.setdefault("resumeOutput", "jsonl")
+    backend.setdefault("jsonlDialect", "claude-stream-json")
+    backend.setdefault("liveSession", "claude-stdio")
+    backend.setdefault("input", "stdin")
+    backend.setdefault("modelArg", "--model")
+    backend.setdefault("sessionArg", "--resume")
+    backend.setdefault("sessionMode", "existing")
+    reliability = backend.setdefault("reliability", {})
+    if not isinstance(reliability, dict):
+        reliability = {}
+        backend["reliability"] = reliability
+    watchdog = reliability.setdefault("watchdog", {})
+    if not isinstance(watchdog, dict):
+        watchdog = {}
+        reliability["watchdog"] = watchdog
+    for mode in ("fresh", "resume"):
+        block = watchdog.setdefault(mode, {})
+        if not isinstance(block, dict):
+            block = {}
+            watchdog[mode] = block
+        try:
+            current = int(block.get("noOutputTimeoutMs", 0))
+        except (TypeError, ValueError):
+            current = 0
+        if current < OPENCLAW_CLI_NO_OUTPUT_TIMEOUT_MS:
+            block["noOutputTimeoutMs"] = OPENCLAW_CLI_NO_OUTPUT_TIMEOUT_MS
+    return backend
+
+
+def openclaw_runtime_patch_needed(cfg: dict[str, Any]) -> bool:
+    defaults = ((cfg.get("agents") or {}).get("defaults") or {})
+    try:
+        if int(defaults.get("timeoutSeconds", 0)) < OPENCLAW_AGENT_TIMEOUT_SECONDS:
+            return True
+    except (TypeError, ValueError):
+        return True
+    backend = ((defaults.get("cliBackends") or {}).get(OPENCLAW_CLI_BACKEND_ID) or {})
+    required = required_cli_backend_config(backend if isinstance(backend, dict) else {})
+    if backend != required:
+        return True
+    hb = defaults.get("heartbeat") or {}
+    if not isinstance(hb, dict):
+        return True
+    if hb.get("every") != OPENCLAW_HEARTBEAT_EVERY:
+        return True
+    try:
+        if int(hb.get("timeoutSeconds", 0)) < OPENCLAW_HEARTBEAT_TIMEOUT_SECONDS:
+            return True
+    except (TypeError, ValueError):
+        return True
+    if int(hb.get("ackMaxChars", 0) or 0) < 180:
+        return True
+    if not str(hb.get("prompt") or "").strip():
+        return True
+    return False
+
+
+def apply_openclaw_runtime_patch(path: Path | None = None) -> bool:
+    """Self-heal OpenClaw runtime settings that prevent long turns from living.
+
+    Returns True only when the config was changed. Invalid/missing configs are
+    left alone so the watchdog never replaces a human-owned file with guesses.
+    """
+    cfg_path = path or openclaw_config_path()
+    try:
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(data, dict) or not openclaw_runtime_patch_needed(data):
+        return False
+    agents = data.setdefault("agents", {})
+    if not isinstance(agents, dict):
+        agents = {}
+        data["agents"] = agents
+    defaults = agents.setdefault("defaults", {})
+    if not isinstance(defaults, dict):
+        defaults = {}
+        agents["defaults"] = defaults
+    try:
+        current_timeout = int(defaults.get("timeoutSeconds", 0))
+    except (TypeError, ValueError):
+        current_timeout = 0
+    if current_timeout < OPENCLAW_AGENT_TIMEOUT_SECONDS:
+        defaults["timeoutSeconds"] = OPENCLAW_AGENT_TIMEOUT_SECONDS
+    cli_backends = defaults.setdefault("cliBackends", {})
+    if not isinstance(cli_backends, dict):
+        cli_backends = {}
+        defaults["cliBackends"] = cli_backends
+    existing_backend = cli_backends.get(OPENCLAW_CLI_BACKEND_ID)
+    cli_backends[OPENCLAW_CLI_BACKEND_ID] = required_cli_backend_config(
+        existing_backend if isinstance(existing_backend, dict) else {}
+    )
+    heartbeat = defaults.setdefault("heartbeat", {})
+    if not isinstance(heartbeat, dict):
+        heartbeat = {}
+        defaults["heartbeat"] = heartbeat
+    heartbeat["every"] = OPENCLAW_HEARTBEAT_EVERY
+    try:
+        hb_timeout = int(heartbeat.get("timeoutSeconds", 0))
+    except (TypeError, ValueError):
+        hb_timeout = 0
+    if hb_timeout < OPENCLAW_HEARTBEAT_TIMEOUT_SECONDS:
+        heartbeat["timeoutSeconds"] = OPENCLAW_HEARTBEAT_TIMEOUT_SECONDS
+    if int(heartbeat.get("ackMaxChars", 0) or 0) < 180:
+        heartbeat["ackMaxChars"] = 180
+    heartbeat.setdefault("includeReasoning", False)
+    heartbeat.setdefault("prompt", OPENCLAW_HEARTBEAT_PROMPT)
+    tmp = cfg_path.with_name(cfg_path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, cfg_path)
+    return True
+
+
+def _openclaw_log_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    tmp_dir = Path(os.environ.get("OPENCLAW_LOG_DIR", "/tmp/openclaw")).expanduser()
+    try:
+        candidates.extend(sorted(tmp_dir.glob("openclaw-*.log"), key=lambda p: p.stat().st_mtime, reverse=True))
+    except OSError:
+        pass
+    candidates.append(Path.home() / ".openclaw" / "logs" / "gateway.err.log")
+    return candidates
+
+
+def _tail_lines(path: Path, max_bytes: int = 512_000) -> list[str]:
+    try:
+        with path.open("rb") as f:
+            try:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - max_bytes), os.SEEK_SET)
+            except OSError:
+                pass
+            return f.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+
+
+def _line_timestamp(line: str, path: Path) -> datetime | None:
+    try:
+        data = json.loads(line)
+        if isinstance(data, dict):
+            ts = data.get("time") or (data.get("_meta") or {}).get("date")
+            if ts:
+                return _parse_ts(str(ts))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    head = line.split(" ", 1)[0]
+    if head.startswith("20"):
+        parsed = _parse_ts(head)
+        if parsed:
+            return parsed
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+    except OSError:
+        return None
+
+
+def _is_cli_timeout_line(line: str) -> bool:
+    lower = line.lower()
+    return any(pattern in lower for pattern in _OPENCLAW_CLI_TIMEOUT_PATTERNS)
+
+
+def latest_cli_backend_timeout(
+    *,
+    log_paths: list[Path] | None = None,
+    now_epoch: float | None = None,
+    lookback_sec: int = 900,
+) -> dict[str, Any] | None:
+    """Return the newest recent OpenClaw CLI no-output timeout, if any."""
+    now = now_epoch if now_epoch is not None else datetime.now(timezone.utc).timestamp()
+    latest: dict[str, Any] | None = None
+    for path in log_paths or _openclaw_log_candidates():
+        for line in _tail_lines(path):
+            if not _is_cli_timeout_line(line):
+                continue
+            ts = _line_timestamp(line, path)
+            if not ts:
+                continue
+            epoch = ts.astimezone(timezone.utc).timestamp()
+            if now - epoch > lookback_sec:
+                continue
+            item = {
+                "epoch": epoch,
+                "ts": ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "path": str(path),
+                "marker": f"{path}:{int(epoch)}:{line[:180]}",
+            }
+            if latest is None or item["epoch"] > latest["epoch"]:
+                latest = item
+    return latest
 
 
 def _run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
@@ -561,6 +783,11 @@ def _self_heal(cfg: dict[str, Any], root: Path) -> None:
     """§W3: re-load the watchdog if it dropped; re-assert gateway KeepAlive.
     Best-effort; never raises into the tick."""
     try:
+        if apply_openclaw_runtime_patch():
+            append_log("self-heal: re-applied OpenClaw runtime reliability config", root)
+    except Exception as exc:  # pragma: no cover - defensive
+        append_log(f"self-heal openclaw config error: {exc!s}", root)
+    try:
         if should_reload_watchdog(is_watchdog_loaded()):
             ensure_watchdog_installed(root)
             append_log("self-heal: re-ensured watchdog launchd job", root)
@@ -739,6 +966,30 @@ def tick(skills_root: Path | None = None) -> str:
         if state.get("channel_fail_streak"):
             state["channel_fail_streak"] = 0
 
+        cli_timeout = latest_cli_backend_timeout(now_epoch=now_epoch)
+        if cli_timeout and cli_timeout.get("marker") != state.get("last_cli_backend_timeout_marker"):
+            state["last_cli_backend_timeout_marker"] = cli_timeout.get("marker")
+            state["last_cli_backend_timeout_epoch"] = cli_timeout.get("epoch")
+            if can_restart(state, tuning):
+                notify_slack(
+                    "⚠️ OpenClawの応答生成が無出力timeoutで止まりました。"
+                    "gatewayを再起動して、次の依頼に応答できる状態へ戻します。",
+                    level="warn",
+                )
+                restart_gateway(cfg)
+                record_restart(state, "cli-backend-timeout", tuning)
+                save_state(state, root)
+                append_log(f"restarted gateway (cli backend timeout {cli_timeout.get('ts')})", root)
+                return "restarted"
+            notify_slack(
+                "⚠️ OpenClawの応答生成timeoutを検知しましたが、短時間の再起動上限に達しています。"
+                "少し待ってから再度確認します。",
+                level="warn",
+            )
+            save_state(state, root)
+            append_log(f"cli backend timeout detected but restart budget exhausted {cli_timeout.get('ts')}", root)
+            return "stuck"
+
         health = read_health(root)
         age = heartbeat_age_seconds(health)
         active = collect_active_runs(root)
@@ -802,6 +1053,7 @@ def status_summary(skills_root: Path | None = None) -> dict[str, Any]:
     last_tick = state.get("last_tick_epoch")
     last_ok = state.get("last_ok_epoch")
     channels = configured_but_down_channels(cfg) if (loaded and healthy) else []
+    cli_timeout = latest_cli_backend_timeout(now_epoch=now, lookback_sec=24 * 60 * 60)
 
     summary: dict[str, Any] = {
         "gateway_label": gwcfg.label(cfg),
@@ -818,6 +1070,9 @@ def status_summary(skills_root: Path | None = None) -> dict[str, Any]:
         ),
         "abandoned": _abandoned_now(state),
         "channels_down": channels,
+        "cli_backend_last_timeout_age_sec": (
+            int(now - cli_timeout["epoch"]) if cli_timeout else None
+        ),
     }
     summary["status"] = overall_status(summary)
     return summary
@@ -825,12 +1080,12 @@ def status_summary(skills_root: Path | None = None) -> dict[str, Any]:
 
 def _age(sec: int | None) -> str:
     if sec is None:
-        return "never"
+        return "なし"
     if sec < 90:
-        return f"{sec}s ago"
+        return f"{sec}秒前"
     if sec < 5400:
-        return f"{sec // 60}m ago"
-    return f"{sec // 3600}h ago"
+        return f"{sec // 60}分前"
+    return f"{sec // 3600}時間前"
 
 
 def format_status_summary(summary: dict[str, Any]) -> str:
@@ -845,17 +1100,21 @@ def format_status_summary(summary: dict[str, Any]) -> str:
     )
     lines = [
         f"{icon} Doorman gateway: {verdict}",
-        f"  • gateway: loaded {yn(summary.get('gateway_loaded'))} / "
-        f"healthy {yn(summary.get('gateway_healthy'))} ({summary.get('gateway_label')})",
-        f"  • watchdog: loaded {yn(summary.get('watchdog_loaded'))} / "
-        f"liveness {live_icon} (last tick {_age(summary.get('watchdog_last_tick_age_sec'))})",
-        f"  • last healthy: {_age(summary.get('last_ok_age_sec'))} / "
-        f"recent restarts: {summary.get('recent_restarts', 0)}"
+        f"  • gateway: 起動 {yn(summary.get('gateway_loaded'))} / "
+        f"応答 {yn(summary.get('gateway_healthy'))} ({summary.get('gateway_label')})",
+        f"  • watchdog: 起動 {yn(summary.get('watchdog_loaded'))} / "
+        f"監視 {live_icon} (最終tick {_age(summary.get('watchdog_last_tick_age_sec'))})",
+        f"  • 最終正常: {_age(summary.get('last_ok_age_sec'))} / "
+        f"直近再起動: {summary.get('recent_restarts', 0)}回"
         f"{' / ABANDONED' if summary.get('abandoned') else ''}",
     ]
+    if summary.get("cli_backend_last_timeout_age_sec") is not None:
+        lines.append(
+            f"  • CLI無出力timeout: {_age(summary.get('cli_backend_last_timeout_age_sec'))}"
+        )
     down = summary.get("channels_down") or []
     if down:
-        lines.append(f"  • channels down: {', '.join(down)}")
+        lines.append(f"  • 切断中チャンネル: {', '.join(down)}")
     return "\n".join(lines)
 
 

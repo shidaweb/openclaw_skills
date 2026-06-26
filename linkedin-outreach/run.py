@@ -32,7 +32,7 @@ from _outreach_core import history as core_history
 from _outreach_core import infer as core_infer
 from _outreach_core import preview as core_preview
 from _outreach_core import prompt as core_prompt
-from _outreach_core.config import BriefError, load_merged_config
+from _outreach_core.config import BriefError, load_merged_config as core_load_merged_config
 from _outreach_core.paths import SkillPaths, resolve_skill_paths
 from _outreach_core.progress import HeartbeatSession, resolve_heartbeat_mode
 from _outreach_core.verify import (
@@ -51,6 +51,7 @@ except ImportError:
 SKILL_DIR = Path(__file__).resolve().parent
 _PATHS: SkillPaths | None = None
 BRIEF_ID = ""
+PERSONA_ID: str | None = None
 DATA_DIR = SKILL_DIR / "data"
 PROMPTS_DIR = SKILL_DIR / "prompts"
 
@@ -58,24 +59,148 @@ DEFAULT_MODEL = core_infer.DEFAULT_MODEL
 BROWSER_PROFILE = core_infer.BROWSER_PROFILE
 RATE_LIMIT_SECONDS = 4  # between page loads, to look human
 
+TOUCHPOINT_AUTO = "auto"
+TOUCHPOINT_CONNECTION = "connection-request"
+TOUCHPOINT_INMAIL = "inmail"
+TOUCHPOINT_CHOICES = (TOUCHPOINT_AUTO, TOUCHPOINT_CONNECTION, TOUCHPOINT_INMAIL)
+
 SKIP_HISTORY_PATH = DATA_DIR / "skip_history.jsonl"
 SENT_HISTORY_PATH = DATA_DIR / "sent_history.jsonl"
 
 
-def configure_brief(brief_id: str | None, *, cmd: str = "") -> SkillPaths:
-    global _PATHS, BRIEF_ID, DATA_DIR, PROMPTS_DIR, SKIP_HISTORY_PATH, SENT_HISTORY_PATH
+def resolve_touchpoint(config: dict[str, Any], requested: str = TOUCHPOINT_AUTO) -> str:
+    """Resolve the first outbound action from CLI intent or brief.sequence.
+
+    A brief whose first step is ``cr`` must never silently fall through to an
+    InMail send.  This was the root of the Tenbin run's design/runtime drift.
+    """
+    normalized = (requested or TOUCHPOINT_AUTO).strip().lower().replace("_", "-")
+    if normalized != TOUCHPOINT_AUTO:
+        if normalized not in TOUCHPOINT_CHOICES:
+            raise ValueError(f"unknown message type: {requested}")
+        return normalized
+
+    steps = ((config.get("sequence") or {}).get("steps") or [])
+    if steps:
+        first = steps[0] if isinstance(steps[0], dict) else {}
+        step_id = str(first.get("id") or first.get("name") or "").strip().lower()
+        if step_id in {"cr", "connection", "connection-request", "connection request"}:
+            return TOUCHPOINT_CONNECTION
+        if step_id in {"inmail", "m0", "direct-inmail"}:
+            return TOUCHPOINT_INMAIL
+
+    # Legacy briefs predate sequence support and are InMail campaigns.
+    return TOUCHPOINT_INMAIL
+
+
+def touchpoint_char_limit(config: dict[str, Any], touchpoint: str) -> int:
+    """Return the strict platform/brief limit for the active touchpoint."""
+    platform_limit = 300 if touchpoint == TOUCHPOINT_CONNECTION else 1800
+    steps = ((config.get("sequence") or {}).get("steps") or [])
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        step_id = str(step.get("id") or "").strip().lower()
+        matches = (
+            touchpoint == TOUCHPOINT_CONNECTION and step_id in {"cr", "connection"}
+        ) or (touchpoint == TOUCHPOINT_INMAIL and step_id in {"inmail", "m0"})
+        if matches and step.get("max_chars"):
+            return min(platform_limit, int(step["max_chars"]))
+    configured = int(((config.get("model") or {}).get("max_chars") or platform_limit))
+    return min(platform_limit, configured)
+
+
+def is_sales_nav_lead_url(url: str) -> bool:
+    return "/sales/lead/" in (url or "")
+
+
+def is_public_profile_url(url: str) -> bool:
+    return "/in/" in (url or "")
+
+
+def names_match(expected: str, actual: str) -> bool:
+    """Conservative identity check for Sales Nav lookup results."""
+    norm = lambda s: re.sub(r"[^a-z0-9]", "", (s or "").casefold())
+    left, right = norm(expected), norm(actual)
+    return bool(left and right and (left == right or left in right or right in left))
+
+
+def snapshot_problem(snapshot: str | None) -> str | None:
+    """Classify snapshots that cannot support trustworthy enrichment."""
+    text = (snapshot or "").strip()
+    if not text:
+        return "empty_snapshot"
+    low = text.casefold()
+    if len(text) < 160:
+        return "snapshot_too_short"
+    if any(
+        marker in low
+        for marker in (
+            "page not found",
+            "profile not found",
+            "this page doesn't exist",
+            "no results found",
+            "ページが見つかりません",
+        )
+    ):
+        return "profile_not_resolved"
+    if "sign in" in low and "linkedin" in low and "heading" not in low:
+        return "login_required"
+    return None
+
+
+def enrichment_signal_count(row: dict[str, Any]) -> int:
+    """Count independent, draftable profile signals."""
+    values = (
+        row.get("headline"),
+        row.get("about"),
+        row.get("current_role_description"),
+        row.get("about_snippet"),
+    )
+    return sum(bool(str(v or "").strip()) for v in values) + bool(row.get("recent_activity")) + bool(row.get("experience"))
+
+
+def ensure_campaign_browser() -> bool | None:
+    """Start the configured browser even when visible mode is explicitly false."""
+    mode = core_infer.browser_headless_preference()
+    if mode is not None:
+        if not core_infer.oc_browser_start(headless=mode):
+            raise RuntimeError("could not start the configured LinkedIn browser")
+        print(f"[campaign] browser mode requested: {'headless' if mode else 'visible'}")
+    return mode
+
+
+def load_merged_config(skill_dir: Path, brief_id: str | None = None) -> dict[str, Any]:
+    """Load this channel's campaign + selected persona configuration."""
+    return core_load_merged_config(
+        skill_dir,
+        brief_id,
+        persona_id=PERSONA_ID,
+        channel="linkedin",
+    )
+
+
+def configure_brief(
+    brief_id: str | None,
+    *,
+    persona_id: str | None = None,
+    cmd: str = "",
+) -> SkillPaths:
+    global _PATHS, BRIEF_ID, PERSONA_ID, DATA_DIR, PROMPTS_DIR, SKIP_HISTORY_PATH, SENT_HISTORY_PATH
     _PATHS = resolve_skill_paths(SKILL_DIR, brief_id, channel="linkedin")
     BRIEF_ID = _PATHS.brief_id
+    PERSONA_ID = persona_id
     DATA_DIR = _PATHS.data_dir
     SKIP_HISTORY_PATH = DATA_DIR / "skip_history.jsonl"
     SENT_HISTORY_PATH = DATA_DIR / "sent_history.jsonl"
     try:
         cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
-        PROMPTS_DIR = core_prompt.resolve_prompts_dir(SKILL_DIR, cfg)
+        PERSONA_ID = cfg.get("_persona_id")
+        PROMPTS_DIR = core_prompt.resolve_prompts_dir(SKILL_DIR, cfg, channel="linkedin")
     except (FileNotFoundError, BriefError):
         PROMPTS_DIR = SKILL_DIR / "prompts"
     if cmd in ("campaign", "fetch-leads", "fetch-from-csv", "send", "draft", "enrich"):
-        print(f"[{cmd}] brief={BRIEF_ID} · skill=linkedin-outreach")
+        print(f"[{cmd}] brief={BRIEF_ID} · persona={PERSONA_ID or 'legacy-inline'} · channel=linkedin")
     return _PATHS
 
 
@@ -468,6 +593,196 @@ def parse_profile(snapshot: str) -> dict[str, Any]:
                 out["experience"].append(hm.group(1).strip())
         break
     out["experience"] = out["experience"][:3]
+    fallback = _parse_multilingual_public_profile(snapshot)
+    used_fallback = False
+    for key in ("headline", "about", "current_role_description"):
+        if not out.get(key) and fallback.get(key):
+            out[key] = fallback[key]
+            used_fallback = True
+    for key in ("recent_activity", "experience"):
+        if not out.get(key) and fallback.get(key):
+            out[key] = fallback[key]
+            used_fallback = True
+    out["_profile_parser"] = (
+        "snapshot_multilingual_fallback" if used_fallback else "sales_nav_snapshot"
+    )
+    return out
+
+
+_PROFILE_SECTION_LABELS = {
+    "about": {"about", "自己紹介", "概要"},
+    "current_role": {"current role", "現在の職務", "現職"},
+    "activity": {
+        "activity",
+        "recent activity",
+        "recent activity on linkedin",
+        "アクティビティ",
+        "最近のアクティビティ",
+    },
+    "featured": {"featured", "おすすめ"},
+    "experience": {"experience", "職歴", "経歴"},
+}
+
+
+def _snapshot_heading(line: str) -> tuple[str, int] | None:
+    match = re.search(r'heading "([^"]+)" \[level=(\d+)\]', line)
+    if not match:
+        return None
+    return match.group(1).strip(), int(match.group(2))
+
+
+def _snapshot_text_value(line: str) -> str | None:
+    """Extract visible inline text from an OpenClaw accessibility snapshot."""
+    patterns = (
+        r"^\s*-\s*text:\s*(.+?)\s*$",
+        r"^\s*-\s*(?:paragraph|generic)\s+(?:\[ref=\w+\])?:\s*(.+?)\s*$",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, line)
+        if not match:
+            continue
+        value = match.group(1).strip()
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            value = value[1:-1]
+        return value.strip()
+    return None
+
+
+def _find_section(lines: list[str], labels: set[str]) -> tuple[int, int] | None:
+    normalized = {label.casefold() for label in labels}
+    for index, line in enumerate(lines):
+        heading = _snapshot_heading(line)
+        if heading and heading[0].casefold() in normalized:
+            return index, heading[1]
+    return None
+
+
+def _section_visible_text(
+    lines: list[str],
+    labels: set[str],
+    *,
+    max_chars: int,
+) -> str | None:
+    found = _find_section(lines, labels)
+    if not found:
+        return None
+    start, section_level = found
+    chunks: list[str] = []
+    for line in lines[start + 1 :]:
+        heading = _snapshot_heading(line)
+        if heading and heading[1] <= section_level:
+            break
+        value = _snapshot_text_value(line)
+        if not value or len(value) < 12:
+            continue
+        if set(value) <= {"-", "–", "—", "_", " "}:
+            continue
+        chunks.append(value)
+        if sum(len(chunk) for chunk in chunks) >= max_chars:
+            break
+    if not chunks:
+        return None
+    return " ".join(chunks)[:max_chars].strip()
+
+
+def _parse_multilingual_public_profile(snapshot: str) -> dict[str, Any]:
+    """Fallback for localized regular LinkedIn profiles (not Sales Navigator).
+
+    Public profiles use level-2 headings and localized section labels. The old
+    parser required English level-1 Sales Navigator headings, turning a fully
+    populated Japanese-UI snapshot into zero enrichment signals.
+    """
+    lines = snapshot.splitlines()
+    out: dict[str, Any] = {
+        "headline": None,
+        "about": None,
+        "current_role_description": None,
+        "recent_activity": [],
+        "experience": [],
+    }
+    main_index = next(
+        (i for i, line in enumerate(lines) if re.search(r"^\s*-\s*main(?:\s|\[)", line)),
+        0,
+    )
+    excluded_headings = {
+        label.casefold()
+        for labels in _PROFILE_SECTION_LABELS.values()
+        for label in labels
+    }
+    excluded_headings.update({"notifications", "お知らせ", "通知"})
+
+    for i in range(main_index, len(lines)):
+        heading = _snapshot_heading(lines[i])
+        if not heading or heading[1] not in {1, 2}:
+            continue
+        name = heading[0]
+        if name.casefold() in excluded_headings or len(name) > 120:
+            continue
+        for line in lines[i + 1 : min(i + 28, len(lines))]:
+            if _snapshot_heading(line):
+                break
+            value = _snapshot_text_value(line)
+            if not value:
+                continue
+            low = value.casefold()
+            if (
+                len(value) >= 18
+                and value != name
+                and not value.startswith("·")
+                and "connection" not in low
+                and "つながり" not in value
+                and "フォロワー" not in value
+            ):
+                out["headline"] = value
+                break
+        if out["headline"]:
+            break
+
+    out["about"] = _section_visible_text(
+        lines, _PROFILE_SECTION_LABELS["about"], max_chars=1600
+    )
+    out["current_role_description"] = _section_visible_text(
+        lines, _PROFILE_SECTION_LABELS["current_role"], max_chars=800
+    )
+
+    activity = _section_visible_text(
+        lines, _PROFILE_SECTION_LABELS["activity"], max_chars=900
+    )
+    if not activity:
+        activity = _section_visible_text(
+            lines, _PROFILE_SECTION_LABELS["featured"], max_chars=900
+        )
+    if activity and any(
+        marker in activity.casefold()
+        for marker in (
+            "has no recent posts",
+            "hasn't posted",
+            "hasn’t posted",
+            "no recent activity",
+            "最近の投稿はありません",
+            "まだ投稿がありません",
+            "投稿はまだありません",
+        )
+    ):
+        activity = None
+    if activity:
+        out["recent_activity"] = [{"type": "profile activity", "time": None, "text": activity}]
+
+    found = _find_section(lines, _PROFILE_SECTION_LABELS["experience"])
+    if found:
+        start, section_level = found
+        roles: list[str] = []
+        for line in lines[start + 1 :]:
+            heading = _snapshot_heading(line)
+            if not heading:
+                continue
+            if heading[1] <= section_level:
+                break
+            if heading[0] not in roles:
+                roles.append(heading[0])
+            if len(roles) == 3:
+                break
+        out["experience"] = roles
     return out
 
 
@@ -656,17 +971,20 @@ def stage_fetch_leads(
 # Stage: fetch-from-csv
 # ============================================================================
 
-def stage_fetch_from_csv(csv_path: Path, out_path: Path,
-                          ignore_skip_history: bool = False) -> None:
+def stage_fetch_from_csv(
+    csv_path: Path,
+    out_path: Path,
+    ignore_skip_history: bool = False,
+    limit: int | None = None,
+) -> None:
     """
     Read leads from a CSV file. Supports two URL formats:
       - Sales Nav:  https://www.linkedin.com/sales/lead/<slug>?...
       - Public:     https://www.linkedin.com/in/<slug>/
 
-    For Sales Nav URLs, enrich works as-is. For public URLs, we navigate
-    to the Sales Nav search-by-name URL to redirect into Sales Nav, then
-    enrich. (LinkedIn auto-resolves /in/<slug> to a Sales Nav lead page
-    when you're signed in to Sales Nav.)
+    Public profile URLs stay public. Fabricating a
+    ``/sales/people/<public-slug>,NAME_SEARCH`` URL is not a reliable
+    resolution mechanism and can return an empty page.
 
     Required CSV column: linkedin_url (or profile_url, or url)
     Optional columns:    name, title, company, location, note
@@ -694,10 +1012,7 @@ def stage_fetch_from_csv(csv_path: Path, out_path: Path,
                 source = "csv_sales_nav"
             elif "/in/" in url:
                 slug = "in/" + url.split("/in/")[1].split("/")[0].split("?")[0]
-                # Send Sales Nav users into the Sales Nav redirect path so
-                # parse_profile (which expects Sales Nav DOM) works.
-                public_slug = url.split("/in/")[1].split("/")[0].split("?")[0]
-                profile_url = f"https://www.linkedin.com/sales/people/{public_slug},NAME_SEARCH"
+                profile_url = url.split("?")[0].rstrip("/") + "/"
                 source = "csv_public"
             else:
                 slug = url
@@ -716,10 +1031,14 @@ def stage_fetch_from_csv(csv_path: Path, out_path: Path,
                 "location": (row.get("location") or "").strip() or None,
                 "tenure": None,
                 "about_snippet": (row.get("note") or "").strip() or None,
+                "evidence_url": (row.get("evidence_url") or "").strip() or None,
                 "profile_url": profile_url,
                 "_source": source,
                 "_fetched_at": datetime.utcnow().isoformat() + "Z",
             })
+
+    if limit is not None:
+        leads = leads[: max(0, limit)]
 
     with out_path.open("w") as f:
         for lead in leads:
@@ -763,7 +1082,8 @@ _LOOKUP_FIRST_LEAD_JS = r"""
 
 
 def stage_lookup_urls(csv_path: Path, output_path: Path | None,
-                       limit: int | None, overwrite: bool, dry_run: bool) -> None:
+                       limit: int | None, overwrite: bool, dry_run: bool,
+                       require_sales_nav: bool = False) -> None:
     """
     For each CSV row with name + company but no linkedin_url, search
     Sales Nav by '"<name>" "<company>"' keywords and write the first lead's
@@ -775,6 +1095,7 @@ def stage_lookup_urls(csv_path: Path, output_path: Path | None,
       limit: process at most N rows (None = all)
       overwrite: if True, also re-resolve rows that already have linkedin_url
       dry_run: show what would be searched without actually navigating
+      require_sales_nav: treat public ``/in/`` URLs as unresolved
     """
     import csv as csvlib
 
@@ -817,7 +1138,10 @@ def stage_lookup_urls(csv_path: Path, output_path: Path | None,
         existing_url = (r.get("linkedin_url") or "").strip()
         if not name or not company:
             continue
-        if existing_url and not overwrite:
+        existing_is_ready = bool(existing_url) and (
+            not require_sales_nav or is_sales_nav_lead_url(existing_url)
+        )
+        if existing_is_ready and not overwrite:
             continue
         candidates.append(r)
 
@@ -825,7 +1149,7 @@ def stage_lookup_urls(csv_path: Path, output_path: Path | None,
         candidates = candidates[:limit]
 
     if not candidates:
-        print("[lookup-urls] no rows need URL lookup (use --overwrite to re-resolve filled rows)")
+        print("[lookup-urls] no rows need URL lookup")
         return
 
     print(f"[lookup-urls] {len(candidates)} executive(s) to look up"
@@ -852,7 +1176,11 @@ def stage_lookup_urls(csv_path: Path, output_path: Path | None,
         _scroll_page(steps=3)
 
         result = _evaluate(_LOOKUP_FIRST_LEAD_JS)
-        if not isinstance(result, dict) or not result.get("url"):
+        if (
+            not isinstance(result, dict)
+            or not result.get("url")
+            or not names_match(name, str(result.get("name") or ""))
+        ):
             # Retry once with name only, in case the company filter is too narrow
             fallback_query = f'"{name}"'
             print(f"  [lookup-urls] not found with name+company; retrying with name only")
@@ -862,7 +1190,11 @@ def stage_lookup_urls(csv_path: Path, output_path: Path | None,
             _scroll_page(steps=3)
             result = _evaluate(_LOOKUP_FIRST_LEAD_JS)
 
-        if isinstance(result, dict) and result.get("url"):
+        if (
+            isinstance(result, dict)
+            and result.get("url")
+            and names_match(name, str(result.get("name") or ""))
+        ):
             r["linkedin_url"] = result["url"]
             found_name = result.get("name", "?")
             found_company = result.get("company") or "?"
@@ -922,16 +1254,16 @@ def stage_campaign(
     clean: bool,
     skip_lookup: bool,
     skip_send: bool,
+    auto_send: bool = False,
+    message_type: str = TOUCHPOINT_AUTO,
     heartbeat: str | None = None,
 ) -> None:
     """Run the canonical outreach pipeline end-to-end."""
     from _outreach_core import events as ev
     from _outreach_core.active_run import ActiveRunError, campaign_run_lock
     from _outreach_core.channel_state import touch_last_used
-    from _outreach_core.infer import browser_headless_preference, oc_browser_start
 
-    if browser_headless_preference():
-        oc_browser_start(headless=True)
+    ensure_campaign_browser()
 
     slack_ch, slack_ts = _slack_env()
     run_id = ev.configure(skill="linkedin-outreach", data_dir=DATA_DIR)
@@ -953,84 +1285,195 @@ def stage_campaign(
 
     bar = "=" * 70
 
-    with lock_ctx:
+    campaign_hb = HeartbeatSession(
+        SKILL_DIR,
+        "campaign",
+        limit,
+        heartbeat=heartbeat,
+        data_dir=DATA_DIR,
+        brief_id=BRIEF_ID,
+        slack_thread_ts=slack_ts,
+        announce_start=False,
+    )
+
+    with lock_ctx, campaign_hb:
         try:
             cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
         except FileNotFoundError as e:
             print(f"[campaign] {e}", file=sys.stderr)
             return
 
-        if clean:
-            for f in ("leads.jsonl", "enriched.jsonl", "drafts.jsonl"):
-                (DATA_DIR / f).unlink(missing_ok=True)
-            print(f"[campaign] cleared previous run state")
+        touchpoint = resolve_touchpoint(cfg, message_type)
+        cfg = dict(cfg)
+        cfg["draft"] = {
+            **(cfg.get("draft") or {}),
+            "touchpoint": touchpoint,
+        }
+        cfg["model"] = {
+            **(cfg.get("model") or {}),
+            "max_chars": touchpoint_char_limit(cfg, touchpoint),
+            "max_chars_extended": touchpoint_char_limit(cfg, touchpoint),
+        }
+        print(f"[campaign] outbound touchpoint={touchpoint}")
 
-        # --- Phase 1: Pull ---
-        print(f"\n{bar}\n[1/6] PULL — gather leads\n{bar}")
-        if csv_input:
-            if not skip_lookup:
-                print(f"\n[campaign] (1a) lookup-urls — auto-fill missing linkedin_url from name+company")
-                stage_lookup_urls(
-                    csv_input, output_path=None, limit=limit, overwrite=False, dry_run=False
+        from _outreach_core.campaign import (
+            CampaignContext,
+            CampaignRunner,
+            FunctionChannelAdapter,
+            PhaseResult,
+        )
+
+        if clean:
+            for f in ("leads.jsonl", "enriched.jsonl", "drafts.jsonl", "sample_profile.txt"):
+                (DATA_DIR / f).unlink(missing_ok=True)
+            import shutil
+
+            shutil.rmtree(DATA_DIR / "profile_snapshots", ignore_errors=True)
+            print("[campaign] cleared previous run state")
+
+        context = CampaignContext(
+            brief_id=BRIEF_ID,
+            persona_id=PERSONA_ID,
+            channel="linkedin",
+            skill="linkedin-outreach",
+            data_dir=DATA_DIR,
+            slack_channel_id=slack_ch,
+            slack_thread_ts=slack_ts,
+            run_id=run_id,
+        )
+        phase_state: dict[str, Any] = {}
+
+        def do_list(_ctx: CampaignContext) -> PhaseResult:
+            print(f"\n{bar}\n[1/4] LIST — gather LinkedIn leads\n{bar}")
+            if csv_input:
+                if not skip_lookup and touchpoint == TOUCHPOINT_INMAIL:
+                    stage_lookup_urls(
+                        csv_input, None, limit, False, False, require_sales_nav=True
+                    )
+                stage_fetch_from_csv(
+                    csv_input,
+                    DATA_DIR / "leads.jsonl",
+                    ignore_skip_history=clean,
+                    limit=limit,
                 )
-            print(f"\n[campaign] (1b) fetch-from-csv")
-            stage_fetch_from_csv(csv_input, DATA_DIR / "leads.jsonl", ignore_skip_history=False)
-        elif search_url:
-            print(f"\n[campaign] (1) fetch-leads from Sales Nav saved search")
-            stage_fetch_leads(
-                search_url,
-                limit,
+            elif search_url:
+                stage_fetch_leads(
+                    search_url,
+                    limit,
+                    DATA_DIR / "leads.jsonl",
+                    ignore_skip_history=clean,
+                    heartbeat="off",
+                    config=cfg,
+                )
+            else:
+                return PhaseResult("list", status="failed", detail={"reason": "no input"})
+
+            leads = [json.loads(line) for line in (DATA_DIR / "leads.jsonl").open() if line.strip()]
+            invalid = [
+                row for row in leads
+                if touchpoint == TOUCHPOINT_INMAIL
+                and not is_sales_nav_lead_url(str(row.get("profile_url") or ""))
+            ]
+            if invalid:
+                return PhaseResult(
+                    "list",
+                    total=len(leads),
+                    ready=len(leads) - len(invalid),
+                    skipped=len(invalid),
+                    status="failed",
+                    detail={"reason": "unresolved Sales Nav URLs"},
+                )
+            return PhaseResult("list", total=len(leads), ready=len(leads), status="ok" if leads else "failed")
+
+        def do_enrich(_ctx: CampaignContext) -> PhaseResult:
+            print(f"\n{bar}\n[2/4] ENRICH — profile evidence\n{bar}")
+            stage_enrich(
                 DATA_DIR / "leads.jsonl",
-                ignore_skip_history=False,
-                heartbeat=heartbeat,
+                DATA_DIR / "enriched.jsonl",
+                heartbeat="off",
                 config=cfg,
             )
-        else:
-            print("[campaign] need --input <csv> or --search-url <url>", file=sys.stderr)
-            return
+            rows = [json.loads(line) for line in (DATA_DIR / "enriched.jsonl").open() if line.strip()]
+            ready = sum(1 for row in rows if row.get("_enrich_status") == "ready")
+            errors: dict[str, int] = {}
+            for row in rows:
+                if row.get("_enrich_status") == "ready":
+                    continue
+                reason = str(row.get("_enrich_error") or "unknown")
+                errors[reason] = errors.get(reason, 0) + 1
+            if errors:
+                print(f"[enrich] non-ready breakdown: {errors}")
+            return PhaseResult(
+                "enrich",
+                total=len(rows),
+                ready=ready,
+                skipped=len(rows) - ready,
+                status="ok" if ready else "failed",
+                detail={"non_ready_reasons": errors},
+            )
 
-        leads_n = sum(1 for line in (DATA_DIR / "leads.jsonl").open() if line.strip())
-        if leads_n == 0:
-            print(f"\n[campaign] no leads after pull — aborting")
-            return
-        print(f"\n[campaign] → {leads_n} leads pulled")
+        def do_draft(_ctx: CampaignContext) -> PhaseResult:
+            print(f"\n{bar}\n[3/4] DRAFT — {touchpoint}\n{bar}")
+            stage_draft(
+                DATA_DIR / "enriched.jsonl",
+                DATA_DIR / "drafts.jsonl",
+                cfg,
+                heartbeat="off",
+            )
+            drafts = [json.loads(line) for line in (DATA_DIR / "drafts.jsonl").open() if line.strip()]
+            sendable = [d for d in drafts if (d.get("draft") or {}).get("subject") != "SKIP"]
+            phase_state["drafts"] = drafts
+            phase_state["sendable"] = sendable
+            return PhaseResult(
+                "draft",
+                total=len(drafts),
+                ready=len(sendable),
+                skipped=len(drafts) - len(sendable),
+            )
 
-        print(f"\n{bar}\n[2/6] ENRICH — profile detail + recent activity\n{bar}")
-        stage_enrich(
-            DATA_DIR / "leads.jsonl",
-            DATA_DIR / "enriched.jsonl",
-            heartbeat=heartbeat,
-            config=cfg,
-        )
-
-        enriched_n = sum(1 for line in (DATA_DIR / "enriched.jsonl").open() if line.strip())
-        if enriched_n == 0:
-            print(f"\n[campaign] no enriched profiles — aborting")
-            return
-        print(f"\n[campaign] → {enriched_n} profiles enriched")
-
-        print(f"\n{bar}\n[3/6] PERSONALIZE — Sonnet draft (cached system prompt)\n{bar}")
-        stage_draft(DATA_DIR / "enriched.jsonl", DATA_DIR / "drafts.jsonl", cfg, heartbeat=heartbeat)
-
-        drafts = [json.loads(l) for l in (DATA_DIR / "drafts.jsonl").open() if l.strip()]
-        sendable = [d for d in drafts if (d.get("draft") or {}).get("subject") != "SKIP"]
-        skipped = len(drafts) - len(sendable)
-        print(
-            f"\n[campaign] → {len(sendable)} sendable, {skipped} SKIP "
-            + f"(send rate {len(sendable) * 100 // len(drafts) if drafts else 0}%)"
-        )
-
-        if skip_send:
-            print(f"\n{bar}\n[4/6] PREVIEW — display only (send skipped)\n{bar}")
+        def do_send(_ctx: CampaignContext) -> PhaseResult:
+            drafts = phase_state.get("drafts") or []
+            sendable = phase_state.get("sendable") or []
+            print(f"\n{bar}\n[4/4] SEND — verify and log\n{bar}")
             stage_preview(DATA_DIR / "drafts.jsonl", interactive_send=False)
-            print(f"\n[campaign] stopped at preview. To send later: python run.py send --ids ...")
-            return
+            ids = set(range(1, len(sendable) + 1))
+            sent_result = stage_send(
+                DATA_DIR / "drafts.jsonl",
+                ids,
+                mode="auto",
+                heartbeat="off",
+                config=cfg,
+                message_type=touchpoint,
+            )
+            sent_n = int((sent_result or {}).get("sent", 0))
+            pending_n = int((sent_result or {}).get("pending", 0))
+            skipped = len(drafts) - len(sendable)
+            return PhaseResult(
+                "send",
+                total=len(drafts),
+                ready=len(sendable),
+                sent=sent_n,
+                pending=pending_n,
+                skipped=skipped,
+                status="ok" if sent_n == len(sendable) and not pending_n else "failed",
+            )
 
-        print(f"\n{bar}\n[4-6/6] APPROVE → SEND → LOG (interactive)\n{bar}")
-        stage_preview(DATA_DIR / "drafts.jsonl", interactive_send=True)
-
+        adapter = FunctionChannelAdapter("linkedin", do_list, do_enrich, do_draft, do_send)
+        result = CampaignRunner(context).run(
+            adapter,
+            stop_after="send" if auto_send else "draft",
+            replace_context=clean,
+        )
+        if result.status == "failed":
+            failed_phase = result.phase(result.stopped_after)
+            detail = (failed_phase.detail if failed_phase else {}) or {}
+            suffix = f": {json.dumps(detail, ensure_ascii=False)}" if detail else ""
+            raise RuntimeError(f"campaign failed in {result.stopped_after}{suffix}")
+        if not auto_send:
+            print(f"\n{bar}\nPREVIEW — no send authorization in this run\n{bar}")
+            stage_preview(DATA_DIR / "drafts.jsonl", interactive_send=False)
         if slack_ch:
-            touch_last_used(slack_ch)
+            touch_last_used(slack_ch, slack_ts)
 
 
 # ============================================================================
@@ -1052,6 +1495,8 @@ def stage_enrich(
     from _outreach_core.cookie_dismiss import apply_cookie_dismiss
 
     enriched: list[dict[str, Any]] = []
+    snapshots_dir = DATA_DIR / "profile_snapshots"
+    snapshots_dir.mkdir(parents=True, exist_ok=True)
     for i, lead in enumerate(leads, 1):
         label = lead.get("name") or lead["id"]
         print(f"[enrich] ({i}/{len(leads)}) {label}")
@@ -1059,21 +1504,51 @@ def stage_enrich(
         time.sleep(RATE_LIMIT_SECONDS)
         apply_cookie_dismiss(_evaluate, cfg, stage="enrich", target_id=lead.get("id"))
         snap = oc_browser("snapshot")
-        if snap is None:
-            print(f"[enrich] failed snapshot for {lead['id']}, skipping")
-            hb.tick(i, f"enrich skip (snapshot failed): {label}")
+        snapshot_text = snap or ""
+        safe_id = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(lead.get("id") or i)).strip("_")
+        (snapshots_dir / f"{i:03d}-{safe_id or i}.txt").write_text(
+            snapshot_text,
+            encoding="utf-8",
+        )
+        problem = snapshot_problem(snap)
+        if problem:
+            print(f"[enrich] {label}: {problem}")
+            enriched.append({
+                **lead,
+                "headline": None,
+                "about": None,
+                "current_role_description": None,
+                "recent_activity": [],
+                "experience": [],
+                "_enrich_status": "failed",
+                "_enrich_error": problem,
+                "_enriched_at": datetime.utcnow().isoformat() + "Z",
+            })
+            hb.tick(i, f"enrich failed ({problem}): {label}")
             continue
         profile = parse_profile(snap)
-        enriched.append({**lead, **profile, "_enriched_at": datetime.utcnow().isoformat() + "Z"})
-        hb.tick(i, f"enrich 完了: {label}")
+        row = {**lead, **profile, "_enriched_at": datetime.utcnow().isoformat() + "Z"}
+        row["_snapshot_chars"] = len(snapshot_text)
+        signals = enrichment_signal_count(row)
+        row["_enrich_signal_count"] = signals
+        row["_enrich_status"] = "ready" if signals > 0 else "insufficient"
+        if signals == 0:
+            row["_enrich_error"] = "no_draftable_profile_signals"
+            print(f"[enrich] {label}: no draftable profile signals")
+            hb.tick(i, f"enrich insufficient: {label}")
+        else:
+            hb.tick(i, f"enrich ready ({signals} signals): {label}")
+        enriched.append(row)
+        sample = DATA_DIR / "sample_profile.txt"
         if i == 1:
-            (DATA_DIR / "sample_profile.txt").write_text(snap)
+            sample.write_text(snapshot_text, encoding="utf-8")
 
     with out_path.open("w") as f:
         for lead in enriched:
             f.write(json.dumps(lead, ensure_ascii=False) + "\n")
     print(f"[enrich] wrote {len(enriched)} enriched leads -> {out_path}")
-    hb.end(f"enrich 完了: {len(enriched)}/{len(leads)} 件")
+    ready = sum(1 for row in enriched if row.get("_enrich_status") == "ready")
+    hb.end(f"enrich 完了: ready={ready}/{len(leads)} 件")
 
 
 # ============================================================================
@@ -1085,10 +1560,21 @@ def build_system_block(config: dict[str, Any]) -> str:
     return core_prompt.build_system_block(config, PROMPTS_DIR)
 
 
-def build_user_block(lead: dict[str, Any], max_chars: int) -> str:
+def build_user_block(
+    lead: dict[str, Any],
+    max_chars: int,
+    touchpoint: str = TOUCHPOINT_INMAIL,
+) -> str:
+    action = (
+        "a LinkedIn connection-request note (the recipient has NOT connected yet; "
+        "do not say 'thanks for connecting'; no subject is transmitted)"
+        if touchpoint == TOUCHPOINT_CONNECTION
+        else "a Sales Navigator InMail (subject and body are both transmitted)"
+    )
     return (
         "<user>\n"
-        "Generate a personalized InMail for the following LinkedIn lead.\n"
+        f"Generate {action}.\n"
+        f"Touchpoint: {touchpoint}.\n"
         f"Output strictly as JSON: {{\"subject\": \"...\", \"body\": \"...\"}}\n"
         f"`body` must be ≤ {max_chars} characters.\n"
         "If profile data is too thin to ground a real personal observation, "
@@ -1108,7 +1594,16 @@ def stage_draft(input_path: Path, out_path: Path, config: dict[str, Any], heartb
     leads_n = sum(1 for line in input_path.open() if line.strip())
     hb_mode = resolve_heartbeat_mode(heartbeat, task="draft")
     hb = HeartbeatSession(SKILL_DIR, "draft", leads_n, heartbeat=hb_mode, data_dir=DATA_DIR)
-    hb.start(f"Sonnet で {leads_n} 件ドラフト生成")
+    touchpoint = resolve_touchpoint(config, str((config.get("draft") or {}).get("touchpoint") or TOUCHPOINT_AUTO))
+    strict_limit = touchpoint_char_limit(config, touchpoint)
+    config = dict(config)
+    config["draft"] = {**(config.get("draft") or {}), "touchpoint": touchpoint}
+    config["model"] = {
+        **(config.get("model") or {}),
+        "max_chars": strict_limit,
+        "max_chars_extended": strict_limit,
+    }
+    hb.start(f"{touchpoint} のドラフトを {leads_n} 件生成")
 
     def _on_progress(current: int, total: int, message: str) -> None:
         hb.tick(current, message)
@@ -1122,7 +1617,9 @@ def stage_draft(input_path: Path, out_path: Path, config: dict[str, Any], heartb
         out_path,
         config,
         prompts_dir=PROMPTS_DIR,
-        build_user_block=build_user_block,
+        build_user_block=lambda lead, max_chars: build_user_block(
+            lead, max_chars, touchpoint=touchpoint
+        ),
         oc_infer_fn=oc_infer,
         append_skip_fn=append_skip_history,
         default_model=DEFAULT_MODEL,
@@ -1342,6 +1839,93 @@ def _verify_sent_via_js() -> dict[str, Any] | None:
     return res if isinstance(res, dict) else None
 
 
+_FILL_CONNECTION_NOTE_JS = r"""
+() => {
+  const setReactValue = (el, value) => {
+    const proto = el.tagName === 'TEXTAREA'
+      ? window.HTMLTextAreaElement.prototype
+      : window.HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+    setter.call(el, value);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+  const dialog = document.querySelector('[role="dialog"]');
+  const note = dialog && dialog.querySelector(
+    'textarea[name="message"], textarea[aria-label*="note" i], '
+    + 'textarea[id*="custom-message" i], textarea'
+  );
+  const value = __BODY__;
+  if (note) setReactValue(note, value);
+  return {
+    dialogPresent: !!dialog,
+    noteFound: !!note,
+    maxLength: note ? note.maxLength : null,
+    valueLength: note ? note.value.length : 0
+  };
+}
+"""
+
+_CLICK_CONNECTION_SEND_JS = r"""
+() => {
+  const dialog = document.querySelector('[role="dialog"]');
+  if (!dialog) return {clicked: false, reason: 'connection dialog not open'};
+  const labels = /^(Send|Send invitation|Send request|送信|招待を送信)$/i;
+  const buttons = Array.from(dialog.querySelectorAll('button'));
+  const btn = buttons.find(b => {
+    const label = (b.textContent || b.getAttribute('aria-label') || '').trim();
+    return labels.test(label) && !b.disabled && b.offsetParent !== null;
+  });
+  if (!btn) return {
+    clicked: false,
+    reason: 'connection send button not found',
+    candidates: buttons.slice(0, 12).map(b => ({
+      text: (b.textContent || '').trim().slice(0, 40),
+      aria: b.getAttribute('aria-label'),
+      disabled: b.disabled
+    }))
+  };
+  const label = (btn.textContent || btn.getAttribute('aria-label') || '').trim();
+  btn.click();
+  return {clicked: true, label};
+}
+"""
+
+_VERIFY_CONNECTION_SENT_JS = r"""
+() => {
+  const text = (document.body && document.body.innerText) ? document.body.innerText : '';
+  const url = location.href || '';
+  const success = [
+    /invitation sent/i, /connection request sent/i, /request sent/i,
+    /pending/i, /招待を送信しました/, /承認待ち/
+  ];
+  for (const re of success) {
+    if (re.test(text)) return {sent: true, reason: 'connection request success/pending visible', url, text: text.slice(0, 800)};
+  }
+  const dialog = document.querySelector('[role="dialog"]');
+  const error = document.querySelector('[role="alert"], .artdeco-inline-feedback--error');
+  if (error) return {sent: false, reason: 'validation/error visible: ' + (error.textContent || '').trim().slice(0, 120), url, text: text.slice(0, 800)};
+  return {sent: false, reason: dialog ? 'connection dialog still open' : 'dialog closed without a success signal', url, text: text.slice(0, 800)};
+}
+"""
+
+
+def _fill_connection_note_via_js(body: str) -> dict[str, Any] | None:
+    js = _FILL_CONNECTION_NOTE_JS.replace("__BODY__", json.dumps(body))
+    res = _evaluate(js)
+    return res if isinstance(res, dict) else None
+
+
+def _click_connection_send_via_js() -> dict[str, Any] | None:
+    res = _evaluate(_CLICK_CONNECTION_SEND_JS)
+    return res if isinstance(res, dict) else None
+
+
+def _verify_connection_sent_via_js() -> dict[str, Any] | None:
+    res = _evaluate(_VERIFY_CONNECTION_SENT_JS)
+    return res if isinstance(res, dict) else None
+
+
 def _find_send_button_ref(snapshot: str) -> str | None:
     """
     Find the Send button ref inside an open InMail compose modal.
@@ -1396,7 +1980,8 @@ def stage_send(
     mode: str = "interactive",
     heartbeat: str | None = None,
     config: dict[str, Any] | None = None,
-) -> None:
+    message_type: str = TOUCHPOINT_AUTO,
+) -> dict[str, int]:
     """
     Drive the Sales Nav InMail compose UI for the given draft IDs.
 
@@ -1423,12 +2008,12 @@ def stage_send(
     sendable = [d for d in drafts if d.get("draft", {}).get("subject") != "SKIP"]
     if not sendable:
         print("[send] no sendable drafts in input; nothing to do")
-        return
+        return {"requested": 0, "sent": 0, "pending": 0}
 
     targets = [d for i, d in enumerate(sendable, 1) if i in ids]
     if not targets:
         print(f"[send] none of ids {sorted(ids)} match sendable drafts (max={len(sendable)})")
-        return
+        return {"requested": 0, "sent": 0, "pending": 0}
 
     # Guard against duplicate sends — refuse to re-send anyone already in sent_history.
     sent_ids = load_sent_set()
@@ -1440,20 +2025,22 @@ def stage_send(
         targets = [d for d in targets if d["id"] not in sent_ids]
         if not targets:
             print(f"[send] nothing left to send")
-            return
+            return {"requested": 0, "sent": 0, "pending": 0}
+
+    cfg = config if config is not None else _load_runtime_config()
+    touchpoint = resolve_touchpoint(cfg, message_type)
 
     mode_label = {
         "interactive": "interactive (will prompt for confirmation in terminal)",
         "auto": "AUTO (will click Send without prompting)",
         "fill-only": "fill-only (no Send click, you do it)",
     }.get(mode, mode)
-    print(f"[send] preparing to fill+act on {len(targets)} InMail compose modals · mode={mode_label}")
+    print(f"[send] preparing {len(targets)} {touchpoint} action(s) · mode={mode_label}")
 
     sent: list[dict[str, Any]] = []
     filled_only: list[dict[str, Any]] = []
     hb = HeartbeatSession(SKILL_DIR, "send", len(targets), heartbeat=heartbeat, data_dir=DATA_DIR)
-    hb.start(f"send {len(targets)} InMails")
-    cfg = config if config is not None else _load_runtime_config()
+    hb.start(f"send {len(targets)} {touchpoint} action(s)")
     from _outreach_core.cookie_dismiss import apply_cookie_dismiss
     from _outreach_core.notify import post as slack_notify
 
@@ -1466,7 +2053,7 @@ def stage_send(
         profile_url = d["profile_url"]
 
         print(f"\n=== [{idx}] {name} ===")
-        print(f"  Subject ({len(subject)} ch): {subject}")
+        print(f"  Subject/label ({len(subject)} ch): {subject}")
         print(f"  Body    ({len(body)} ch)")
 
         # 1. Navigate to profile
@@ -1478,6 +2065,91 @@ def stage_send(
         profile_snap = oc_browser("snapshot")
         if not profile_snap:
             print(f"  [send] failed snapshot for {name}; skipping")
+            filled_only.append(d)
+            continue
+
+        if touchpoint == TOUCHPOINT_CONNECTION:
+            if len(body) > touchpoint_char_limit(cfg, touchpoint):
+                print(f"  [send] connection note exceeds limit; refusing ({len(body)} chars)")
+                filled_only.append(d)
+                continue
+            connect_ref = (
+                _find_button_ref_by_text(profile_snap, f"Connect with {name.split()[0]}")
+                or _find_button_ref_by_text(profile_snap, "Connect")
+                or _find_button_ref_by_text(profile_snap, "つながり")
+            )
+            if not connect_ref:
+                print("  [send] Connect button not found (already pending/connected or UI changed)")
+                filled_only.append(d)
+                continue
+            print(f"  [send] clicking Connect (ref={connect_ref})")
+            oc_browser("click", connect_ref)
+            time.sleep(2.0)
+
+            invite_snap = oc_browser("snapshot") or ""
+            add_note_ref = (
+                _find_button_ref_by_text(invite_snap, "Add a note")
+                or _find_button_ref_by_text(invite_snap, "メッセージを追加")
+            )
+            if add_note_ref:
+                oc_browser("click", add_note_ref)
+                time.sleep(1.0)
+
+            fill_res = _fill_connection_note_via_js(body)
+            if not fill_res or not fill_res.get("noteFound"):
+                print(f"  [send] connection note field not found: {fill_res}")
+                filled_only.append(d)
+                continue
+            max_length = int(fill_res.get("maxLength") or 0)
+            if max_length > 0 and len(body) > max_length:
+                print(f"  [send] connection note exceeds DOM limit {max_length}; refusing")
+                filled_only.append(d)
+                continue
+            print(f"  [send] ✓ connection note filled ({len(body)} chars)")
+
+            if mode == "fill-only":
+                filled_only.append(d)
+                print("  [send] filled; human must click Send")
+                continue
+            if mode == "interactive":
+                slack_notify(
+                    f"📋 [{name}] connection request note filled — confirm in Slack, then re-run "
+                    f"`python run.py send --ids {idx} --auto-send --message-type connection-request`",
+                    level="info",
+                )
+                filled_only.append(d)
+                continue
+
+            send_res = _click_connection_send_via_js()
+            if not send_res or not send_res.get("clicked"):
+                print(f"  [send] connection Send button not found: {send_res}")
+                filled_only.append(d)
+                continue
+            time.sleep(4.0)
+            browser_verify = _verify_connection_sent_via_js()
+            post_snap = oc_browser("snapshot") or ""
+            snap_path = DATA_DIR / f"verify_snapshot_{d.get('id', idx)}.txt"
+            if post_snap:
+                snap_path.write_text(post_snap, encoding="utf-8")
+            vresult = verify_send_completed(
+                d,
+                "linkedin",
+                snapshot=post_snap,
+                browser_verify=browser_verify,
+                data_dir=DATA_DIR,
+                snapshot_path=snap_path if post_snap else None,
+            )
+            outcome = handle_verify_result(d, vresult, DATA_DIR, channel="linkedin")
+            if outcome != "sent_ok":
+                print(f"  [send] ⚠ connection request unverified: {vresult.get('reason')}")
+                filled_only.append(d)
+                hb.tick(idx, f"{name} connection verify {vresult.get('status')}")
+                continue
+            print(f"  [send] ✅ connection request sent ({vresult.get('reason')})")
+            sent.append({**d, "_touchpoint": TOUCHPOINT_CONNECTION})
+            hb.tick(idx, f"{name} connection request sent")
+            if not is_last:
+                time.sleep(30)
             continue
 
         msg_ref = (d.get("_message_ref")
@@ -1485,6 +2157,7 @@ def stage_send(
                    or _find_button_ref_by_text(profile_snap, "Message"))
         if not msg_ref:
             print(f"  [send] could not locate Message button on profile; skipping")
+            filled_only.append(d)
             continue
         print(f"  [send] clicking Message button (ref={msg_ref})")
         oc_browser("click", msg_ref)
@@ -1600,6 +2273,7 @@ def stage_send(
         print(f"[send] If you DID send any of those manually, run:")
         ids_str = ",".join(str(sendable.index(d) + 1) for d in filled_only)
         print(f"      .venv/bin/python run.py mark-sent --ids {ids_str}")
+    return {"requested": len(targets), "sent": len(sent), "pending": len(filled_only)}
 
 
 def stage_resolve(target_id: str, fields: dict[str, str], config: dict[str, Any]) -> None:
@@ -1643,14 +2317,23 @@ def stage_mark_sent(input_path: Path, ids: set[int]) -> None:
 def _cli_heartbeat(args: argparse.Namespace, task: str) -> str | None:
     hb = getattr(args, "heartbeat", "auto")
     explicit = None if hb == "auto" else hb
-    return resolve_heartbeat_mode(explicit, task=task)
+    return resolve_heartbeat_mode(explicit, task=task, brief_id=BRIEF_ID)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(prog="linkedin-outreach", description=__doc__)
     brief_parent = argparse.ArgumentParser(add_help=False)
-    brief_parent.add_argument("--brief", default=None, help="Brief id (default: briefs/_active.txt)")
+    brief_parent.add_argument("--brief", default=argparse.SUPPRESS, help="Brief id (default: briefs/_active.txt)")
+    brief_parent.add_argument("--persona", default=argparse.SUPPRESS, help="Persona id (default: brief/thread binding)")
+    brief_parent.add_argument("--slack-channel-id", default=argparse.SUPPRESS)
+    brief_parent.add_argument("--slack-thread-ts", default=argparse.SUPPRESS)
+    brief_parent.add_argument(
+        "--heartbeat",
+        choices=["auto", "slack", "off"],
+        default=argparse.SUPPRESS,
+    )
     ap.add_argument("--brief", default=None, help="Brief id (default: briefs/_active.txt)")
+    ap.add_argument("--persona", default=None, help="Persona id (default: brief/thread binding)")
     ap.add_argument("--slack-channel-id", default=None, help="Sets DOORMAN_SLACK_CHANNEL_ID")
     ap.add_argument("--slack-thread-ts", default=None, help="Sets DOORMAN_SLACK_THREAD_TS")
     ap.add_argument(
@@ -1686,8 +2369,13 @@ def main() -> None:
     p.add_argument("--clean", action="store_true", help="Wipe leads/enriched/drafts before running")
     p.add_argument("--skip-lookup", action="store_true",
                    help="Skip the lookup-urls sub-phase (use CSV linkedin_url as-is)")
-    p.add_argument("--skip-send", action="store_true",
-                   help="Stop at preview without sending (display only)")
+    send_mode = p.add_mutually_exclusive_group()
+    send_mode.add_argument("--skip-send", action="store_true",
+                           help="Stop at preview without sending (display only)")
+    send_mode.add_argument("--auto-send", action="store_true",
+                           help="Send every sendable draft, verify, and require a complete count")
+    p.add_argument("--message-type", choices=TOUCHPOINT_CHOICES, default=TOUCHPOINT_AUTO,
+                   help="auto follows the first step in brief.sequence")
 
     p = sub.add_parser("lookup-urls", parents=[brief_parent], help="Auto-fill linkedin_url in CSV by searching Sales Nav")
     p.add_argument("--input", required=True, help="CSV with name + company columns")
@@ -1696,6 +2384,8 @@ def main() -> None:
     p.add_argument("--overwrite", action="store_true",
                    help="Re-resolve rows that already have linkedin_url")
     p.add_argument("--dry-run", action="store_true", help="Show targets without searching")
+    p.add_argument("--require-sales-nav", action="store_true",
+                   help="Resolve public profile URLs to real /sales/lead/ URLs")
 
     p = sub.add_parser("history", parents=[brief_parent], help="View / manage skip and sent history")
     p.add_argument(
@@ -1714,6 +2404,7 @@ def main() -> None:
     p.add_argument("--in", dest="input_path", default=None)
     p.add_argument("--out", default=None)
     p.add_argument("--config", default=str(SKILL_DIR / "config.yaml"))
+    p.add_argument("--message-type", choices=TOUCHPOINT_CHOICES, default=TOUCHPOINT_AUTO)
 
     p = sub.add_parser("preview", parents=[brief_parent], help="Show all drafts in terminal for review (then prompt to send)")
     p.add_argument("--in", dest="input_path", default=None)
@@ -1723,6 +2414,7 @@ def main() -> None:
     p = sub.add_parser("send", parents=[brief_parent], help="Drive Sales Nav to fill compose modal and send InMail")
     p.add_argument("--in", dest="input_path", default=None)
     p.add_argument("--ids", required=True, help="Comma-separated SENDABLE draft indices (1-based, SKIPs not counted)")
+    p.add_argument("--message-type", choices=TOUCHPOINT_CHOICES, default=TOUCHPOINT_AUTO)
     mode_group = p.add_mutually_exclusive_group()
     mode_group.add_argument("--auto-send", action="store_true",
                              help="Fill and click Send without prompting. Used by Slack agent AFTER user has confirmed.")
@@ -1742,21 +2434,31 @@ def main() -> None:
     if getattr(args, "slack_thread_ts", None):
         os.environ["DOORMAN_SLACK_THREAD_TS"] = args.slack_thread_ts
     try:
-        configure_brief(getattr(args, "brief", None), cmd=args.cmd)
+        configure_brief(
+            getattr(args, "brief", None),
+            persona_id=getattr(args, "persona", None),
+            cmd=args.cmd,
+        )
     except BriefError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(2)
 
     if args.cmd == "campaign":
-        stage_campaign(
-            csv_input=Path(args.input) if args.input else None,
-            search_url=args.search_url,
-            limit=args.limit,
-            clean=args.clean,
-            skip_lookup=args.skip_lookup,
-            skip_send=args.skip_send,
-            heartbeat=_cli_heartbeat(args, "campaign"),
-        )
+        try:
+            stage_campaign(
+                csv_input=Path(args.input) if args.input else None,
+                search_url=args.search_url,
+                limit=args.limit,
+                clean=args.clean,
+                skip_lookup=args.skip_lookup,
+                skip_send=args.skip_send,
+                auto_send=args.auto_send,
+                message_type=args.message_type,
+                heartbeat=_cli_heartbeat(args, "campaign"),
+            )
+        except RuntimeError as exc:
+            print(f"[campaign] quality/completion gate: {exc}", file=sys.stderr)
+            sys.exit(4)
     elif args.cmd == "fetch-leads":
         try:
             fetch_cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
@@ -1785,6 +2487,7 @@ def main() -> None:
             args.limit,
             args.overwrite,
             args.dry_run,
+            args.require_sales_nav,
         )
     elif args.cmd == "history":
         stage_history(args.action)
@@ -1806,6 +2509,8 @@ def main() -> None:
         except FileNotFoundError as e:
             print(f"[draft] {e}", file=sys.stderr)
             sys.exit(2)
+        cfg = dict(cfg)
+        cfg["draft"] = {**(cfg.get("draft") or {}), "touchpoint": resolve_touchpoint(cfg, args.message_type)}
         stage_draft(
             _data_path(args.input_path, "enriched.jsonl"),
             _data_path(args.out, "drafts.jsonl"),
@@ -1829,13 +2534,25 @@ def main() -> None:
             send_cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
         except FileNotFoundError:
             send_cfg = {}
-        stage_send(
+        send_result = stage_send(
             _data_path(args.input_path, "drafts.jsonl"),
             ids,
             mode=mode,
             heartbeat=_cli_heartbeat(args, "send"),
             config=send_cfg,
+            message_type=args.message_type,
         )
+        if mode == "auto" and (
+            send_result.get("sent") != send_result.get("requested")
+            or send_result.get("pending")
+        ):
+            print(
+                "[send] completion gate failed: "
+                f"requested={send_result.get('requested')} "
+                f"sent={send_result.get('sent')} pending={send_result.get('pending')}",
+                file=sys.stderr,
+            )
+            sys.exit(4)
     elif args.cmd == "resolve":
         fields: dict[str, str] = {}
         for item in args.field:

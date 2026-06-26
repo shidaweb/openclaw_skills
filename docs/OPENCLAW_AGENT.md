@@ -18,7 +18,7 @@ cd ~/.openclaw/skills
 
 `./job start` が保証すること（エージェントが無言でも届く）:
 1. 🚀 **開始**通知（起動直後に Python が同期投稿）
-2. … 心拍（run.py の HeartbeatSession が約5分毎に投稿）
+2. … 心拍（run.py の HeartbeatSession が約10分ごとに投稿）
 3. ✅/❌ **終了**通知（成功・失敗・例外いずれでも supervisor が投稿）
 
 ### 受信即 ack（必須）
@@ -35,8 +35,8 @@ cd ~/.openclaw/skills && ./healthcheck touch-command
 ```bash
 cd ~/.openclaw/skills
 ./report progress --brief torana-line-crm   # ★推奨: いまの送信進捗を1行で
-                                            #   例: send 12/30 · 送信9 · スキップ2 · 要対応1 · 経過6m · 残り目安4m · 処理中: 株式会社X
-./healthcheck ping        # heartbeat 経過秒 / active runs / needs_attention 件数
+                                            #   例: 送信 12/30 · 送信OK 9 · スキップ 2 · 要対応 1 · 経過 6分 · 残り目安 4分 · 処理中: 株式会社X
+./healthcheck ping        # 日本語1〜2行: heartbeat 経過 / 実行中run / 要対応件数
 ./healthcheck status      # 上記 + system_health JSON + events 末尾
 ./brief status --brief torana-line-crm   # 進行中 run の stage / 件数を file から再構築
 ```
@@ -44,14 +44,14 @@ cd ~/.openclaw/skills
 **「進捗」「どこまで」「あと何件」と聞かれたら最優先で `./report progress --brief <id>` を返す**
 （v22・run_progress.json を読むだけ・ターンを占有しない）。`--json` で構造化、
 ブラウザで見たいなら `./report dashboard --brief <id>` が自動更新HTMLのパスを返す。
-送信実行中は **5分毎の心拍にもこの進捗サマリ（送信/スキップ/要対応/残り目安）が
+送信実行中は **10分ごとの心拍にもこの進捗サマリ（送信/スキップ/要対応/残り目安）が
 自動で載る**ので、エージェントからの追加投稿は不要。
 
 ---
 
 ## 1. 旧: 進捗通知（detached 起動なら自動で担保）
 
-長時間の Doorman タスクでは **約5分ごとに Slack へ進捗を投稿する**（ユーザー不安の解消）。これは Python パイプラインと **エージェント自身のフォロー** の両方で担保する。
+長時間の Doorman タスクでは **約10分ごとに Slack へ進捗を投稿する**（ユーザー不安の解消）。これは Python パイプラインと **エージェント自身のフォロー** の両方で担保する。
 
 ## 1. Python 側（自動）
 
@@ -59,7 +59,7 @@ cd ~/.openclaw/skills
 |----------|------|
 | `linkedin-outreach/research.py` | `heartbeat_watch.py` をバックグラウンド起動 + 各 stage の `--heartbeat auto` |
 | `run.py enrich\|draft\|send\|campaign` | 既定 `--heartbeat auto`（`sender_brief.yaml` の `heartbeat.enabled_for: [all]`） |
-| `heartbeat_watch.py` | `current_task.jsonl` を監視して約5分毎に Slack 投稿 |
+| `heartbeat_watch.py` | `current_task.jsonl` を監視して約10分ごとに Slack 投稿 |
 
 Slack 投稿先: `sender_brief.yaml` の webhook、または `~/.openclaw/openclaw.json` の `channels.slack.botToken` + 直近 Slack セッションのチャンネル。
 
@@ -68,7 +68,7 @@ Slack 投稿先: `sender_brief.yaml` の webhook、または `~/.openclaw/opencl
 パイプラインを **バックグラウンドや複数コマンド** で回すとき:
 
 1. 開始前: `nohup .venv/bin/python heartbeat_watch.py &`（スキルディレクトリ内）
-2. **5分ごと**（またはユーザーが「進捗？」）:  
+2. **10分ごと**（またはユーザーが「進捗？」）:
    `python heartbeat_watch.py --once` と `python pipeline_status.py` → **要約を Slack に投稿**
 3. 終了時: サマリ + 次アクション（送信は別途 `send`）
 

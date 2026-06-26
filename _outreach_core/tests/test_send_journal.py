@@ -50,6 +50,26 @@ class TestShouldSkipResume(unittest.TestCase):
         ]
         self.assertEqual(sj.unverified_attempt_ids(entries), {"a"})
 
+    def test_interrupted_pre_submit_ids(self) -> None:
+        entries = [
+            {"target_id": "a", "phase": "target_started"},
+            {"target_id": "b", "phase": "target_started"},
+            {"target_id": "b", "phase": "target_finished", "outcome": "skipped"},
+            {"target_id": "c", "phase": "target_started"},
+            {"target_id": "c", "phase": "submit_attempted"},
+            {"target_id": "d", "phase": "target_started"},
+            {"target_id": "d", "phase": "verified", "outcome": "sent_ok"},
+        ]
+        self.assertEqual(sj.interrupted_pre_submit_ids(entries), {"a"})
+
+    def test_target_started_then_submit_attempted_is_unverified_not_interrupted(self) -> None:
+        entries = [
+            {"target_id": "t1", "phase": "target_started"},
+            {"target_id": "t1", "phase": "submit_attempted"},
+        ]
+        self.assertEqual(sj.interrupted_pre_submit_ids(entries), set())
+        self.assertEqual(sj.unverified_attempt_ids(entries), {"t1"})
+
 
 class TestJournalFile(unittest.TestCase):
     def test_append_and_load_roundtrip(self) -> None:

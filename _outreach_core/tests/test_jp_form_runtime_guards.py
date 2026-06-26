@@ -41,6 +41,14 @@ class TestWrongFormRuntimeGuard(unittest.TestCase):
         diag = {"warnings": ["採用専用フォームのためB2B提案には不適切"], "skipped": []}
         self.assertIsNotNone(self.run_mod._detect_wrong_form_type(diag))
 
+    def test_zero_fill_body_failure_aborts_before_verify(self) -> None:
+        diag = {"filled": [], "errors": ["body textarea fill failed"]}
+        self.assertIsNotNone(self.run_mod._detect_empty_submission_risk(diag))
+
+    def test_body_failure_with_other_fields_can_continue(self) -> None:
+        diag = {"filled": ["name=志田典道 (set_text)"], "errors": ["body textarea fill failed"]}
+        self.assertIsNone(self.run_mod._detect_empty_submission_risk(diag))
+
     def test_checkbox_script_does_not_set_true_then_toggle_false(self) -> None:
         script = self.run_mod._CHECK_BY_NAME_JS
         self.assertNotIn("cb.checked = true", script)

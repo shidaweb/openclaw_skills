@@ -101,6 +101,24 @@ def test_confirm_instruction_outranks_success_looking_keyword():
     assert obs["state"] == "confirm"
 
 
+def test_progress_done_label_with_echo_and_submit_button_is_confirm():
+    # Step indicators often include 「送信完了」 while the page is still a
+    # confirmation screen. Echoed values + a pending submit control must win.
+    obs = send_state.classify_send_state(
+        _ev(
+            text="入力画面 確認画面 送信完了 志田典道 shida@torana.co.jp 株式会社トラーナ",
+            visible_textareas=0,
+            editable_visible=0,
+            submit_controls=2,
+            final_submit_controls=1,
+            probe_text_hits=3,
+            probe_field_hits=0,
+        )
+    )
+    assert obs["state"] == "confirm"
+    assert obs["send_verdict"] == "uncertain"
+
+
 def test_confirm_with_disabled_value_echo_fields_still_actable():
     # readonly/disabled inputs are excluded from editable_visible by the JS;
     # the classifier sees editable=0 → confirm.
@@ -139,6 +157,22 @@ def test_done_page_via_thanks_url():
     assert obs["state"] == "done"
 
 
+def test_success_keyword_without_pending_submit_is_sent_evidence():
+    result = send_state.assess_submission_result(
+        _ev(
+            text="お問い合わせありがとうございました。内容を確認次第ご連絡いたします。",
+            visible_forms=1,
+            visible_textareas=0,
+            editable_visible=1,
+            submit_controls=1,
+            final_submit_controls=0,
+            probe_field_hits=0,
+        )
+    )
+    assert result["verdict"] == "sent_ok"
+    assert "success_without_pending_submit" in result["signals"]
+
+
 def test_success_keyword_with_our_values_still_in_fields_is_not_done():
     # bounced page that mentions 完了 in boilerplate but the form is still live
     obs = send_state.classify_send_state(
@@ -148,6 +182,72 @@ def test_success_keyword_with_our_values_still_in_fields_is_not_done():
         )
     )
     assert obs["state"] == "input"
+
+
+def test_cf7_sent_with_visible_form_is_done():
+    # Contact Form 7 often leaves the form/textarea visible after Ajax success.
+    obs = send_state.classify_send_state(
+        _ev(
+            text="お問い合わせフォーム",
+            cf7_sent=True,
+            cf7_statuses=["sent wpcf7-form sent"],
+            cf7_response_text="ありがとうございます。メッセージは送信されました。",
+            visible_forms=1,
+            visible_textareas=1,
+            editable_visible=8,
+            probe_field_hits=0,
+        )
+    )
+    assert obs["state"] == "done"
+
+
+def test_cf7_invalid_with_visible_form_is_validation_error():
+    obs = send_state.classify_send_state(
+        _ev(
+            text="入力内容に問題があります。確認してもう一度お試しください。",
+            cf7_invalid=True,
+            cf7_statuses=["invalid wpcf7-form invalid"],
+            visible_forms=1,
+            visible_textareas=1,
+            editable_visible=8,
+            probe_field_hits=3,
+        )
+    )
+    assert obs["state"] == "validation_error"
+
+
+def test_generic_sent_status_with_visible_form_is_done():
+    obs = send_state.classify_send_state(
+        _ev(
+            text="お問い合わせフォーム",
+            submission_sent=True,
+            submission_statuses=["success form-success submitted"],
+            submission_status_text="お問い合わせを受け付けました。",
+            visible_forms=1,
+            visible_textareas=1,
+            editable_visible=8,
+            probe_field_hits=0,
+        )
+    )
+    assert obs["state"] == "done"
+    assert obs["send_verdict"] == "sent_ok"
+
+
+def test_generic_invalid_status_with_visible_form_is_validation_error():
+    obs = send_state.classify_send_state(
+        _ev(
+            text="お問い合わせフォーム",
+            submission_invalid=True,
+            submission_statuses=["error form-error invalid"],
+            submission_status_text="入力内容に問題があります。",
+            visible_forms=1,
+            visible_textareas=1,
+            editable_visible=8,
+            probe_field_hits=3,
+        )
+    )
+    assert obs["state"] == "validation_error"
+    assert obs["send_verdict"] == "failed"
 
 
 # --- fingerprint / transition ------------------------------------------------------

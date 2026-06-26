@@ -9,7 +9,7 @@ description: |
   JP-form prospecting.
 
   The skill runs as a Python pipeline (`run.py`) with subcommands:
-    bootstrap (Pull) -> enrich -> draft -> preview -> send
+    bootstrap (Pull) → enrich → draft → preview → send
 
   In v1 it can stop at `preview` (human reviews drafts). The `send` phase
   drives the actual form (fill + click confirm + click final send) via
@@ -17,6 +17,34 @@ description: |
 ---
 
 # jp-form-outreach
+
+## Shared outreach architecture
+
+Treat campaign, persona, and channel as independent selections:
+
+- campaign (`brief`): product, target, evidence rules, sequence;
+- persona: sender identity, voice, sign-off;
+- channel: `jp_form` or `linkedin` delivery behavior.
+
+Resolve and persist the tuple per Slack thread, not per Slack channel:
+
+```bash
+cd ~/.openclaw/skills
+./outreach bind --brief torana-line-crm --persona torana-norimitsu \
+  --channel jp_form --slack-channel-id "$DOORMAN_SLACK_CHANNEL_ID" \
+  --slack-thread-ts "$DOORMAN_SLACK_THREAD_TS"
+
+./outreach start --brief torana-line-crm --persona torana-norimitsu \
+  --channel jp_form --slack-channel-id "$DOORMAN_SLACK_CHANNEL_ID" \
+  --slack-thread-ts "$DOORMAN_SLACK_THREAD_TS" -- \
+  campaign --clean --skip-send
+```
+
+Use `./outreach resolve ...` before launch. Do not infer the delivery skill
+from persona or campaign name. The shared CampaignRunner always executes
+`LIST → ENRICH → DRAFT → SEND`; this skill supplies the JP-form channel
+operations. When changing persona in an existing campaign workspace, use
+`--clean`; the runner rejects cross-persona draft reuse without it.
 
 ## Auto-acknowledge (MANDATORY, 最優先ルール)
 
@@ -41,14 +69,15 @@ agent は 5 秒以内に必ず thread 返信する:
 無音時間を絶対に作らない設計が、OpenClaw 系プロダクトの操作可能感を担保する。
 
 
-## Session start: brief & channel confirmation (MANDATORY)
+## Session start: campaign, persona & channel confirmation (MANDATORY)
 
 新規セッションで list-build / campaign / draft / send / preview など
 **データ生成・送信を伴う**リクエストを受けたら、起動前に Slack で次を確認する:
 
-1. **brief** — `python3 -m _outreach_core.helpers.brief list` で一覧。例:
+1. **campaign** — `python3 -m _outreach_core.helpers.brief list` で一覧。例:
    「📇 どの brief で進めますか？ [既定] torana-line-crm — トラーナ LINE×CRM …」
-2. **channel** — brief の `desired_channels` から jp_form / linkedin / 両方を選ばせる。
+2. **persona** — `./outreach personas` から送信人格を選ぶ。
+3. **channel** — jp_form / linkedin を独立して選ぶ。
 
 確定後は全 `run.py` 呼び出しに `--brief <id>` を付ける（省略時は `briefs/_active.txt`）。
 進捗照会・`brief list`・`history show` だけは確認省略可。
@@ -65,7 +94,7 @@ agent は 5 秒以内に必ず thread 返信する:
 | 送信ファネル見せて | `../report send-funnel --since 7d` |
 | needs_attention まとめて | `../report needs-attention` |
 | 全部止めて | `brief stop-run --brief <id>` |
-| **ping** / **生きてる？** | `cd ~/.openclaw/skills && ./healthcheck ping`（5 秒以内に 1 行返答） |
+| **ping** / **生きてる？** | `cd ~/.openclaw/skills && ./healthcheck ping`（5秒以内に日本語で即答） |
 | **status** / **詳しく** | `./healthcheck status` |
 | **watchdog 元気？** | `tail -1 data/watchdog.log` |
 
@@ -88,7 +117,7 @@ Slack で **ping / 生きてる？ / status** を受けたら Auto-ack 不要で
 
 ```bash
 cd ~/.openclaw/skills
-./healthcheck ping      # 1 行: heartbeat 経過秒・active runs・needs_attention
+./healthcheck ping      # 日本語1〜2行: heartbeat 経過・実行中run・要対応件数
 ./healthcheck status    # ping + system_health JSON + events 末尾
 ./healthcheck touch-command   # Slack 受信時に last_command_at を更新（任意）
 ```
@@ -103,7 +132,7 @@ heartbeat は専用 cron 不要。実行中は `HeartbeatSession` が**実進捗
 - gateway プロセス**死亡**は gateway 自身の launchd `KeepAlive` が自動復旧（OS レベル）。
 - watchdog は `openclaw health` で**応答性**を確認し、連続失敗時のみ
   `launchctl kickstart -k` で**hung した gateway を強制再起動**（10 分 3 回まで、超過で手動エスカレーション）。
-- 実行中 run の heartbeat が 5 分以上止まったら「タスク詰まり」を Slack 警告。
+- 実行中 run の heartbeat が止まったら「タスク詰まり」を Slack 警告（Slack進捗投稿は約10分ごと）。
 - 状態確認: `tail -5 data/watchdog.log` / 再インストール `scripts/install-watchdog.sh` / 解除 `scripts/uninstall-watchdog.sh`。
 
 ## Stateless context reconstruction
@@ -203,6 +232,7 @@ Python から直接 Slack 投稿する。エージェントは起動後すぐ自
 
 - 受信したら **5 秒以内に一言 ack**（必要なら `./healthcheck touch-command`）
 - 「進捗どう？」→ `./healthcheck ping` / `./brief status --brief <id>`（file から即答）
+- skip_history 済みの会社を再投入する場合は `campaign --include-skipped --only ...` を必ず付ける（付けないと bootstrap で除外される）
 - 詳細は [`docs/OPENCLAW_AGENT.md`](../docs/OPENCLAW_AGENT.md)
 
 ### 段階実行（手動で stage を回す稀なケース）

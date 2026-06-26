@@ -15,27 +15,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-FORM_SUCCESS_KEYWORDS = (
-    "送信完了",
-    "送信を受け付け",
-    "受付完了",
-    "ありがとうございました",
-    "お問い合わせありがとう",
-    "お問い合わせを受け付け",
-    "ご連絡ありがとう",
-    "完了しました",
-    "完了画面",
-    "送信が完了",
-    "送信されました",
-    "送信いたしました",
-    "メッセージは送信",
-    "THANKS",
-    "thank you",
-    "thank you for",
-    "successfully submitted",
-    "inquiry has been received",
-    "we have received",
-)
+from _outreach_core import send_state as core_send_state
+
+FORM_SUCCESS_KEYWORDS = core_send_state.FORM_SUCCESS_KEYWORDS
+FORM_ERROR_KEYWORDS = core_send_state.FORM_ERROR_KEYWORDS
 
 LINKEDIN_SUCCESS_KEYWORDS = (
     "message sent",
@@ -48,11 +31,96 @@ LINKEDIN_SUCCESS_KEYWORDS = (
 )
 
 PAGE_EVIDENCE_JS = r"""
-() => ({
-  url: location.href,
-  title: document.title || '',
-  text: (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 16000),
-})
+() => {
+  const visible = (el) => {
+    if (!el) return false;
+    if (el.offsetParent === null && getComputedStyle(el).position !== 'fixed') return false;
+    const st = getComputedStyle(el);
+    return st.display !== 'none' && st.visibility !== 'hidden';
+	  };
+	  let visibleForms = 0, visibleTextareas = 0, editableVisible = 0,
+	      submitControls = 0, finalSubmitControls = 0;
+	  const statuses = [];
+	  const responseTexts = [];
+  const addStatus = (el) => {
+    if (!el) return;
+    const cls = String(el.className || '');
+    const status = String(el.getAttribute && (el.getAttribute('data-status') || el.getAttribute('status')) || '');
+    const aria = String(el.getAttribute && (el.getAttribute('role') || el.getAttribute('aria-live')) || '');
+    if (cls || status || aria) statuses.push(`${status} ${cls} ${aria}`.trim());
+  };
+  for (const el of document.querySelectorAll(
+    [
+      'form',
+      '.wpcf7 form',
+      'form.wpcf7-form',
+      '.wpcf7-response-output',
+      '[role="alert"]',
+      '[role="status"]',
+      '[aria-live]',
+      '.success',
+      '.complete',
+      '.completed',
+      '.thanks',
+      '.thankyou',
+      '.form-success',
+      '.mw_wp_form_complete',
+      '.alert-success',
+      '.error',
+      '.form-error',
+      '.mw_wp_form_error',
+      '.alert-danger'
+    ].join(',')
+	  )) {
+	    addStatus(el);
+	    if (visible(el) && el.matches && !el.matches('form')) {
+	      const t = String(el.textContent || '').trim();
+	      if (t) responseTexts.push(t.slice(0, 300));
+	    }
+	  }
+	  for (const f of document.querySelectorAll('form')) if (visible(f)) visibleForms++;
+	  const isEditableType = (el) => {
+	    const t = (el.type || '').toLowerCase();
+	    return !['hidden', 'submit', 'button', 'image', 'file', 'checkbox', 'radio'].includes(t);
+	  };
+	  for (const el of document.querySelectorAll('input, textarea, select')) {
+	    if (!visible(el)) continue;
+	    if (el.tagName === 'TEXTAREA') visibleTextareas++;
+	    if (el.tagName === 'INPUT' && !isEditableType(el)) continue;
+	    if (el.disabled || el.readOnly) continue;
+	    editableVisible++;
+	  }
+	  const finalSubmitRe = /送信|送る|問い合わせ|お問い合わせ|submit|send|confirm|確定|完了/i;
+	  for (const el of document.querySelectorAll(
+	    'button, input[type="submit"], input[type="button"], input[type="image"], [role="button"]'
+	  )) {
+	    if (!visible(el)) continue;
+	    submitControls++;
+	    const label = String(el.innerText || el.value || el.getAttribute('aria-label') || el.textContent || '');
+	    if (finalSubmitRe.test(label)) finalSubmitControls++;
+	  }
+	  if (document.body) statuses.push(String(document.body.className || ''));
+  const joined = statuses.join(' ').toLowerCase();
+  const responseText = responseTexts.join('\n').slice(0, 600);
+  return {
+    url: location.href,
+	    title: document.title || '',
+	    text: (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 16000),
+	    visible_forms: visibleForms,
+	    visible_textareas: visibleTextareas,
+	    editable_visible: editableVisible,
+	    submit_controls: submitControls,
+	    final_submit_controls: finalSubmitControls,
+	    cf7_statuses: statuses,
+    cf7_response_text: responseText,
+    cf7_sent: /\bsent\b|mail[_-]?sent|wpcf7-mail-sent-ok/.test(joined),
+    cf7_invalid: /\binvalid\b|spam|failed|aborted|unaccepted/.test(joined),
+    submission_statuses: statuses,
+    submission_status_text: responseText,
+    submission_sent: /(^|[\s_-])(sent|success|succeeded|complete|completed|submitted|thanks|thankyou|mw[_-]?wp[_-]?form[_-]?complete)([\s_-]|$)/i.test(joined),
+    submission_invalid: /(^|[\s_-])(invalid|error|failed|failure|spam|aborted|unaccepted|mw[_-]?wp[_-]?form[_-]?error)([\s_-]|$)/i.test(joined),
+  };
+}
 """
 
 # v15 §V3 — form presence must be judged by VISIBILITY, not DOM existence.
@@ -66,10 +134,53 @@ FORM_VISIBILITY_JS = r"""
     const st = getComputedStyle(el);
     return st.display !== 'none' && st.visibility !== 'hidden';
   };
-  let visibleForms = 0, visibleTextareas = 0;
-  for (const f of document.querySelectorAll('form')) if (visible(f)) visibleForms++;
-  for (const t of document.querySelectorAll('textarea')) if (visible(t)) visibleTextareas++;
-  return { visible_forms: visibleForms, visible_textareas: visibleTextareas };
+	  let visibleForms = 0, visibleTextareas = 0, editableVisible = 0,
+	      submitControls = 0, finalSubmitControls = 0;
+	  for (const f of document.querySelectorAll('form')) if (visible(f)) visibleForms++;
+	  const isEditableType = (el) => {
+	    const t = (el.type || '').toLowerCase();
+	    return !['hidden', 'submit', 'button', 'image', 'file', 'checkbox', 'radio'].includes(t);
+	  };
+	  for (const el of document.querySelectorAll('input, textarea, select')) {
+	    if (!visible(el)) continue;
+	    if (el.tagName === 'TEXTAREA') visibleTextareas++;
+	    if (el.tagName === 'INPUT' && !isEditableType(el)) continue;
+	    if (el.disabled || el.readOnly) continue;
+	    editableVisible++;
+	  }
+	  const finalSubmitRe = /送信|送る|問い合わせ|お問い合わせ|submit|send|confirm|確定|完了/i;
+	  for (const el of document.querySelectorAll(
+	    'button, input[type="submit"], input[type="button"], input[type="image"], [role="button"]'
+	  )) {
+	    if (!visible(el)) continue;
+	    submitControls++;
+	    const label = String(el.innerText || el.value || el.getAttribute('aria-label') || el.textContent || '');
+	    if (finalSubmitRe.test(label)) finalSubmitControls++;
+	  }
+  const statuses = [];
+  for (const el of document.querySelectorAll(
+    'form, .wpcf7 form, form.wpcf7-form, [role="alert"], [role="status"], [aria-live], .success, .complete, .completed, .thanks, .thankyou, .form-success, .mw_wp_form_complete, .alert-success, .error, .form-error, .mw_wp_form_error, .alert-danger'
+  )) {
+    const cls = String(el.className || '');
+    const status = String(el.getAttribute && (el.getAttribute('data-status') || el.getAttribute('status')) || '');
+    const aria = String(el.getAttribute && (el.getAttribute('role') || el.getAttribute('aria-live')) || '');
+    if (cls || status || aria) statuses.push(`${status} ${cls} ${aria}`.trim());
+  }
+  if (document.body) statuses.push(String(document.body.className || ''));
+  const joined = statuses.join(' ').toLowerCase();
+  return {
+	    visible_forms: visibleForms,
+	    visible_textareas: visibleTextareas,
+	    editable_visible: editableVisible,
+	    submit_controls: submitControls,
+	    final_submit_controls: finalSubmitControls,
+	    cf7_statuses: statuses,
+    cf7_sent: /\bsent\b|mail[_-]?sent|wpcf7-mail-sent-ok/.test(joined),
+    cf7_invalid: /\binvalid\b|spam|failed|aborted|unaccepted/.test(joined),
+    submission_statuses: statuses,
+    submission_sent: /(^|[\s_-])(sent|success|succeeded|complete|completed|submitted|thanks|thankyou|mw[_-]?wp[_-]?form[_-]?complete)([\s_-]|$)/i.test(joined),
+    submission_invalid: /(^|[\s_-])(invalid|error|failed|failure|spam|aborted|unaccepted|mw[_-]?wp[_-]?form[_-]?error)([\s_-]|$)/i.test(joined),
+  };
 }
 """
 
@@ -84,29 +195,7 @@ def _text_has_keyword(text: str, keywords: tuple[str, ...]) -> bool:
 
 
 def _url_looks_like_success(url: str) -> bool:
-    u = _norm(url)
-    markers = (
-        "thanks",
-        "thank",
-        "complete",
-        "completed",
-        "success",
-        "done",
-        "finish",
-        "/thanks",
-        "arigato",
-        "kanryo",
-    )
-    return any(m in u for m in markers)
-FORM_ERROR_KEYWORDS = (
-    "入力エラー",
-    "未入力",
-    "正しく入力してください",
-    "入力内容に誤り",
-    "エラーがあります",
-    "送信できませんでした",
-    "送信に失敗",
-)
+    return core_send_state.url_looks_like_success(url)
 
 PICK_TARGET_FORM_JS = r"""
 () => {
@@ -186,6 +275,12 @@ def append_needs_attention(data_dir: Path, entry: dict[str, Any]) -> Path:
     row = {**entry, "recorded_at": datetime.utcnow().isoformat() + "Z", "status": "open"}
     with path.open("a") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    try:
+        from _outreach_core.notify import post_problem
+
+        post_problem("needs_attention", row, row)
+    except Exception:
+        pass
     return path
 
 
@@ -235,33 +330,19 @@ def _plan_field_names(plan: dict[str, Any] | None) -> set[str]:
 
 
 def _jp_form_success_confirmed(evidence: dict[str, Any]) -> bool:
-    """Strong success: keyword on page AND (thanks URL OR no error banner)."""
-    if not evidence.get("has_success_keyword"):
-        return False
-    if evidence.get("url_success"):
-        return True
-    return not evidence.get("has_error_keyword")
+    """Strong success according to the shared send-state verdict."""
+    return bool(core_send_state.assess_submission_result(evidence).get("sent"))
 
 
 # --- v15 §V1: weighted evidence scoring (pure) -------------------------------
 def score_send_evidence(evidence: dict[str, Any]) -> int:
     """Weighted score over post-submit signals (§V1 table).
 
-    +2 success-looking URL / +2 success keyword / +2 form visibly gone
-    −3 visible error keyword / −2 input form still visibly present
+    Delegates to ``send_state`` so CF7, MW WP Form, aria-live alerts, generic
+    success/error blocks, URL transitions, and visible-form residue are judged
+    by one shared policy.
     """
-    score = 0
-    if evidence.get("url_success"):
-        score += 2
-    if evidence.get("has_success_keyword"):
-        score += 2
-    if evidence.get("form_gone_visible"):
-        score += 2
-    if evidence.get("has_error_keyword"):
-        score -= 3
-    if evidence.get("form_still_present"):
-        score -= 2
-    return score
+    return int(core_send_state.assess_submission_result(evidence).get("score") or 0)
 
 
 def verdict_from_score(score: int) -> str:
@@ -271,6 +352,23 @@ def verdict_from_score(score: int) -> str:
     if score <= -2:
         return "failed"
     return "uncertain"
+
+
+def _record_submission_result(evidence: dict[str, Any]) -> dict[str, Any]:
+    """Attach the shared send-state verdict fields to evidence and return it."""
+    result = core_send_state.assess_submission_result(evidence)
+    evidence["score"] = result["score"]
+    evidence["send_verdict"] = result["verdict"]
+    evidence["send_reason"] = result["reason"]
+    evidence["send_signals"] = result["signals"]
+    evidence["has_success_keyword"] = result["has_success_keyword"]
+    evidence["has_error_keyword"] = result["has_error_keyword"]
+    evidence["url_success"] = result["url_success"]
+    evidence["form_gone_visible"] = result["form_gone_visible"]
+    evidence["form_still_present"] = result["form_still_present"]
+    evidence["explicit_sent"] = result["explicit_sent"]
+    evidence["explicit_invalid"] = result["explicit_invalid"]
+    return result
 
 
 # --- v15 §V2: LLM tiebreak for uncertain verdicts (with hallucination guard) -
@@ -423,17 +521,54 @@ def verify_send_completed(
     if isinstance(browser_verify, dict):
         page_url = str(browser_verify.get("url") or "")
         extra = str(browser_verify.get("text") or "")
+        cf7_extra = str(browser_verify.get("cf7_response_text") or "")
+        submission_extra = str(browser_verify.get("submission_status_text") or "")
         if extra and extra not in snap:
             snap = f"{snap}\n{extra}"
+        if cf7_extra and cf7_extra not in snap:
+            snap = f"{snap}\n{cf7_extra}"
+        if submission_extra and submission_extra not in snap:
+            snap = f"{snap}\n{submission_extra}"
+        for key in (
+            "visible_forms",
+            "visible_textareas",
+            "editable_visible",
+            "submit_controls",
+            "final_submit_controls",
+            "probe_text_hits",
+            "probe_field_hits",
+            "form_gone_visible",
+            "form_still_present",
+            "has_success_keyword",
+            "has_error_keyword",
+            "cf7_sent",
+            "cf7_invalid",
+            "cf7_statuses",
+            "cf7_response_text",
+            "submission_sent",
+            "submission_invalid",
+            "submission_statuses",
+            "submission_status_text",
+        ):
+            if key in browser_verify:
+                evidence[key] = browser_verify.get(key)
     if page_url:
+        evidence["url"] = page_url
         evidence["url_success"] = _url_looks_like_success(page_url)
     if snap:
+        evidence["text"] = snap[:8000]
         evidence["has_success_keyword"] = _text_has_keyword(snap, FORM_SUCCESS_KEYWORDS)
         evidence["has_error_keyword"] = _text_has_keyword(snap, FORM_ERROR_KEYWORDS)
 
+    submission = _record_submission_result(evidence)
+
     # Guardrail: if an explicit input error banner is present and we don't also
     # have strong success evidence, treat as failure (Benesse false-positive).
-    if evidence.get("has_error_keyword") and not _jp_form_success_confirmed(evidence):
+    if (
+        evidence.get("has_error_keyword")
+        and not submission["sent"]
+        and not submission.get("explicit_sent")
+    ):
         return {
             "status": "needs_attention",
             "reason": f"{name}: 確認画面にエラーメッセージが検出されました",
@@ -442,10 +577,10 @@ def verify_send_completed(
             "unresolved_fields": None,
         }
 
-    if _jp_form_success_confirmed(evidence):
+    if submission["sent"]:
         return {
             "status": "ok",
-            "reason": f"{name}: 送信完了画面を確認",
+            "reason": f"{name}: 送信完了を確認 ({submission['reason']}, score={submission['score']})",
             "evidence": evidence,
             "snapshot_path": str(snapshot_path) if snapshot_path else None,
             "unresolved_fields": None,
@@ -457,18 +592,37 @@ def verify_send_completed(
         if isinstance(vis, dict):
             visible_forms = int(vis.get("visible_forms") or 0)
             visible_textareas = int(vis.get("visible_textareas") or 0)
+            editable_visible = int(vis.get("editable_visible") or 0)
+            submit_controls = int(vis.get("submit_controls") or 0)
+            final_submit_controls = int(vis.get("final_submit_controls") or 0)
             evidence["visible_forms"] = visible_forms
             evidence["visible_textareas"] = visible_textareas
+            evidence["editable_visible"] = editable_visible
+            evidence["submit_controls"] = submit_controls
+            evidence["final_submit_controls"] = final_submit_controls
             evidence["form_gone_visible"] = (
                 visible_forms == 0 and visible_textareas == 0
             )
             evidence["form_still_present"] = visible_textareas > 0
+            for key in (
+                "cf7_sent",
+                "cf7_invalid",
+                "cf7_statuses",
+                "submission_sent",
+                "submission_invalid",
+                "submission_statuses",
+                "submission_status_text",
+                "editable_visible",
+                "submit_controls",
+                "final_submit_controls",
+            ):
+                if key in vis and key not in evidence:
+                    evidence[key] = vis.get(key)
 
     # v15 §V1: weighted score settles cases keywords alone could not.
-    score = score_send_evidence(evidence)
-    evidence["score"] = score
-    score_verdict = verdict_from_score(score)
-    if score_verdict == "sent_ok":
+    submission = _record_submission_result(evidence)
+    score = int(submission["score"])
+    if submission["verdict"] == "sent_ok":
         return {
             "status": "ok",
             "reason": f"{name}: 送信完了をスコア判定で確認 (score={score})",
@@ -476,7 +630,7 @@ def verify_send_completed(
             "snapshot_path": str(snapshot_path) if snapshot_path else None,
             "unresolved_fields": None,
         }
-    if score_verdict == "failed":
+    if submission["verdict"] == "failed":
         return {
             "status": "needs_attention",
             "reason": f"{name}: 送信失敗の証拠が優勢 (score={score})",
@@ -612,9 +766,11 @@ def handle_verify_result(
     data_dir: Path,
     *,
     channel: str,
+    record_attention: bool = True,
 ) -> str:
     """
-    Persist needs_attention + notify. Returns outcome: sent_ok | needs_attention | uncertain.
+    Persist needs_attention + notify unless record_attention is false.
+    Returns outcome: sent_ok | needs_attention | uncertain.
     """
     from _outreach_core.notify import post as notify_post
 
@@ -626,23 +782,19 @@ def handle_verify_result(
         _emit_send_event(target, result, channel, "sent_ok")
         return "sent_ok"
 
-    entry = {
-        "target_id": target.get("id"),
-        "name": name,
-        "channel": channel,
-        "reason": result.get("reason"),
-        "unresolved_fields": result.get("unresolved_fields"),
-        "snapshot_path": result.get("snapshot_path"),
-        "evidence": result.get("evidence"),
-    }
-    append_needs_attention(data_dir, entry)
+    if record_attention:
+        entry = {
+            "target_id": target.get("id"),
+            "name": name,
+            "channel": channel,
+            "reason": result.get("reason"),
+            "unresolved_fields": result.get("unresolved_fields"),
+            "snapshot_path": result.get("snapshot_path"),
+            "evidence": result.get("evidence"),
+        }
+        append_needs_attention(data_dir, entry)
 
     if status == "needs_attention":
-        fields = result.get("unresolved_fields") or []
-        field_txt = ", ".join(
-            f"{f.get('type', '?')}: {f.get('label') or f.get('name')}" for f in fields[:5]
-        )
-        notify_post(f"{name} 想定外の入力項目: {field_txt}", level="warn")
         _emit_send_event(target, result, channel, "needs_attention", escalated=True)
         return "needs_attention"
 
@@ -650,7 +802,6 @@ def handle_verify_result(
     prefix = f"{name}: "
     if reason.startswith(prefix):
         reason = reason[len(prefix) :]
-    notify_post(f"{name} 送信完了が確認できません: {reason}", level="warn")
     _emit_send_event(target, result, channel, "uncertain")
     return "uncertain"
 
@@ -669,6 +820,8 @@ def _emit_send_event(
         if not ev.get_context().data_dir:
             return
         tid = str(target.get("id") or "")
+        evidence = result.get("evidence") or {}
+        draft = target.get("draft") or {}
         ev.emit(
             "send.verify.completed",
             stage="send",
@@ -677,7 +830,13 @@ def _emit_send_event(
             payload={
                 "status": result.get("status"),
                 "reason": (result.get("reason") or "")[:200],
-                "evidence_keys": list((result.get("evidence") or {}).keys()),
+                "evidence_keys": list(evidence.keys()),
+                "send_verdict": evidence.get("send_verdict"),
+                "send_score": evidence.get("score"),
+                "send_reason": evidence.get("send_reason"),
+                "send_signals": evidence.get("send_signals") or [],
+                "name": target.get("name") or target.get("company"),
+                "subject": draft.get("subject") or target.get("subject") or "",
                 "channel": channel,
             },
             trace_dir=result.get("snapshot_path"),

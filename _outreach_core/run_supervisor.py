@@ -61,6 +61,23 @@ def is_stalled(activity_age_sec: float | None, stall_sec: int = STALL_SEC) -> bo
     return activity_age_sec >= stall_sec
 
 
+def should_abort_target(started_at: float | None, now: float | None, limit: int | float) -> bool:
+    """True when one target has exceeded its per-target wall-clock budget.
+
+    ``limit <= 0`` disables the guard. Equality counts as timed out so the
+    boundary is deterministic for tests and operations.
+    """
+    try:
+        lim = float(limit)
+        if lim <= 0:
+            return False
+        start = float(started_at)
+        current = float(now)
+    except (TypeError, ValueError):
+        return False
+    return max(0.0, current - start) >= lim
+
+
 def latest_activity_age_sec(paths: list[Path], now: float | None = None) -> float | None:
     """Age (seconds) of the most recently modified existing path among ``paths``.
 
@@ -149,6 +166,49 @@ def decide(
 
 def is_restart(action: str) -> bool:
     return action in _RESTART_ACTIONS
+
+
+def build_give_up_problem(
+    action: str,
+    *,
+    exit_code: int | None,
+    activity_age_sec: float | None,
+    recent_outcomes: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Build the Slack problem payload for terminal supervisor give-up."""
+    if action not in {ACTION_GIVE_UP_STALLED, ACTION_GIVE_UP_CRASH}:
+        return None
+    counts: dict[str, int] = {}
+    for row in recent_outcomes or []:
+        if not isinstance(row, dict):
+            continue
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        outcome = row.get("outcome") or payload.get("outcome")
+        if outcome:
+            counts[str(outcome)] = counts.get(str(outcome), 0) + 1
+    if action == ACTION_GIVE_UP_STALLED:
+        root = f"run stalled after {int(activity_age_sec or 0)}s without activity"
+        kind = "run_give_up_stalled"
+        next_action = "ログ末尾と直近 outcome を確認し、詰まった対象を needs_attention から切り分けて再実行してください。"
+    else:
+        root = f"run crashed with exit={exit_code}"
+        kind = "run_give_up_crash"
+        next_action = "ログ末尾と例外を確認し、修正後に同じコマンドを再実行してください。"
+    return {
+        "kind": kind,
+        "target": {
+            "target_id": "run_supervisor",
+            "name": "Doorman run supervisor",
+        },
+        "detail": {
+            "root_cause": root,
+            "exit_code": exit_code,
+            "activity_age_sec": activity_age_sec,
+            "recent_outcomes": counts,
+            "next_action": next_action,
+            "level": "error",
+        },
+    }
 
 
 # ---------------------------------------------------------------------------

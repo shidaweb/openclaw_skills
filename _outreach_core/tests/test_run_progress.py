@@ -28,18 +28,19 @@ class TestSnapshotIO(unittest.TestCase):
         self.assertEqual(snap["status"], "running")
 
     def test_bump_counts_by_outcome(self):
-        rp.start(self.dir, "send", 5)
+        rp.start(self.dir, "send", 6)
         rp.bump(self.dir, outcome="sent", name="A")
         rp.bump(self.dir, outcome="queued", name="B")
         rp.bump(self.dir, outcome="skipped", name="C")
         rp.bump(self.dir, outcome="crashed", name="D")
         rp.bump(self.dir, outcome="done", name="E")
+        rp.bump(self.dir, outcome="timed_out", name="F")
         snap = rp.read(self.dir)
-        self.assertEqual(snap["processed"], 5)
+        self.assertEqual(snap["processed"], 6)
         self.assertEqual(snap["sent"], 1)
-        self.assertEqual(snap["needs_attention"], 2)   # queued + crashed
+        self.assertEqual(snap["needs_attention"], 3)   # queued + crashed + timed_out
         self.assertEqual(snap["skipped"], 2)           # skipped + done
-        self.assertEqual(snap["current"], "E")
+        self.assertEqual(snap["current"], "F")
 
     def test_finish_sets_status(self):
         rp.start(self.dir, "send", 1)
@@ -86,8 +87,8 @@ class TestFormatting(unittest.TestCase):
             "started_at": (datetime.now(timezone.utc) - timedelta(minutes=6)).isoformat(),
         }
         out = rp.format_summary(snap)
-        self.assertIn("send 12/30", out)
-        self.assertIn("送信 9", out)
+        self.assertIn("送信 12/30", out)
+        self.assertIn("送信OK 9", out)
         self.assertIn("要対応 1", out)
         self.assertIn("株式会社X", out)
         self.assertIn("残り目安", out)

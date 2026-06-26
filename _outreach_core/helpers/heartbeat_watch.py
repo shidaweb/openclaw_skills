@@ -56,7 +56,16 @@ def _format_status(ev: dict) -> str:
     prog = ""
     if cur != "" and tot != "":
         prog = f" {cur}/{tot}"
-    return f"[Doorman/{task}]{prog} · {msg}"
+    task_label = {
+        "research": "調査",
+        "campaign": "キャンペーン",
+        "fetch-leads": "リスト取得",
+        "enrich": "フォーム調査",
+        "draft": "ドラフト作成",
+        "send": "送信",
+        "resolve": "リゾルバ",
+    }.get(str(task), str(task))
+    return f"Doorman進捗: {task_label}{prog} · {msg}"
 
 
 def _should_stop(ev: dict | None, idle_sec: float, last_change: float) -> bool:
@@ -84,8 +93,8 @@ def run_watch(
 ) -> int:
     if not webhook_configured():
         print(
-            "[heartbeat_watch] Slack not configured (OpenClaw botToken or webhook). "
-            "No posts sent.",
+            "[heartbeat_watch] Slack未設定です（OpenClaw botToken または webhook）。"
+            "投稿しませんでした。",
             file=sys.stderr,
         )
         return 2
@@ -103,24 +112,25 @@ def run_watch(
             if body != last_body:
                 last_change = time.time()
                 last_body = body
+            # End events are a stop signal, not another progress message. The
+            # supervisor is responsible for the one terminal Slack result.
+            if not once and _should_stop(ev, idle_timeout_sec, last_change):
+                print(f"[heartbeat_watch] stop ({ev.get('event')} / {ev.get('task')})")
+                return 0
             now = time.time()
             if once or (now - last_post >= interval_sec and body):
                 if post(body, level="info"):
-                    print(f"[heartbeat_watch] posted: {body[:120]}")
+                    print(f"[heartbeat_watch] 投稿しました: {body[:120]}")
                 else:
-                    print("[heartbeat_watch] post failed", file=sys.stderr)
+                    print("[heartbeat_watch] 投稿に失敗しました", file=sys.stderr)
                 last_post = now
 
             if once:
                 return 0
-            if _should_stop(ev, idle_timeout_sec, last_change):
-                print(f"[heartbeat_watch] stop ({ev.get('event')} / {ev.get('task')})")
-                return 0
-
         if once:
             if not ev:
                 post(
-                    f"[Doorman/{skill_name}] 進捗ログなし "
+                    f"Doorman進捗: {skill_name} の進捗ログなし "
                     "(パイプライン未開始 or --heartbeat off)",
                     level="info",
                 )

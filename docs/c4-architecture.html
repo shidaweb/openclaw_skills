@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Doorman — C4アーキテクチャ図 (L1 + L2)</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: #1a2129;
+    --text: #e6edf3;
+    --muted: #9aa7b2;
+    --accent: #4aa8ff;
+    --border: #2b3540;
+    --code-bg: #11181f;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f7f9fb; --panel: #ffffff; --text: #1c2530; --muted: #5a6b7a;
+      --accent: #1761c4; --border: #e1e7ec; --code-bg: #f0f3f6;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", "Segoe UI", sans-serif;
+    line-height: 1.7; font-size: 15px;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 32px 24px 80px; }
+  h1 { font-size: 26px; margin: 0 0 6px; }
+  h2 { font-size: 20px; margin: 44px 0 10px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 16px; margin: 26px 0 8px; color: var(--accent); }
+  .sub { color: var(--muted); margin: 0 0 4px; }
+  .meta { color: var(--muted); font-size: 13px; background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 14px; margin: 16px 0 0; }
+  a { color: var(--accent); }
+  .diagram { background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 18px; margin: 18px 0; overflow-x: auto; text-align: center; }
+  .mermaid { font-size: 14px; }
+  ul { padding-left: 20px; }
+  li { margin: 6px 0; }
+  code { background: var(--code-bg); border: 1px solid var(--border); border-radius: 5px;
+    padding: 1px 6px; font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13px; }
+  .note { background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 14px 18px; margin: 16px 0; }
+  footer { margin-top: 50px; color: var(--muted); font-size: 13px; border-top: 1px solid var(--border); padding-top: 16px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Doorman — C4アーキテクチャ図（L1 + L2）</h1>
+  <p class="sub">ソースコードから抽出した <a href="https://c4model.com/" target="_blank" rel="noopener">C4モデル</a> のレベル1（System Context）とレベル2（Container）。</p>
+  <p class="sub">対象リポジトリ: <code>openclaw_skills</code>（共通コア <code>_outreach_core</code> + チャンネル別スキル）。</p>
+  <p class="meta">抽出元: <code>README.md</code>, <code>_outreach_core/</code>（infer / notify / adapters / paths ほか）, <code>jp-form-outreach/run.py</code>, CLIランチャ（<code>brief</code> / <code>job</code> / <code>report</code> / <code>healthcheck</code>）。</p>
+
+  <h2>L1 — System Context</h2>
+  <p>「Doorman が誰のために、どの外部システムとやり取りするか」の俯瞰図。内部構造は次の L2 で展開する。</p>
+  <div class="diagram">
+    <pre class="mermaid">
+C4Context
+    title System Context — Doorman アウトリーチ運用基盤
+
+    Person(operator, "運用者", "Slackで指示を出し、送信を承認する（Nori / チーム）")
+
+    System(doorman, "Doorman", "Slack指示で動くアウトリーチ運用基盤。フォーム/InMailの下書き〜送信〜記録を6フェーズで自動化")
+
+    System_Ext(slack, "Slack", "指示の受け口（OpenClawエージェント経由）と片方向の通知先")
+    System_Ext(openclaw, "OpenClaw + Claude", "会話エージェント(Opus)とサブタスク推論(Sonnet)。下書き・フォーム解析を担当")
+    System_Ext(jpforms, "日本企業の問い合わせフォーム", "送信先のWebサイト（jp-form-outreach）")
+    System_Ext(linkedin, "LinkedIn", "InMail 送信先（linkedin-outreach）")
+
+    Rel(operator, slack, "指示・承認", "チャット")
+    Rel(slack, doorman, "コマンド起動", "OpenClawエージェント")
+    Rel(doorman, slack, "進捗・結果を通知", "Webhook / chat.postMessage")
+    Rel(doorman, openclaw, "下書き生成・フォーム解析", "openclaw infer (subprocess)")
+    Rel(doorman, jpforms, "問い合わせフォーム送信", "ブラウザ自動操作")
+    Rel(doorman, linkedin, "InMail 送信", "ブラウザ自動操作")
+
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="2")
+    </pre>
+  </div>
+  <h3>要点</h3>
+  <ul>
+    <li>入力経路は Slack のみ（運用者 → OpenClawエージェント → Doorman）。Doorman 側からも Slack へ片方向通知を返す（<code>notify.py</code> / <code>openclaw_slack.py</code>）。</li>
+    <li>LLM は2系統。会話エージェントは Opus、Python パイプライン内のサブタスク（下書き・フォーム解析）は Sonnet 固定（<code>infer.py</code> の <code>DEFAULT_MODEL</code>）。</li>
+    <li>送信先は2系統。日本企業の問い合わせフォームと LinkedIn InMail。どちらもブラウザ自動操作で到達する。</li>
+  </ul>
+
+  <h2>L2 — Container</h2>
+  <p>Doorman を「実行単位（コンテナ）」に分解する。<code>_outreach_core</code> を軸に、薄い CLI ランチャ、チャンネル別パイプライン、ブラウザ抽象層、append-only な状態ストアで構成される。</p>
+  <div class="diagram">
+    <pre class="mermaid">
+C4Container
+    title Container — Doorman
+
+    Person(operator, "運用者", "Slackで指示・承認")
+    System_Ext(slack, "Slack", "指示の受け口 / 通知先")
+    System_Ext(openclaw_llm, "OpenClaw + Claude", "Opus(エージェント) / Sonnet(サブタスク)")
+    System_Ext(websites, "送信先サイト", "日本企業フォーム / LinkedIn")
+
+    System_Boundary(doorman, "Doorman") {
+        Container(agent, "OpenClawエージェント", "OpenClaw + Opus", "Slack会話を解釈し、CLIランチャを起動するフロント層")
+        Container(cli, "CLIランチャ", "Python (brief/job/report/healthcheck)", "PYTHONPATHを通して _outreach_core のモジュールを起動する薄いラッパ")
+        Container(jobrunner, "detached ジョブランナー", "Python (run_job)", "長時間ジョブを別プロセス化しSlack応答遅延を回避。supervisor/watchdogで監視")
+        Container(core, "共通コア _outreach_core", "Python ライブラリ", "6フェーズ運用の本体: draft / contact_url / form_validation / verify / progress / history / send_state など")
+        Container(jp, "jp-form-outreach パイプライン", "Python (run.py, research.py)", "日本企業フォーム送信。bootstrap→enrich→draft→preview→send→mark-sent")
+        Container(li, "linkedin-outreach パイプライン", "Python (run.py, build_search.py)", "LinkedIn InMail 送信パイプライン")
+        Container(browser, "ブラウザアダプタ層", "Python (adapters/*)", "OpenClawBrowser / Playwright を同一プロトコルで切替。get_browser()で選択")
+        Container(notify, "通知モジュール", "Python (notify, openclaw_slack)", "片方向のSlack通知。Webhook または chat.postMessage")
+        ContainerDb(state, "状態ストア", "append-only JSONL + YAML", "sent/skip/events 履歴, channel_state, ターゲットリスト, job_logs, system_health")
+    }
+
+    Rel(operator, slack, "指示・承認")
+    Rel(slack, agent, "メッセージ", "Slack API")
+    Rel(agent, cli, "コマンド起動", "subprocess")
+    Rel(cli, jobrunner, "detachedジョブ開始", "job start")
+    Rel(jobrunner, jp, "パイプライン実行", "subprocess")
+    Rel(jobrunner, li, "パイプライン実行", "subprocess")
+    Rel(jp, core, "下書き/検証/履歴を利用", "import")
+    Rel(li, core, "下書き/検証/履歴を利用", "import")
+    Rel(core, browser, "ページ操作", "evaluate / browser()")
+    Rel(browser, websites, "フォーム入力・送信", "自動操作")
+    Rel(core, openclaw_llm, "下書き・フォーム解析", "oc_infer (subprocess)")
+    Rel(core, state, "読み書き", "JSONL / YAML")
+    Rel(core, notify, "結果通知を依頼", "import")
+    Rel(notify, slack, "通知", "Webhook / Bot")
+
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
+    </pre>
+  </div>
+  <h3>コンテナの責務メモ</h3>
+  <ul>
+    <li><strong>OpenClawエージェント</strong> — Slack 会話を解釈する唯一のフロント。Opus 系（リポジトリ外で設定）。ここから下は決定論的な Python に渡る。</li>
+    <li><strong>CLIランチャ</strong>（<code>brief</code> / <code>job</code> / <code>report</code> / <code>healthcheck</code>）— どのディレクトリからでも <code>PYTHONPATH=.</code> を通して <code>_outreach_core.helpers.*</code> を <code>runpy</code> で起動するだけの薄い層。</li>
+    <li><strong>detached ジョブランナー</strong>（<code>run_job</code>）— 長時間ジョブを別プロセス化し Slack 応答遅延を回避。<code>run_supervisor</code> / <code>watchdog</code> / <code>heartbeat_watch</code> が死活監視する。</li>
+    <li><strong>共通コア <code>_outreach_core</code></strong> — 本体。下書き(<code>draft</code>)とフォーム解析だけが LLM を使い、<code>verify</code> / <code>progress</code> / <code>history</code> / <code>report</code> は原則 LLM なしの純関数。先日修正した <code>contact_url</code>（フォーム種別判定）もここ。</li>
+    <li><strong>チャンネル別パイプライン</strong> — <code>jp-form-outreach</code> と <code>linkedin-outreach</code>。同じ契約（コアの import）で、実行面（フォーム送信 / InMail）だけ差し替える。</li>
+    <li><strong>ブラウザアダプタ層</strong>（<code>adapters/</code>）— <code>BrowserAdapter</code> プロトコルの背後で OpenClawBrowser と Playwright を切替。呼び出し側は <code>get_browser()</code> だけを見る。</li>
+    <li><strong>状態ストア</strong> — <code>sent_history.jsonl</code> / <code>skip_history.jsonl</code> / <code>events.jsonl</code> を中心に append-only。再実行の冪等性と再開容易性を確保。ターゲットリスト(YAML)・<code>channel_state</code>・<code>job_logs</code>・<code>system_health</code> もここ。</li>
+  </ul>
+
+  <h2>設計上の不変条件（コードから読み取れる方針）</h2>
+  <div class="note">
+    <ol>
+      <li><strong>決定論と LLM の分離</strong> — LLM は <code>draft</code> と form analyzer に限定し、失敗時は純関数で補正する。</li>
+      <li><strong>append-only 履歴</strong> — 状態は追記中心。再開・冪等性を最優先。</li>
+      <li><strong>安全優先 submit</strong> — 生 <code>form.submit()</code> を避け <code>requestSubmit</code> ベース。</li>
+      <li><strong>アダプタ seam</strong> — ブラウザバックエンド（OpenClaw / Playwright）は差し替え可能で、ロールバック先が常に存在する。</li>
+    </ol>
+  </div>
+
+  <footer>C4モデル L1+L2 / ソースコード抽出 — openclaw_skills</footer>
+</div>
+
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+  const dark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+  mermaid.initialize({ startOnLoad: true, theme: dark ? "dark" : "default", c4: { diagramMarginX: 20 } });
+</script>
+</body>
+</html>

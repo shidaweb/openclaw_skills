@@ -1,0 +1,15 @@
+persona:
+  id: your-persona-id
+  display_name: Display Name
+
+sender:
+  name: ""
+  company: ""
+  role: ""
+  email: ""
+  phone: ""
+  calendar_url: ""
+
+personalization:
+  tone: ""
+  closing: ""

@@ -3,7 +3,17 @@
 Slack 指示で動くアウトリーチ運用基盤です。  
 OpenClaw エージェントが対話を受け、Python パイプラインが実処理を実行します。
 
-このリポジトリは、共通コア `'_outreach_core/'` を軸に、複数スキルの運用を同じ契約で回します。
+このリポジトリは、共通コア `_outreach_core/` を軸に、複数スキルの運用を同じ契約で回します。
+
+構成は3つの独立した軸です。
+
+- campaign (`briefs/`): 商材、対象、根拠ルール、シーケンス
+- persona (`personas/`): 送信者情報、口調、署名
+- channel: `jp_form` または `linkedin` の配信実装
+
+Slackではチャンネル全体ではなくスレッドごとに、この3点を `./outreach bind`
+で固定します。共通ランナーは `LIST → ENRICH → DRAFT → SEND` の順序と
+完了件数の照合を担い、各Skillはチャネル固有の処理だけを提供します。
 
 ## 現在のスキル
 
@@ -16,8 +26,8 @@ OpenClaw エージェントが対話を受け、Python パイプラインが実�
 
 ## 主要機能
 
-- **6フェーズ運用**: Pull → Enrich → Personalize → Approve → Send → Log
-- **マルチ brief**: チャンネルごとに発信人格/設定を切替
+- **4フェーズ共通契約**: List → Enrich → Draft → Send（Verify/LogをSendに内包）
+- **マルチ campaign / persona**: Slackスレッドごとに人格と配信チャネルを独立選択
 - **detached 実行**: 長時間ジョブを別プロセス化し、Slack 応答遅延を回避
 - **自律運用モード**: 初回承認後は自己採点・自動スキップ方針で連続処理
 - **送信レジリエンス（jp-form）**:
@@ -102,6 +112,7 @@ OpenClaw エージェントが対話を受け、Python パイプラインが実�
 ### 運用状態
 
 - `data/channel_state/<channel>.json`: Slack channel ↔ brief バインド
+- `data/thread_state/<channel>/<thread>.json`: campaign/persona/channel のスレッド別バインド
 - `data/system_health/<host>.json`: heartbeat / health 状態
 - `<skill>/data/briefs/<id>/current_task.jsonl`: 現在進行タスク
 - `<skill>/data/briefs/<id>/active_run.lock`: 実行ロック
@@ -126,6 +137,7 @@ OpenClaw エージェントが対話を受け、Python パイプラインが実�
 cd ~/.openclaw/skills
 
 ./brief        list | show | status | bind | unbind | new | write-from-json | stop-run ...
+./outreach     resolve | bind | start | personas
 ./job          start <skill> <stage> --brief <id> ...
 ./healthcheck  ping | status | write-heartbeat | touch-command
 ./report       improvements | draft-quality | send-funnel | needs-attention | prune
@@ -143,7 +155,9 @@ python3 -m venv .venv
 
 cd ~/.openclaw/skills
 cp briefs/torana-line-crm.example.yaml briefs/<your-id>.yaml
-./brief bind --brief <your-id> --channel <slack_channel_id>
+cp personas/_template.yaml personas/<your-persona>.yaml
+./outreach bind --brief <your-id> --persona <your-persona> --channel jp_form \
+  --slack-channel-id <slack_channel_id> --slack-thread-ts <thread_ts>
 ```
 
 watchdog を有効化する場合:

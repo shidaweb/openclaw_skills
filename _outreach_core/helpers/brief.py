@@ -223,7 +223,15 @@ def cmd_unbind(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     ch = args.channel_id or channel_state.slack_channel_id_from_env() or None
-    print(build_status_report(args.brief, channel_id=ch, skill=args.skill))
+    thread_ts = args.thread_ts or channel_state.slack_thread_ts_from_env() or None
+    print(
+        build_status_report(
+            args.brief,
+            channel_id=ch,
+            thread_ts=thread_ts,
+            skill=args.skill,
+        )
+    )
     return 0
 
 
@@ -352,7 +360,8 @@ def main() -> None:
     p = sub.add_parser("status", help="Reconstruct progress from file state (§14-G)")
     p.add_argument("--brief", default=None)
     p.add_argument("--channel-id", default=None)
-    p.add_argument("--skill", default="jp-form-outreach", choices=[s[0] for s in SKILL_DIRS])
+    p.add_argument("--thread-ts", default=None)
+    p.add_argument("--skill", default=None, choices=[s[0] for s in SKILL_DIRS])
 
     p = sub.add_parser("stop-run", help="SIGTERM lock pid and remove active_run.lock")
     p.add_argument("--brief", default=None)

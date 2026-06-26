@@ -6,13 +6,8 @@ brief:
   active_since: "2026-05-26"
   notes: ""
 
-sender:
-  name: ""
-  company: ""
-  role: ""
-  email: ""
-  phone: ""
-  calendar_url: ""
+# Who is speaking. Sender identity and voice live in personas/<id>.yaml.
+persona_id: "your-persona-id"
 
 product:
   name: ""

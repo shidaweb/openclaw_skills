@@ -137,8 +137,8 @@ _REASON_LABEL = {
     "confirm_submit_not_found": "確認画面の最終送信ボタンを自動特定できません",
     "submit_button_not_found": "送信ボタンを自動特定できません",
     "wrong_form_type": "想定と異なるフォーム種別を検出（誤フォームの可能性）",
-    "page_has_no_form": "ページにフォームが存在しません（URL要再精査：リダイレクト/案内ページ/閉鎖の可能性）",
-    "form_vanished_after_fill": "入力後にフォームが消失（バリデーション差し戻し/セッション切れの可能性）",
+    "page_has_no_form": "フォーム未検出（URL再精査が必要）",
+    "form_vanished_after_fill": "入力後にフォーム消失（チャット/iframe/セッション切れの可能性）",
     "submit_gate_unsatisfied": "送信ゲート（同意・必須選択）が未充足のまま送信ボタンに到達できません",
     "wizard_too_deep": "多段フォームのステップ数が上限を超えました",
     "cloudflare_challenge": "Cloudflare bot検知（Turnstile/managed challenge）をブロッキングで検出。突破不可のため手動通過が必要",
@@ -167,10 +167,11 @@ def build_actionable_message(entry: dict[str, Any], *, auto_resolver: bool) -> s
     shot = diag.get("screenshot_path") or ""
 
     lines = [
-        f"⚠️ {name}（{tid}）: {humanize_reason(reason_class)}",
-        f"　検知詳細: {entry.get('reason', reason_class)}",
+        f"⚠️ {name}（{tid}）",
+        f"　原因: {humanize_reason(reason_class)}",
+        f"　詳細: {entry.get('reason', reason_class)}",
         f"　URL: {url}",
-        f"　ページ内ボタン候補（{len(buttons)}）: {btn_preview}",
+        f"　ボタン候補（{len(buttons)}）: {btn_preview}",
     ]
     # v17: show WHERE in the send process it failed, not just the last symptom.
     timeline = diag.get("timeline")
@@ -187,12 +188,10 @@ def build_actionable_message(entry: dict[str, Any], *, auto_resolver: bool) -> s
     if snap:
         lines.append(f"　スナップショット: {snap}")
     if auto_resolver:
-        lines.append("　→ 自動リゾルバに登録しました。本体バッチは止めず継続し、"
-                     "完了後に別プロセスが深掘り再試行します（返信不要）。")
+        lines.append("　対応: 自動リゾルバに登録済み。本体処理は継続します（返信不要）。")
     else:
-        lines.append("　→ リゾルバキューに登録しました。`run.py resolve-queue --brief <id>` "
-                     "で別プロセスが深掘り再試行できます。")
-    lines.append(f"　不要ならスキップ: 「{tid} skip」。手動で送るならURLを開いて確認。")
+        lines.append("　対応: リゾルバキューに登録済み。`run.py resolve-queue --brief <id>` で再試行できます。")
+    lines.append(f"　人手対応: スキップは「{tid} skip」。手動送信はURLを確認してください。")
     return "\n".join(lines)
 
 

@@ -1,7 +1,12 @@
 # Outreach briefs (v4 §14)
 
-Each YAML file defines one sender persona / product / target ICP. Runtime state lives under
-`{skill}/data/briefs/<brief_id>/`.
+Each YAML file defines one campaign: product, target ICP, evidence rules, and
+sequence. Sender identity and voice live separately in `personas/<persona_id>.yaml`.
+Runtime state lives under `{skill}/data/briefs/<brief_id>/`.
+
+Slack thread routing uses the independent tuple
+`campaign + persona + channel`. Use `outreach bind` and `outreach start` for
+normal operation; channel-wide `brief bind` remains a legacy/default fallback.
 
 ## Quick start
 
@@ -42,5 +47,8 @@ echo "torana-line-crm" > briefs/_active.txt   # if not already set
 - `brief status [--brief <id>] [--channel-id C...]` — §14-G file-based progress summary
 - `brief stop-run [--brief <id>]` — stop campaign via active_run.lock pid
 - `brief write-from-json <id> --answers answers.json [--bind-channel C...]` — onboarding output
+- `outreach personas` — available sender personas
+- `outreach bind --brief <id> --persona <id> --channel <jp_form|linkedin> ...` — bind a Slack thread
+- `outreach start ... -- campaign ...` — route to the correct channel Skill and run detached
 
-All `run.py` subcommands accept `--brief <id>` (default: `_active.txt`).
+All `run.py` subcommands accept `--brief <id>` and `--persona <id>`.

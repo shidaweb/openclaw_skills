@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Doorman — C4 改善案（Target Architecture）</title>
+<style>
+  :root {
+    --bg: #0f1419; --panel: #1a2129; --text: #e6edf3; --muted: #9aa7b2;
+    --accent: #4aa8ff; --good: #4ad28a; --warn: #f0a64a; --border: #2b3540; --code-bg: #11181f;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f7f9fb; --panel:#fff; --text:#1c2530; --muted:#5a6b7a; --accent:#1761c4;
+      --good:#1b8a55; --warn:#b4701a; --border:#e1e7ec; --code-bg:#f0f3f6; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP","Segoe UI",sans-serif;
+    line-height:1.7; font-size:15px; }
+  .wrap { max-width:1100px; margin:0 auto; padding:32px 24px 80px; }
+  h1 { font-size:26px; margin:0 0 6px; }
+  h2 { font-size:20px; margin:46px 0 10px; padding-bottom:8px; border-bottom:1px solid var(--border); }
+  h3 { font-size:16px; margin:24px 0 8px; color:var(--accent); }
+  .sub { color:var(--muted); margin:0 0 4px; }
+  .pill { display:inline-block; font-size:12px; font-weight:600; padding:2px 10px; border-radius:999px;
+    background:rgba(74,168,255,.15); color:var(--accent); border:1px solid var(--accent); margin-bottom:14px; }
+  .meta { color:var(--muted); font-size:13px; background:var(--code-bg); border:1px solid var(--border);
+    border-radius:8px; padding:10px 14px; margin:16px 0 0; }
+  a { color:var(--accent); }
+  .diagram { background:var(--panel); border:1px solid var(--border); border-radius:12px;
+    padding:18px; margin:18px 0; overflow-x:auto; text-align:center; }
+  .mermaid { font-size:14px; }
+  ul,ol { padding-left:20px; } li { margin:6px 0; }
+  code { background:var(--code-bg); border:1px solid var(--border); border-radius:5px;
+    padding:1px 6px; font-family:"SF Mono",Menlo,Consolas,monospace; font-size:13px; }
+  .delta { background:var(--panel); border:1px solid var(--border); border-left:3px solid var(--good);
+    border-radius:8px; padding:12px 16px; margin:14px 0; }
+  .delta b { color:var(--good); }
+  .note { background:var(--panel); border:1px solid var(--border); border-left:3px solid var(--warn);
+    border-radius:8px; padding:12px 16px; margin:14px 0; }
+  table { border-collapse:collapse; width:100%; margin:14px 0; font-size:14px; }
+  th,td { border:1px solid var(--border); padding:8px 10px; text-align:left; vertical-align:top; }
+  th { background:var(--code-bg); }
+  footer { margin-top:50px; color:var(--muted); font-size:13px; border-top:1px solid var(--border); padding-top:16px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <span class="pill">TARGET / TO-BE — 改善案</span>
+  <h1>Doorman — C4 改善案アーキテクチャ</h1>
+  <p class="sub">現行（v26 相当）の構造課題を踏まえた<strong>目標形</strong>の <a href="https://c4model.com/" target="_blank" rel="noopener">C4モデル</a>。</p>
+  <p class="sub">中心となる構造変更は「<strong>単一実行権限 + 永続キュー</strong>」「<strong>SQLite を真実の源とするイベント射影</strong>」「<strong>共通パイプラインエンジン + チャンネル戦略</strong>」「<strong>LLM クライアント seam</strong>」「<strong>明示的なターゲット状態機械</strong>」。</p>
+  <p class="meta">これは提案であり、現行実装ではありません。現行構造は <code>docs/c4-architecture.html</code> を参照。各図に「現行との差分」を併記しています。</p>
+
+  <h2>改善の狙い（なぜ作り直すか）</h2>
+  <p>現行は本番インシデントごとの信頼性パッチ（v4→v26）の積層で、<code>host_role</code> のプライマリホスト・ゲーティング、<code>run_supervisor</code> の stall 検知＆再起動、「再起動で冪等」回復、detached プロセス監視、ファイルベース状態——これらは本来「<strong>1つの永続キュー + 単一実行権限 + 共有状態ストア</strong>」という構造プリミティブの手作り代替です。この目標形は、それらを1つの枯れたパターンへ畳み込み、二重送信を<em>規約</em>ではなく<em>構造</em>として封じます。</p>
+
+  <h2>L1 — System Context</h2>
+  <p>外部関係は現行とほぼ同じ。違いは<strong>境界を明確化</strong>した点：OpenClaw + Claude を一貫して外部プラットフォームとして扱い、reCAPTCHA/Turnstile を「解かず回避する相手」として明示する。</p>
+  <div class="diagram">
+    <pre class="mermaid">
+C4Context
+    title System Context (Target) — Doorman
+
+    Person(operator, "運用者", "Slackで指示・送信承認（Nori / チーム）")
+
+    System(doorman, "Doorman", "アウトリーチ運用基盤。キュー駆動・単一実行権限・共有状態で6フェーズを自動化")
+
+    System_Ext(slack, "Slack", "指示の受け口 / 片方向通知")
+    System_Ext(openclaw, "OpenClaw + Claude (外部基盤)", "会話=Opus / サブタスク=Sonnet。下書き・フォーム解析を担う実行基盤")
+    System_Ext(jpforms, "日本企業の問い合わせフォーム", "送信先サイト")
+    System_Ext(linkedin, "LinkedIn", "InMail 送信先")
+    System_Ext(captcha, "reCAPTCHA / Turnstile", "解かず『誘発を避け学習する』相手")
+
+    Rel(operator, slack, "指示・承認", "チャット")
+    Rel(slack, doorman, "コマンド投入 / 通知受信", "OpenClawエージェント")
+    Rel(doorman, openclaw, "下書き・フォーム解析", "LLMクライアント")
+    Rel(doorman, jpforms, "フォーム送信", "ブラウザ自動操作")
+    Rel(doorman, linkedin, "InMail 送信", "ブラウザ自動操作")
+    Rel(doorman, captcha, "誘発回避・スコア学習", "warmup / 観測")
+
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="2")
+    </pre>
+  </div>
+  <div class="delta"><b>現行との差分:</b> OpenClaw の二重描画（外部/内部）を解消し外部基盤に統一。reCAPTCHA/Turnstile を外部要素として明示。</div>
+
+  <h2>L2 — Container（目標形）</h2>
+  <p>「Slackフロント → 受付 → <strong>永続キュー</strong> → <strong>単一 worker</strong> → 共通パイプラインエンジン → チャンネル戦略 / 送信ドライバ」。状態は <strong>SQLite（真実の源）+ append-only イベントログ</strong>。</p>
+  <div class="diagram">
+    <pre class="mermaid">
+C4Container
+    title Container (Target) — Doorman
+
+    Person(operator, "運用者", "Slackで指示・承認")
+    System_Ext(slack, "Slack", "指示 / 通知")
+    System_Ext(openclaw_llm, "OpenClaw + Claude", "Opus / Sonnet")
+    System_Ext(websites, "送信先サイト", "JPフォーム / LinkedIn")
+
+    System_Boundary(doorman, "Doorman") {
+        Container(agent, "OpenClawエージェント", "OpenClaw + Opus", "Slack会話を解釈し、ジョブをキューへ投入するフロント")
+        Container(intake, "受付 / ディスパッチャ", "Python (CLI + enqueue)", "コマンドを検証しジョブを永続キューへ。即座にrun_idを返す（送信はしない）")
+        ContainerQueue(queue, "永続ジョブキュー", "SQLite-backed queue", "唯一の発火源。visibility-timeout/再配信で stall 回復・冪等を吸収")
+        Container(worker, "単一実行 Worker", "Python (1 leader / host)", "primary host のみがリースを取得し実行。多重送信を構造的に防止")
+        Container(engine, "パイプラインエンジン", "Python (_outreach_core)", "6フェーズ orchestration を共通化。LLMなしの決定論部（verify/progress/history/report）も内包")
+        Container(channels, "チャンネル戦略", "Python (jp-form / linkedin プラグイン)", "差分のみ実装：ターゲットschema と send-step。エンジンが呼び出す")
+        Container(senddriver, "送信ドライバ", "Python (observe→classify→act)", "型付きページ状態に基づく閉ループ送信。全チャンネル共通")
+        Container(browser, "ブラウザアダプタ seam", "Python (OpenClaw / Playwright)", "get_browser() で背後実装を切替")
+        Container(llmclient, "LLMクライアント seam", "Python (API/SDK + CLI 実装)", "構造化出力・リトライ・テスト可能。oc_infer subprocess を1実装に格下げ")
+        Container(resolver, "エスカレーション・レゾルバ", "Python (typed actions)", "blocked ターゲットに型付き解決アクション。人間/自動の両方が作用可能")
+        Container(notify, "通知モジュール", "Python", "片方向Slack通知（Webhook / Bot）")
+        ContainerDb(store, "状態ストア（真実の源）", "SQLite", "ターゲット状態機械・送信済み判定・ステータス・レポートを集約クエリ")
+        ContainerDb(eventlog, "イベントログ", "append-only JSONL", "監査用の追記ログ。SQLiteへ射影され再構築可能")
+    }
+
+    Rel(operator, slack, "指示・承認")
+    Rel(slack, agent, "メッセージ", "Slack API")
+    Rel(agent, intake, "コマンド", "subprocess / call")
+    Rel(intake, queue, "ジョブ投入", "enqueue")
+    Rel(worker, queue, "リース取得・ack", "lease / visibility-timeout")
+    Rel(worker, engine, "実行駆動", "call")
+    Rel(engine, channels, "差分ステップ呼出", "strategy")
+    Rel(engine, senddriver, "送信を委譲", "observe→act")
+    Rel(senddriver, browser, "ページ操作", "evaluate / browser()")
+    Rel(browser, websites, "入力・送信", "自動操作")
+    Rel(engine, llmclient, "下書き・解析", "infer")
+    Rel(llmclient, openclaw_llm, "推論呼出", "API / CLI")
+    Rel(engine, store, "状態遷移・dedup", "SQL")
+    Rel(engine, eventlog, "イベント追記", "append")
+    Rel(eventlog, store, "射影", "project")
+    Rel(senddriver, resolver, "blocker報告", "typed")
+    Rel(resolver, store, "解決状態更新", "SQL")
+    Rel(engine, notify, "結果通知")
+    Rel(notify, slack, "通知")
+
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
+    </pre>
+  </div>
+  <div class="delta"><b>現行との差分（主要 5 点）:</b>
+    <ol>
+      <li><b>永続キュー + 単一 Worker</b> を新設 → <code>run_supervisor</code> の stall/再起動・「再起動で冪等」・detached監視を吸収。</li>
+      <li><b>SQLite を真実の源</b>に → JSONL は監査イベントログに格下げ（射影元として維持）。「2台が食い違う」系を構造的に排除。</li>
+      <li><b>パイプラインエンジン + チャンネル戦略</b> → jp-form/linkedin の <code>run.py</code> 二重実装を解消。</li>
+      <li><b>LLMクライアント seam</b> → ブラウザと同様に推論も抽象化。<code>oc_infer</code> subprocess は1実装に。</li>
+      <li><b>送信ドライバ（v24ループ）を全チャンネル共通の唯一のドライバ</b>へ昇格。レゾルバは型付きアクション化。</li>
+    </ol>
+  </div>
+
+  <h2>Deployment — 多ホストと送信権限</h2>
+  <p>現行で最重要なのに図に出ていなかった軸。<strong>送信できるのは Worker のリースを保持する1台だけ</strong>。dev機は worker を起動しないので、CLIを叩いても・Slackが誤配信しても、構造的に送信できない。</p>
+  <div class="diagram">
+    <pre class="mermaid">
+C4Deployment
+    title Deployment (Target) — 単一実行権限
+
+    Deployment_Node(prod, "本番ホスト (Mac Mini)", "primary") {
+        Deployment_Node(prod_rt, "OpenClaw ランタイム", "Slack接続あり") {
+            Container(agent_p, "エージェント + 受付", "Opus", "Slack指示をキューへ投入")
+            Container(worker_p, "Worker (leader)", "Python", "キューのリースを保持＝唯一の送信主体")
+            ContainerDb(db_p, "状態ストア", "SQLite", "真実の源 + イベントログ")
+            Container(wd_p, "外部watchdog", "stdlib only", "venv破損でも独立稼働しgatewayを復旧")
+        }
+    }
+    Deployment_Node(dev, "開発ホスト (MacBook Pro)", "non-primary") {
+        Deployment_Node(dev_rt, "OpenClaw ランタイム", "Slack非接続") {
+            Container(agent_d, "エージェント（開発）", "—", "worker を起動しない＝send不可")
+        }
+    }
+    Deployment_Node(saas, "Slack", "SaaS") {
+        Container(slack_n, "Slack ワークスペース", "API", "ONEゲートウェイにのみ接続")
+    }
+
+    Rel(slack_n, agent_p, "コマンド配信", "単一接続")
+    Rel(agent_p, worker_p, "enqueue → lease", "SQLite queue")
+    Rel(worker_p, db_p, "状態/dedup", "SQL")
+    Rel(wd_p, worker_p, "死活監視・復旧", "health/restart")
+    </pre>
+  </div>
+  <div class="delta"><b>現行との差分:</b> 「devは送信を拒否する」procedural guard（<code>host_role</code>）から、「<b>worker リースを持つ1台しか送れない</b>」structural guard へ。watchdog の stdlib-only 独立稼働（venv破損耐性）は維持。</div>
+
+  <h2>Dynamic — ターゲットのライフサイクル状態機械</h2>
+  <p>現行では複数 JSONL に暗黙分散していた状態を、明示的な状態機械として SQLite に集約。各 <code>blocked</code> は<strong>理由つき</strong>で、レゾルバの<strong>型付きアクション</strong>に対応する。</p>
+  <div class="diagram">
+    <pre class="mermaid">
+stateDiagram-v2
+    [*] --> queued
+    queued --> enriched : enrich
+    enriched --> drafted : LLM draft
+    drafted --> awaiting_approval : preview
+    awaiting_approval --> sending : approve / auto
+    awaiting_approval --> skipped : reject
+    sending --> sent : verify OK
+    sending --> blocked : captcha / submit-not-found / content-rejected
+    blocked --> sending : typed resolve action
+    blocked --> skipped : unviable domain learned
+    sent --> [*]
+    skipped --> [*]
+</pre>
+  </div>
+  <div class="delta"><b>現行との差分:</b> <code>sent_history</code>/<code>skip_history</code>/<code>events</code>/<code>resolve_queue</code> に散っていた状態を1つの遷移モデルへ。<code>blocked → sending</code> は「同じ検出の再試行」ではなく型付き解決アクションで起こす。</div>
+
+  <h2>移行の順序（インクリメンタル）</h2>
+  <table>
+    <tr><th>段階</th><th>内容</th><th>得られるもの</th></tr>
+    <tr><td>1</td><td>SQLite を「送信済み判定」の真実の源に（JSONL から射影）</td><td>多ホストの食い違い解消・dedup の信頼化</td></tr>
+    <tr><td>2</td><td>SQLite-backed キュー + 単一 worker を導入、<code>run_job</code> をその上に再実装</td><td><code>run_supervisor</code>/再起動冪等を吸収、送信権限が構造化</td></tr>
+    <tr><td>3</td><td>6フェーズを engine に抽出、jp-form/linkedin を戦略プラグイン化</td><td>二重実装の解消・パッチ適用面が半減</td></tr>
+    <tr><td>4</td><td>LLMクライアント seam を切る（CLI 実装を温存しつつ API 実装追加）</td><td>テスト容易性・構造化出力・起動コスト減</td></tr>
+    <tr><td>5</td><td>送信ドライバ統一 + レゾルバ型付きアクション</td><td>送信信頼性の一元化・回復の原則化</td></tr>
+  </table>
+
+  <div class="note"><b>変えない方がよい資産:</b> 決定論と LLM の分離 / append-only イベントログ（射影元として残す）/ ブラウザのアダプタ seam（即ロールバック）/ watchdog の stdlib-only 独立性。目標形はこれらを壊さず、その上に構造プリミティブを足す方針です。</div>
+
+  <footer>C4 改善案（Context / Container / Deployment / Dynamic） — openclaw_skills / to-be design</footer>
+</div>
+
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+  const dark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+  mermaid.initialize({ startOnLoad: true, theme: dark ? "dark" : "default", c4: { diagramMarginX: 20 } });
+</script>
+</body>
+</html>

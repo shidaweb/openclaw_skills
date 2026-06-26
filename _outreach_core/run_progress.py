@@ -23,6 +23,18 @@ FILENAME = "run_progress.json"
 HTML_FILENAME = "run_progress.html"
 _REFRESH_SEC = 4  # browser auto-reload cadence while a run is active
 
+_STAGE_LABEL = {
+    "campaign": "キャンペーン",
+    "list": "リスト作成",
+    "fetch-leads": "リスト取得",
+    "fetch-from-csv": "CSV取込",
+    "enrich": "フォーム調査",
+    "draft": "ドラフト作成",
+    "send": "送信",
+    "resolve": "リゾルバ",
+    "research": "調査",
+}
+
 # outcome (from _send_one_target) → counter bucket
 _OUTCOME_BUCKET = {
     "sent": "sent",
@@ -30,6 +42,7 @@ _OUTCOME_BUCKET = {
     "skipped": "skipped",
     "queued": "needs_attention",
     "crashed": "needs_attention",
+    "timed_out": "needs_attention",
 }
 
 
@@ -228,6 +241,7 @@ def format_summary(snap: dict[str, Any] | None, *, now: datetime | None = None) 
     if not snap:
         return "進捗データなし（run_progress.json が見つかりません）"
     stage = snap.get("stage", "?")
+    stage_label = _STAGE_LABEL.get(str(stage), str(stage))
     total = int(snap.get("total", 0))
     processed = int(snap.get("processed", 0))
     sent = int(snap.get("sent", 0))
@@ -235,8 +249,8 @@ def format_summary(snap: dict[str, Any] | None, *, now: datetime | None = None) 
     na = int(snap.get("needs_attention", 0))
     status = snap.get("status", "?")
     parts = [
-        f"{stage} {processed}/{total}",
-        f"送信 {sent}",
+        f"{stage_label} {processed}/{total}",
+        f"送信OK {sent}",
         f"スキップ {skipped}",
         f"要対応 {na}",
     ]

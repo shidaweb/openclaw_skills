@@ -67,6 +67,9 @@ linkedin-outreach/loop_until_10.sh
 # Ship only the neutral templates (system_persona.md / examples.md); each client
 # keeps its tuned copy as *.local.md (loader prefers it automatically).
 **/prompts/*.local.md
+personas/*.yaml
+!personas/_template.yaml
+!personas/*.example.yaml
 # Active-brief pointer is per-client (which brief this install runs).
 briefs/_active.txt
 
@@ -91,6 +94,7 @@ briefs/*.yaml
 # Target lists are local-only; keep only example templates
 **/targets/*.yaml
 **/targets/*.csv
+**/targets/*.bak*
 !**/targets/*.example.yaml
 !**/targets/*.example.csv
 

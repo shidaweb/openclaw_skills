@@ -70,6 +70,11 @@ class TestSendPerLeadIsolation(unittest.TestCase):
     def _stage_send(self, tmp: Path, drafts: Path, send_one, ids=None):
         m = self.run_mod
         _FakeHeartbeat.instances = []
+        emitted = []
+
+        def emit_event(*args, **kwargs):
+            emitted.append((args, kwargs))
+
         # v20 primary-host guard must not depend on THIS machine's hostname /
         # data/primary_host — patch it open so the tests run on any host.
         from _outreach_core import host_role
@@ -79,11 +84,14 @@ class TestSendPerLeadIsolation(unittest.TestCase):
              patch.object(m, "HeartbeatSession", _FakeHeartbeat), \
              patch.object(m, "_send_one_target", side_effect=send_one), \
              patch.object(m, "_close_tab_safely"), \
-             patch.object(m, "_emit_event"), \
+             patch.object(m, "_emit_event", side_effect=emit_event), \
              patch.object(m, "append_sent_history"), \
+             patch("_outreach_core.notify.post_problem", return_value=False), \
              patch.object(m.time, "sleep"):
             m.stage_send(drafts, ids or {1, 2}, mode="auto", config={"sender": {}})
-        return _FakeHeartbeat.instances[-1]
+        hb = _FakeHeartbeat.instances[-1]
+        hb.events = emitted
+        return hb
 
     def test_crash_in_one_lead_does_not_kill_batch(self) -> None:
         """§R acceptance 1: an exception in lead 1 → batch continues, needs_attention recorded."""
@@ -104,10 +112,52 @@ class TestSendPerLeadIsolation(unittest.TestCase):
 
             self.assertEqual(calls, ["t1", "t2"], "batch must continue past the crash")
             self.assertTrue(hb.ended, "hb.end must run")
+            target_outcomes = [
+                e for e in hb.events
+                if e[0] and e[0][0] == "send.target_outcome"
+            ]
+            self.assertEqual(len(target_outcomes), 2)
             na = tmp / "needs_attention.jsonl"
             self.assertTrue(na.exists())
             rows = [json.loads(l) for l in na.read_text().splitlines() if l.strip()]
             self.assertTrue(any("lead_crashed" in str(r.get("reason")) for r in rows))
+
+    def test_soft_timeout_in_one_lead_does_not_kill_batch(self) -> None:
+        """A wedged lead is routed to needs_attention and the next target runs."""
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            drafts = tmp / "drafts.jsonl"
+            _write_drafts(drafts, ["t1", "t2"])
+
+            calls: list[str] = []
+            m = self.run_mod
+
+            def send_one(d, **kw):
+                calls.append(d["id"])
+                if d["id"] == "t1":
+                    raise m.LeadSoftTimeoutError("lead_soft_timeout after 1s")
+                return {"outcome": "done"}
+
+            hb = self._stage_send(tmp, drafts, send_one)
+
+            self.assertEqual(calls, ["t1", "t2"], "batch must continue past timeout")
+            self.assertTrue(hb.ended, "hb.end must run")
+            target_outcomes = [
+                e for e in hb.events
+                if e[0] and e[0][0] == "send.target_outcome"
+            ]
+            target_timeouts = [
+                e for e in hb.events
+                if e[0] and e[0][0] == "send.target_timeout"
+            ]
+            self.assertEqual(len(target_outcomes), 2)
+            self.assertEqual(len(target_timeouts), 1)
+            rows = [
+                json.loads(l)
+                for l in (tmp / "needs_attention.jsonl").read_text().splitlines()
+                if l.strip()
+            ]
+            self.assertTrue(any("lead_soft_timeout" in str(r.get("reason")) for r in rows))
 
     def test_hb_end_runs_even_when_loop_raises(self) -> None:
         """§R acceptance 2: non-KeyboardInterrupt escaping the loop still ends hb."""
@@ -161,6 +211,38 @@ class TestSendPerLeadIsolation(unittest.TestCase):
                 if l.strip()
             ]
             self.assertTrue(any("unverified_prior_attempt" in str(r.get("reason")) for r in rows))
+
+    def test_interrupted_before_submit_is_parked_and_batch_resumes(self) -> None:
+        """A prior no-output kill before submit is parked so restart continues with next target."""
+        from _outreach_core import send_journal as sj
+
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            drafts = tmp / "drafts.jsonl"
+            _write_drafts(drafts, ["t1", "t2"])
+            sj.append_journal(tmp, "t1", sj.PHASE_TARGET_STARTED, form_url="https://t1.example.co.jp/contact")
+
+            calls: list[str] = []
+
+            def send_one(d, **kw):
+                calls.append(d["id"])
+                return {"outcome": "done"}
+
+            self._stage_send(tmp, drafts, send_one)
+
+            self.assertEqual(calls, ["t2"], "interrupted t1 must be parked, not retried")
+            rows = [
+                json.loads(l)
+                for l in (tmp / "needs_attention.jsonl").read_text().splitlines()
+                if l.strip()
+            ]
+            self.assertTrue(any("interrupted_before_submit" in str(r.get("reason")) for r in rows))
+            journal = sj.load_journal(tmp)
+            finished = [
+                r for r in journal
+                if r.get("target_id") == "t1" and r.get("phase") == sj.PHASE_TARGET_FINISHED
+            ]
+            self.assertTrue(finished, "parking the interrupted target must close the checkpoint")
 
 
 class TestEnrichPerLeadIsolation(unittest.TestCase):

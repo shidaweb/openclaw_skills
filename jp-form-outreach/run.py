@@ -14,11 +14,14 @@ State files live in ./data/*.jsonl  (append-only, resumable).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from datetime import datetime
@@ -34,8 +37,10 @@ from _outreach_core import avoidance as core_avoidance
 from _outreach_core import captcha as core_captcha
 from _outreach_core import content_guard as core_content_guard
 from _outreach_core import contact_url as core_contact_url
+from _outreach_core import outcomes as core_outcomes
 from _outreach_core import resolve_queue as core_resolve_queue
 from _outreach_core import run_progress as core_progress
+from _outreach_core import run_supervisor as core_run_supervisor
 from _outreach_core import send_journal as core_send_journal
 from _outreach_core import send_state as core_send_state
 from _outreach_core import send_timeline as core_timeline
@@ -44,7 +49,7 @@ from _outreach_core import tab_utils as core_tab_utils
 from _outreach_core import infer as core_infer
 from _outreach_core import preview as core_preview
 from _outreach_core import prompt as core_prompt
-from _outreach_core.config import BriefError, load_merged_config
+from _outreach_core.config import BriefError, load_merged_config as core_load_merged_config
 from _outreach_core.paths import SkillPaths, resolve_skill_paths
 from _outreach_core.progress import HeartbeatSession, resolve_heartbeat_mode
 from _outreach_core.verify import (
@@ -64,32 +69,52 @@ except ImportError:
 SKILL_DIR = Path(__file__).resolve().parent
 _PATHS: SkillPaths | None = None
 BRIEF_ID = ""
+PERSONA_ID: str | None = None
 DATA_DIR = SKILL_DIR / "data"
 PROMPTS_DIR = SKILL_DIR / "prompts"
 
 DEFAULT_MODEL = core_infer.DEFAULT_MODEL
 BROWSER_PROFILE = core_infer.BROWSER_PROFILE
 RATE_LIMIT_SECONDS = 4
+DEFAULT_PER_TARGET_TIMEOUT_SEC = 300
+DEFAULT_SEND_LEAD_SOFT_TIMEOUT_SEC = DEFAULT_PER_TARGET_TIMEOUT_SEC
 
 SKIP_HISTORY_PATH = DATA_DIR / "skip_history.jsonl"
 SENT_HISTORY_PATH = DATA_DIR / "sent_history.jsonl"
 
 
-def configure_brief(brief_id: str | None, *, cmd: str = "") -> SkillPaths:
+def load_merged_config(skill_dir: Path, brief_id: str | None = None) -> dict[str, Any]:
+    """Load this channel's campaign + selected persona configuration."""
+    return core_load_merged_config(
+        skill_dir,
+        brief_id,
+        persona_id=PERSONA_ID,
+        channel="jp_form",
+    )
+
+
+def configure_brief(
+    brief_id: str | None,
+    *,
+    persona_id: str | None = None,
+    cmd: str = "",
+) -> SkillPaths:
     """Resolve brief, data/briefs/<id>/, targets/<id>.yaml, and prompt overrides."""
-    global _PATHS, BRIEF_ID, DATA_DIR, PROMPTS_DIR, SKIP_HISTORY_PATH, SENT_HISTORY_PATH
+    global _PATHS, BRIEF_ID, PERSONA_ID, DATA_DIR, PROMPTS_DIR, SKIP_HISTORY_PATH, SENT_HISTORY_PATH
     _PATHS = resolve_skill_paths(SKILL_DIR, brief_id, channel="jp_form")
     BRIEF_ID = _PATHS.brief_id
+    PERSONA_ID = persona_id
     DATA_DIR = _PATHS.data_dir
     SKIP_HISTORY_PATH = DATA_DIR / "skip_history.jsonl"
     SENT_HISTORY_PATH = DATA_DIR / "sent_history.jsonl"
     try:
         cfg = load_merged_config(SKILL_DIR, BRIEF_ID)
-        PROMPTS_DIR = core_prompt.resolve_prompts_dir(SKILL_DIR, cfg)
+        PERSONA_ID = cfg.get("_persona_id")
+        PROMPTS_DIR = core_prompt.resolve_prompts_dir(SKILL_DIR, cfg, channel="jp_form")
     except (FileNotFoundError, BriefError):
         PROMPTS_DIR = SKILL_DIR / "prompts"
     if cmd in ("campaign", "bootstrap", "send", "draft", "enrich", "preview"):
-        print(f"[{cmd}] brief={BRIEF_ID} · skill=jp-form-outreach")
+        print(f"[{cmd}] brief={BRIEF_ID} · persona={PERSONA_ID or 'legacy-inline'} · channel=jp_form")
     return _PATHS
 
 
@@ -653,6 +678,70 @@ def _start_stdout_heartbeat(interval: float = 60.0) -> None:
             print(f"[heartbeat] alive · {label} · elapsed={elapsed}s", flush=True)
 
     threading.Thread(target=_beat, daemon=True, name="stdout-heartbeat").start()
+
+
+class LeadSoftTimeoutError(TimeoutError):
+    """Raised when one target spends too long inside the send pipeline."""
+
+
+def _send_lead_soft_timeout_sec(config: dict[str, Any] | None) -> int:
+    """Per-target send timeout.
+
+    Workaround for browser/site/CLI stalls: if one company gets wedged, route
+    that company to needs_attention and continue the batch. Override with
+    ``DOORMAN_SEND_LEAD_TIMEOUT_SEC`` or ``execution.per_target_timeout_sec``.
+    ``send.lead_soft_timeout_sec`` is still accepted for existing briefs. Set
+    <=0 to disable.
+    """
+    raw: Any = os.environ.get("DOORMAN_SEND_LEAD_TIMEOUT_SEC", "").strip()
+    exec_cfg = (config or {}).get("execution") or {}
+    send_cfg = (config or {}).get("send") or {}
+    if raw == "":
+        raw = exec_cfg.get("per_target_timeout_sec")
+    if raw in (None, ""):
+        raw = send_cfg.get("lead_soft_timeout_sec")
+    if raw in (None, ""):
+        return DEFAULT_SEND_LEAD_SOFT_TIMEOUT_SEC
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_SEND_LEAD_SOFT_TIMEOUT_SEC
+
+
+@contextlib.contextmanager
+def _lead_soft_timeout(seconds: int, *, target_id: str) -> Any:
+    """Interrupt a single target if it exceeds ``seconds``.
+
+    ``subprocess.run`` kills its child on exceptions raised while waiting, so
+    this also prevents a wedged OpenClaw subprocess from surviving the timeout.
+    """
+    if seconds <= 0 or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    if not hasattr(signal, "SIGALRM") or not hasattr(signal, "setitimer"):
+        yield
+        return
+
+    started_at = time.time()
+
+    def _raise_timeout(_signum: int, _frame: Any) -> None:
+        if not core_run_supervisor.should_abort_target(started_at, time.time(), seconds):
+            return
+        raise LeadSoftTimeoutError(
+            f"lead_soft_timeout after {seconds}s (target_id={target_id})"
+        )
+
+    prev_handler = signal.getsignal(signal.SIGALRM)
+    prev_timer = signal.setitimer(signal.ITIMER_REAL, 0)
+    signal.signal(signal.SIGALRM, _raise_timeout)
+    signal.setitimer(signal.ITIMER_REAL, float(seconds))
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, prev_handler)
+        if prev_timer and prev_timer[0] > 0:
+            signal.setitimer(signal.ITIMER_REAL, prev_timer[0], prev_timer[1])
 
 
 def _list_page_links() -> list[dict[str, str]]:
@@ -1538,7 +1627,8 @@ def stage_preview(input_path: Path, interactive_send: bool = True,
     into stage_send. Mirrors linkedin-outreach's preview UX (canonical
     Approve phase of the 6-phase outreach pattern).
     """
-    drafts = [json.loads(l) for l in input_path.open()]
+    with input_path.open(encoding="utf-8") as f:
+        drafts = [json.loads(l) for l in f if l.strip()]
     skipped = [d for d in drafts if d["draft"].get("subject") == "SKIP"]
     sendable = [d for d in drafts if d["draft"].get("subject") != "SKIP"]
     sent_ids = load_sent_set()
@@ -1649,7 +1739,7 @@ def _run_autonomous_send(
     drafts_path: Path,
     cfg: dict[str, Any],
     sendable: list[dict[str, Any]],
-) -> None:
+) -> dict[str, Any]:
     """Autonomous Phases 4-6.
 
     Gate: if upfront approval is required and not yet granted, post the brief +
@@ -1679,14 +1769,14 @@ def _run_autonomous_send(
             payload={"sendable": len(sendable), "brief": BRIEF_ID},
         )
         print(f"\n[campaign] 承認後に再実行すると全件自動送信します。")
-        return
+        return {"selected": 0, "sent": 0, "pending": len(sendable), "skipped": 0, "failed": 0}
 
     print(f"\n{bar}\n[4-6/6] AUTONOMOUS SEND — hands-off (no per-item confirm)\n{bar}")
     ids = _resolve_ids_arg(None, True, drafts_path, cmd_name="campaign")
     if not ids:
         print("[campaign] no sendable drafts left to auto-send")
-        return
-    stage_send(drafts_path, ids, mode="auto", config=cfg, heartbeat="auto")
+        return {"selected": 0, "sent": 0, "pending": 0, "skipped": 0, "failed": 0}
+    stats = stage_send(drafts_path, ids, mode="auto", config=cfg, heartbeat="auto") or {}
 
     # Auto-resolver pass (§16): the main batch never stopped on a hard form — it
     # queued those targets. Now that the browser is free, deep-resolve them in the
@@ -1694,6 +1784,13 @@ def _run_autonomous_send(
     if core_resolve_queue.pending(DATA_DIR):
         print(f"\n{bar}\n[resolver] queued blockers → deep resolve pass\n{bar}")
         stage_resolve_queue(cfg)
+    return {
+        "selected": int(stats.get("selected") or len(ids)),
+        "sent": int(stats.get("sent") or 0),
+        "pending": int(stats.get("pending") or 0),
+        "skipped": int(stats.get("skipped") or 0),
+        "failed": int(stats.get("failed") or 0),
+    }
 
 
 def _resolver_failure_detail(
@@ -1773,7 +1870,7 @@ def stage_resolve_queue(config: dict[str, Any] | None = None) -> None:
     core_progress.transition(DATA_DIR, "resolve", len(queue), brief=BRIEF_ID)
     hb = HeartbeatSession(SKILL_DIR, "resolve", len(queue), heartbeat="auto", data_dir=DATA_DIR)
     hb.start(f"deep-resolve {len(queue)} targets")
-    resolved, skipped = [], []
+    resolved, skipped, skipped_details = [], [], []
 
     for i, entry in enumerate(queue, 1):
         tid = str(entry.get("target_id"))
@@ -1782,6 +1879,7 @@ def stage_resolve_queue(config: dict[str, Any] | None = None) -> None:
         if not d:
             core_resolve_queue.mark(DATA_DIR, tid, "skipped", note="draft not found")
             skipped.append(name)
+            skipped_details.append(f"{name}: 下書きが見つかりません")
             core_progress.bump(DATA_DIR, outcome="skipped", name=name)
             hb.tick(i, f"{name} skipped: draft not found")
             continue
@@ -1815,7 +1913,13 @@ def stage_resolve_queue(config: dict[str, Any] | None = None) -> None:
             result = _deep_submit(d, body, config, trace=trace, flow=flow,
                                   verify_strict=True, iterative_fill=True)
         vres = result.get("vresult")
-        outcome = handle_verify_result(d, vres, DATA_DIR, channel="jp_form") if vres else "failed"
+        outcome = (
+            handle_verify_result(
+                d, vres, DATA_DIR, channel="jp_form", record_attention=False
+            )
+            if vres
+            else "failed"
+        )
         if outcome == "sent_ok":
             append_sent_history([d])
             core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SENT)
@@ -1833,6 +1937,8 @@ def stage_resolve_queue(config: dict[str, Any] | None = None) -> None:
             )
             print(f"  [resolver] ⏭ {name} 自動解決できず → skip 記録 ({detail})")
             skipped.append(name)
+            label = core_resolve_queue.humanize_reason(str(entry.get("reason_class") or "unknown"))
+            skipped_details.append(f"{name}: {label}")
             progress_outcome = "skipped"
         _emit_event(
             "resolver.target_outcome",
@@ -1854,9 +1960,21 @@ def stage_resolve_queue(config: dict[str, Any] | None = None) -> None:
 
     hb.end(f"resolve done · sent={len(resolved)} · skipped={len(skipped)}")
     core_progress.finish(DATA_DIR)
-    msg = (f"🔧 リゾルバ完了: 自動送信 {len(resolved)} / スキップ {len(skipped)}\n"
-           f"  送信: {('、'.join(resolved)) or 'なし'}\n"
-           f"  スキップ: {('、'.join(skipped)) or 'なし'}")
+    def _join_preview(items: list[str], *, limit: int = 8) -> str:
+        if not items:
+            return "なし"
+        shown = items[:limit]
+        tail = f" ほか{len(items) - limit}件" if len(items) > limit else ""
+        return "、".join(shown) + tail
+
+    msg = (
+        f"🔧 リゾルバ完了: 送信OK {len(resolved)} / 未送信 {len(skipped)}\n"
+        f"  送信OK: {_join_preview(resolved)}\n"
+        f"  未送信: {_join_preview(skipped)}\n"
+        f"  理由: {_join_preview(skipped_details, limit=6)}"
+    )
+    if skipped:
+        msg += "\n  次アクション: URL再精査または手動送信対象です。"
     print(f"\n[resolver] {msg}")
     try:
         notify_post(msg, level="info")
@@ -1870,6 +1988,7 @@ def stage_campaign(
     skip_enrich: bool,
     skip_send: bool,
     include_sent: bool = False,
+    include_skipped: bool = False,
     refine: bool = False,
     limit: int | None = None,
     only_ids: list[str] | None = None,
@@ -1911,73 +2030,115 @@ def stage_campaign(
             )
             return
 
+        from _outreach_core.campaign import (
+            CampaignContext,
+            CampaignRunner,
+            FunctionChannelAdapter,
+            PhaseResult,
+        )
+
         if clean:
             for f in ("leads.jsonl", "enriched.jsonl", "drafts.jsonl"):
                 (DATA_DIR / f).unlink(missing_ok=True)
-            print(f"[campaign] cleared previous run state")
+            print("[campaign] cleared previous run state")
 
-        # --- Phase 1: Pull ---
-        print(f"\n{bar}\n[1/6] PULL — bootstrap targets from {targets_path.name}\n{bar}")
-        stage_bootstrap(
-            targets_path,
-            DATA_DIR / "leads.jsonl",
-            include_sent=include_sent,
-            limit=limit,
-            only_ids=only_ids,
+        context = CampaignContext(
+            brief_id=BRIEF_ID,
+            persona_id=PERSONA_ID,
+            channel="jp_form",
+            skill="jp-form-outreach",
+            data_dir=DATA_DIR,
+            slack_channel_id=slack_ch,
+            slack_thread_ts=slack_ts,
+            run_id=run_id,
         )
-        leads_n = sum(1 for line in (DATA_DIR / "leads.jsonl").open() if line.strip())
-        if leads_n == 0:
-            print(f"\n[campaign] no targets after pull — aborting")
-            return
-        print(f"\n[campaign] → {leads_n} targets pulled")
+        phase_state: dict[str, Any] = {}
 
-        # --- Phase 2: Enrich ---
-        if skip_enrich:
-            print(f"\n{bar}\n[2/6] ENRICH — SKIPPED (using --skip-enrich, leads passed through)\n{bar}")
-            import shutil
+        def do_list(_ctx: CampaignContext) -> PhaseResult:
+            print(f"\n{bar}\n[1/4] LIST — bootstrap targets from {targets_path.name}\n{bar}")
+            stage_bootstrap(
+                targets_path,
+                DATA_DIR / "leads.jsonl",
+                include_sent=include_sent,
+                include_skipped=include_skipped,
+                limit=limit,
+                only_ids=only_ids,
+            )
+            count = sum(1 for line in (DATA_DIR / "leads.jsonl").open() if line.strip())
+            if count == 0:
+                return PhaseResult("list", status="failed", detail={"reason": "no targets"})
+            return PhaseResult("list", total=count, ready=count)
 
-            shutil.copy(DATA_DIR / "leads.jsonl", DATA_DIR / "enriched.jsonl")
-        else:
-            print(f"\n{bar}\n[2/6] ENRICH — form structure detection\n{bar}")
-            stage_enrich(DATA_DIR / "leads.jsonl", DATA_DIR / "enriched.jsonl", config=cfg)
+        def do_enrich(_ctx: CampaignContext) -> PhaseResult:
+            print(f"\n{bar}\n[2/4] ENRICH — form structure detection\n{bar}")
+            if skip_enrich:
+                import shutil
 
-        enriched_n = sum(1 for line in (DATA_DIR / "enriched.jsonl").open() if line.strip())
-        if enriched_n == 0:
-            print(f"\n[campaign] no enriched targets — aborting")
-            return
-        print(f"\n[campaign] → {enriched_n} targets enriched")
+                shutil.copy(DATA_DIR / "leads.jsonl", DATA_DIR / "enriched.jsonl")
+            else:
+                stage_enrich(DATA_DIR / "leads.jsonl", DATA_DIR / "enriched.jsonl", config=cfg)
+            count = sum(1 for line in (DATA_DIR / "enriched.jsonl").open() if line.strip())
+            if count == 0:
+                return PhaseResult("enrich", status="failed", detail={"reason": "no enriched targets"})
+            return PhaseResult("enrich", total=count, ready=count, status="skipped" if skip_enrich else "ok")
 
-        # --- Phase 3: Personalize ---
-        print(f"\n{bar}\n[3/6] PERSONALIZE — Opus draft (cached system prompt)\n{bar}")
-        stage_draft(DATA_DIR / "enriched.jsonl", DATA_DIR / "drafts.jsonl", cfg, refine=refine)
+        def do_draft(_ctx: CampaignContext) -> PhaseResult:
+            print(f"\n{bar}\n[3/4] DRAFT — personalized copy\n{bar}")
+            stage_draft(DATA_DIR / "enriched.jsonl", DATA_DIR / "drafts.jsonl", cfg, refine=refine)
+            drafts = [json.loads(line) for line in (DATA_DIR / "drafts.jsonl").open() if line.strip()]
+            sendable = [d for d in drafts if (d.get("draft") or {}).get("subject") != "SKIP"]
+            phase_state["drafts"] = drafts
+            phase_state["sendable"] = sendable
+            return PhaseResult(
+                "draft",
+                total=len(drafts),
+                ready=len(sendable),
+                skipped=len(drafts) - len(sendable),
+            )
 
-        drafts = [json.loads(l) for l in (DATA_DIR / "drafts.jsonl").open() if l.strip()]
-        sendable = [d for d in drafts if (d.get("draft") or {}).get("subject") != "SKIP"]
-        skipped = len(drafts) - len(sendable)
-        print(
-            f"\n[campaign] → {len(sendable)} sendable, {skipped} SKIP "
-            + f"(send rate {len(sendable) * 100 // len(drafts) if drafts else 0}%)"
+        def do_send(_ctx: CampaignContext) -> PhaseResult:
+            sendable = phase_state.get("sendable") or []
+            before = len(load_sent_set())
+            before_skipped = len(load_skip_set())
+            send_stats = _run_autonomous_send(DATA_DIR / "drafts.jsonl", cfg, sendable)
+            sent = max(0, len(load_sent_set()) - before)
+            skipped = max(0, len(load_skip_set()) - before_skipped)
+            selected = int((send_stats or {}).get("selected") or 0)
+            failed = int((send_stats or {}).get("failed") or 0)
+            pending = max(
+                0,
+                selected - sent - skipped - failed,
+                int((send_stats or {}).get("pending") or 0) - sent - skipped,
+            )
+            total = max(selected, sent + skipped + pending + failed)
+            return PhaseResult(
+                "send",
+                total=total,
+                sent=sent,
+                skipped=skipped,
+                pending=pending,
+                failed=failed,
+                status="ok",
+            )
+
+        adapter = FunctionChannelAdapter("jp_form", do_list, do_enrich, do_draft, do_send)
+        send_authorized = (not skip_send) and core_autonomy.is_autonomous(cfg)
+        result = CampaignRunner(context).run(
+            adapter,
+            stop_after="send" if send_authorized else "draft",
+            replace_context=clean,
         )
-
-        # --- Phases 4-6: Approve → Send → Log ---
-        if skip_send:
-            print(f"\n{bar}\n[4/6] PREVIEW — display only (send skipped)\n{bar}")
-            stage_preview(DATA_DIR / "drafts.jsonl", interactive_send=False, config=cfg)
-            print(f"\n[campaign] stopped at preview. To send later: python run.py send --ids ...")
-            return
-
-        # --- Autonomous path: lock quality once upfront, then run hands-off ---
-        if core_autonomy.is_autonomous(cfg):
-            _run_autonomous_send(DATA_DIR / "drafts.jsonl", cfg, sendable)
-            if slack_ch:
-                touch_last_used(slack_ch)
-            return
-
-        print(f"\n{bar}\n[4-6/6] APPROVE → SEND → LOG (interactive)\n{bar}")
-        stage_preview(DATA_DIR / "drafts.jsonl", interactive_send=True, config=cfg)
-
+        if result.status == "failed":
+            raise RuntimeError(f"campaign failed in {result.stopped_after}")
+        if not send_authorized:
+            print(f"\n{bar}\nPREVIEW — no send authorization in this run\n{bar}")
+            stage_preview(
+                DATA_DIR / "drafts.jsonl",
+                interactive_send=not skip_send,
+                config=cfg,
+            )
         if slack_ch:
-            touch_last_used(slack_ch)
+            touch_last_used(slack_ch, slack_ts)
 
 
 # ============================================================================
@@ -3098,6 +3259,7 @@ def _harvest_and_fix_validation_errors(
     zenkaku_fixed = _fix_zenkaku_errors(errors)
     fixed = (
         len(summary.get("kana_fixed") or [])
+        + len(summary.get("postal_fixed") or [])
         + (1 if summary.get("subject_filled") else 0)
         + len(phone_fixed)
         + len(zenkaku_fixed)
@@ -3119,6 +3281,7 @@ def _harvest_and_fix_validation_errors(
                     "errors": [{"field": e["field"][:40], "kind": e["kind"]} for e in errors][:8],
                     "fixed": fixed,
                     "kana_fixed": (summary.get("kana_fixed") or [])[:6],
+                    "postal_fixed": (summary.get("postal_fixed") or [])[:6],
                     "subject_filled": summary.get("subject_filled"),
                     "phone_fixed": phone_fixed[:4],
                 },
@@ -5016,8 +5179,6 @@ def _postal_sort_key(entry: dict[str, Any]) -> int:
 def _escalate_dynamic_required(
     target: dict[str, Any], fields: list[dict[str, Any]]
 ) -> None:
-    from _outreach_core.notify import post as notify_post
-
     tid = target.get("id", "?")
     name = target.get("name", "?")
     labels = ", ".join(
@@ -5034,7 +5195,6 @@ def _escalate_dynamic_required(
             "action_needed": "field_values",
         },
     )
-    notify_post(f"{name} 想定外の必須項目（動的）: {labels}", level="warn")
     _emit_event(
         "send.escalated",
         stage="send",
@@ -5598,12 +5758,25 @@ def _detect_wrong_form_type(diag: dict[str, Any]) -> str | None:
     return None
 
 
+def _detect_empty_submission_risk(diag: dict[str, Any]) -> str | None:
+    """Block submit/verify when nothing was actually filled.
+
+    Some guide/gate pages contain generic success words such as "完了" while
+    exposing no usable inquiry form. If body fill failed and we filled zero
+    fields, any later "success" signal is almost certainly page-copy noise.
+    """
+    errors = [str(e) for e in (diag.get("errors") or [])]
+    filled = [str(f) for f in (diag.get("filled") or [])]
+    if any("body textarea fill failed" in e for e in errors) and not filled:
+        return "本文を入力できず、入力済み項目も0件のため送信成功判定へ進めません"
+    return None
+
+
 def _escalate_await_proceed(target: dict[str, Any], reason: str) -> None:
     """Record needs_attention + Slack notify; browser stays open for resolve --action proceed."""
-    from _outreach_core.notify import post as notify_post
-
     tid = target.get("id", "?")
     name = target.get("name", "?")
+    short = _humanize_blocker_reason(reason)
     append_needs_attention(
         DATA_DIR,
         {
@@ -5612,16 +5785,11 @@ def _escalate_await_proceed(target: dict[str, Any], reason: str) -> None:
             "channel": "jp_form",
             "reason": reason,
             "action_needed": "proceed",
+            "slack_message": (
+                f"{name}: {short}。Slack で「{tid} 進めて」と返すと手動再開できます。\n"
+                f"詳細: {reason}"
+            ),
         },
-    )
-    # Truthful messaging: state the ACTUAL blocker reason. Previously this always
-    # said "reCAPTCHA / 確認待ち" even when the real cause was a missing submit
-    # button or wrong form — which made non-captcha failures look like captcha
-    # detections (see production logs / オリヒロ false positive).
-    short = _humanize_blocker_reason(reason)
-    notify_post(
-        f"⚠️ {name}: {short}。Slack で「{tid} 進めて」と返すと手動再開できます。\n  詳細: {reason}",
-        level="warn",
     )
     _emit_event(
         "send.escalated",
@@ -5722,6 +5890,20 @@ def _live_captcha_state() -> dict[str, Any]:
     except Exception:  # noqa: BLE001 - detection must never crash a send
         raw = None
     return core_captcha.classify_live_state(raw)
+
+
+def _combine_page_evidence_text(snapshot: str | None, page_evidence: dict[str, Any] | None) -> str:
+    """Merge browser snapshot text with structured post-submit evidence."""
+    combined = snapshot or ""
+    if isinstance(page_evidence, dict):
+        combined = (
+            f"{combined}\n"
+            f"{page_evidence.get('text', '')}\n"
+            f"{page_evidence.get('cf7_response_text', '')}\n"
+            f"{page_evidence.get('submission_status_text', '')}\n"
+            f"{page_evidence.get('url', '')}"
+        )
+    return combined
 
 
 def _blocker_diagnostics(d: dict[str, Any], *, trace: Any = None) -> dict[str, Any]:
@@ -5980,8 +6162,6 @@ def _queue_for_resolver(
     the deep resolver, append needs_attention, and post a CLEAR actionable
     message (no misleading 「進めて」). The main batch keeps moving. The errored
     tab (``tab_id``) is left OPEN so the resolver can focus it in place (§17)."""
-    from _outreach_core.notify import post as notify_post
-
     tid = str(d.get("id") or d.get("name") or "?")
     name = d.get("name", "?")
     diag = _blocker_diagnostics(d, trace=trace)
@@ -6007,6 +6187,7 @@ def _queue_for_resolver(
         "diagnostics": diag,
     }
     core_resolve_queue.enqueue(DATA_DIR, entry)
+    slack_message = core_resolve_queue.build_actionable_message(entry, auto_resolver=autonomous)
     append_needs_attention(
         DATA_DIR,
         {
@@ -6018,13 +6199,9 @@ def _queue_for_resolver(
             "action_needed": "auto_resolve",
             "buttons": diag.get("buttons"),
             "snapshot_path": diag.get("snapshot_path"),
+            "slack_message": slack_message,
         },
     )
-    try:
-        notify_post(core_resolve_queue.build_actionable_message(entry, auto_resolver=autonomous),
-                    level="warn")
-    except Exception:  # noqa: BLE001
-        pass
     _emit_event(
         "send.queued_for_resolver", stage="send", target_id=tid,
         payload={"reason_class": reason_class, "buttons": diag.get("buttons"), "reason": reason[:160]},
@@ -6086,9 +6263,9 @@ def _resolve_in_open_tab(
     time.sleep(2)
     page_evidence = _evaluate(PAGE_EVIDENCE_JS)
     snap = oc_browser("snapshot")
-    combined = snap or ""
-    if isinstance(page_evidence, dict):
-        combined = f"{combined}\n{page_evidence.get('text', '')}\n{page_evidence.get('url', '')}"
+    combined = _combine_page_evidence_text(
+        snap, page_evidence if isinstance(page_evidence, dict) else None
+    )
     vresult = verify_send_completed(
         d, "jp_form", snapshot=combined,
         browser_verify=page_evidence if isinstance(page_evidence, dict) else None,
@@ -6123,8 +6300,44 @@ def _deep_submit(
     form_url = d["form_url"]
     tid = str(d.get("id") or d.get("name") or "?")
 
+    before_url = ""
+    try:
+        before_evidence = _evaluate(PAGE_EVIDENCE_JS)
+        if isinstance(before_evidence, dict):
+            before_url = str(before_evidence.get("url") or "")
+    except Exception:  # noqa: BLE001
+        before_url = ""
+
     oc_browser("open", form_url)
     time.sleep(RATE_LIMIT_SECONDS)
+    try:
+        after_open_evidence = _evaluate(PAGE_EVIDENCE_JS)
+        after_open_url = (
+            str(after_open_evidence.get("url") or "")
+            if isinstance(after_open_evidence, dict)
+            else ""
+        )
+    except Exception:  # noqa: BLE001
+        after_open_url = ""
+    if (
+        before_url
+        and after_open_url
+        and after_open_url == before_url
+        and not core_tab_utils.same_site(after_open_url, form_url)
+    ):
+        _emit_event(
+            "resolver.open_stale_page",
+            stage="resolve",
+            target_id=tid,
+            payload={"form_url": form_url, "current_url": after_open_url},
+            trace_dir=trace,
+        )
+        return {
+            "vresult": None,
+            "page_text": "",
+            "loop_status": "open_failed_stale_page",
+            "cur_url": after_open_url,
+        }
     apply_cookie_dismiss(
         _evaluate, config, stage="send", target_id=tid,
         emit_event=lambda kind, **kw: _emit_event(kind, trace_dir=trace, **kw),
@@ -6158,9 +6371,9 @@ def _deep_submit(
     time.sleep(2)
     page_evidence = _evaluate(PAGE_EVIDENCE_JS)
     snap = oc_browser("snapshot")
-    combined = snap or ""
-    if isinstance(page_evidence, dict):
-        combined = f"{combined}\n{page_evidence.get('text', '')}\n{page_evidence.get('url', '')}"
+    combined = _combine_page_evidence_text(
+        snap, page_evidence if isinstance(page_evidence, dict) else None
+    )
     vresult = verify_send_completed(
         d, "jp_form", snapshot=combined,
         browser_verify=page_evidence if isinstance(page_evidence, dict) else None,
@@ -6449,6 +6662,10 @@ def _submission_loop(
                 "probe_text_hits": obs.get("probe_text_hits"),
                 "probe_field_hits": obs.get("probe_field_hits"),
                 "dialog_count": obs.get("dialog_count"),
+                "send_verdict": obs.get("send_verdict"),
+                "send_score": obs.get("send_score"),
+                "send_reason": obs.get("send_reason"),
+                "send_signals": obs.get("send_signals"),
             },
             trace_dir=trace,
         )
@@ -7030,6 +7247,23 @@ def _send_one_target(
         for e in diagnostics["errors"]:
             print(f"    ✗ {e}")
 
+    empty_submission_risk = _detect_empty_submission_risk(diagnostics)
+    if empty_submission_risk:
+        print(f"  [send] ⚠ EMPTY_SUBMISSION_RISK — {empty_submission_risk}")
+        filled_only.append(d)
+        core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_WRONG_FORM)
+        if cur_tab_id:
+            resolver_tab_ids.add(cur_tab_id)
+        _queue_for_resolver(
+            d,
+            "body_not_filled",
+            empty_submission_risk,
+            trace=trace,
+            autonomous=autonomous,
+            tab_id=cur_tab_id,
+        )
+        return {"outcome": "queued", "reason": "body_not_filled"}
+
     wrong_form_reason = _detect_wrong_form_type(diagnostics)
     if wrong_form_reason:
         print(f"  [send] ⚠ WRONG_FORM_TYPE detected — {wrong_form_reason}")
@@ -7281,9 +7515,9 @@ def _send_one_target(
     page_evidence = _evaluate(PAGE_EVIDENCE_JS)
     snap = oc_browser("snapshot")
     snap_path = DATA_DIR / f"verify_snapshot_{d.get('id', di)}.txt"
-    combined = snap or ""
-    if isinstance(page_evidence, dict):
-        combined = f"{combined}\n{page_evidence.get('text', '')}\n{page_evidence.get('url', '')}"
+    combined = _combine_page_evidence_text(
+        snap, page_evidence if isinstance(page_evidence, dict) else None
+    )
     if combined.strip():
         snap_path.write_text(combined, encoding="utf-8")
 
@@ -7294,6 +7528,14 @@ def _send_one_target(
             trace, "post_submit_evidence.txt",
             f"url: {page_evidence.get('url', '')}\n"
             f"title: {page_evidence.get('title', '')}\n\n"
+            f"cf7_sent: {page_evidence.get('cf7_sent', '')}\n"
+            f"cf7_invalid: {page_evidence.get('cf7_invalid', '')}\n"
+            f"cf7_statuses: {page_evidence.get('cf7_statuses', '')}\n"
+            f"cf7_response_text: {page_evidence.get('cf7_response_text', '')}\n\n"
+            f"submission_sent: {page_evidence.get('submission_sent', '')}\n"
+            f"submission_invalid: {page_evidence.get('submission_invalid', '')}\n"
+            f"submission_statuses: {page_evidence.get('submission_statuses', '')}\n"
+            f"submission_status_text: {page_evidence.get('submission_status_text', '')}\n\n"
             f"{(page_evidence.get('text') or '')[:4000]}",
         )
 
@@ -7314,6 +7556,11 @@ def _send_one_target(
             infer_fn=lambda p, m: oc_infer(p, m or core_infer.DEFAULT_MODEL),
             tiebreak_model=_form_analyzer_base_model(config),
         )
+        verify_evidence = vresult.get("evidence") or {}
+        d["_last_verify_verdict"] = (
+            verify_evidence.get("send_verdict") or vresult.get("status")
+        )
+        d["_last_verify_status"] = vresult.get("status")
         ev.dump_trace(trace, "verify_evidence.json", vresult.get("evidence") or {})
         outcome = handle_verify_result(d, vresult, DATA_DIR, channel="jp_form")
         core_timeline.add(
@@ -7441,7 +7688,11 @@ def _send_one_target(
         core_send_journal.append_journal(
             DATA_DIR, tid, core_send_journal.PHASE_VERIFIED, outcome=final_outcome
         )
-    return {"outcome": "sent" if any(x is d for x in sent) else "done"}
+    return {
+        "outcome": "sent" if any(x is d for x in sent) else "done",
+        "verify_verdict": d.get("_last_verify_verdict"),
+        "verify_status": d.get("_last_verify_status"),
+    }
 
 
 
@@ -7453,10 +7704,20 @@ def stage_send(
     heartbeat: str | None = None,
     verify_strict: bool = True,
     iterative_fill: bool = False,
-) -> None:
+) -> dict[str, Any]:
+    stats: dict[str, Any] = {
+        "selected": 0,
+        "sent": 0,
+        "pending": 0,
+        "skipped": 0,
+        "failed": 0,
+        "unverified": 0,
+        "interrupted": 0,
+        "stopped": False,
+    }
     if not config:
         print("[send] missing config", file=sys.stderr)
-        return
+        return stats
 
     # v20: primary-host guard. On a non-primary machine (e.g. the dev MacBook)
     # refuse to actually SUBMIT, so a stray command never fires real outreach.
@@ -7479,18 +7740,20 @@ def stage_send(
                 _notify_post(msg, level="warn")
             except Exception:  # noqa: BLE001
                 pass
-            return
+            return stats
 
-    drafts = [json.loads(l) for l in input_path.open()]
+    with input_path.open(encoding="utf-8") as f:
+        drafts = [json.loads(l) for l in f if l.strip()]
     sendable = [d for d in drafts if d.get("draft", {}).get("subject") != "SKIP"]
     if not sendable:
         print("[send] no sendable drafts")
-        return
+        return stats
 
     targets = [d for i, d in enumerate(sendable, 1) if i in ids]
     if not targets:
         print(f"[send] no matching ids; max={len(sendable)}")
-        return
+        return stats
+    stats["selected"] = len(targets)
 
     sent_ids = load_sent_set()
     pre_filtered = [d for d in targets if d["id"] in sent_ids]
@@ -7498,36 +7761,98 @@ def stage_send(
         names = ", ".join(d.get("name", "?") for d in pre_filtered)
         print(f"[send] ⚠ skipping {len(pre_filtered)} already in sent_history: {names}")
         targets = [d for d in targets if d["id"] not in sent_ids]
+        stats["selected"] = len(targets)
         if not targets:
-            return
+            return stats
 
     # v15 §R3: resume guard — a target whose journal shows submit_attempted
     # without verified crashed mid-submit last run. Double-send risk → do NOT
     # auto-send; route to needs_attention for a human decision.
-    unverified = core_send_journal.unverified_attempt_ids(
-        core_send_journal.load_journal(DATA_DIR)
-    )
+    journal_entries = core_send_journal.load_journal(DATA_DIR)
+    unverified = core_send_journal.unverified_attempt_ids(journal_entries)
     flagged = [d for d in targets if str(d.get("id")) in unverified]
     if flagged:
+        stats["unverified"] = len(flagged)
+        stats["pending"] += len(flagged)
+        open_unverified_attention = {
+            str(row.get("target_id") or "")
+            for row in list_open_needs_attention(DATA_DIR)
+            if "unverified_prior_attempt" in str(row.get("reason") or "")
+        }
         names = ", ".join(d.get("name", "?") for d in flagged)
         print(f"[send] ⚠ {len(flagged)} target(s) with UNVERIFIED prior submit "
               f"attempt → needs_attention (二重送信防止): {names}")
         for d in flagged:
-            append_needs_attention(DATA_DIR, {
-                "target_id": d.get("id"),
-                "name": d.get("name"),
-                "channel": "jp_form",
-                "reason": ("unverified_prior_attempt: 前回runが最終送信クリック後・"
-                           "verify前に異常終了。二重送信防止のため自動送信を停止。"
-                           "送信履歴(メール受信等)を確認してから判断してください"),
-            })
+            if str(d.get("id") or "") not in open_unverified_attention:
+                append_needs_attention(DATA_DIR, {
+                    "target_id": d.get("id"),
+                    "name": d.get("name"),
+                    "channel": "jp_form",
+                    "reason": ("unverified_prior_attempt: 前回runが最終送信クリック後・"
+                               "verify前に異常終了。二重送信防止のため自動送信を停止。"
+                               "送信履歴(メール受信等)を確認してから判断してください"),
+                })
+                open_unverified_attention.add(str(d.get("id") or ""))
             _emit_event(
                 "send.unverified_prior_attempt", stage="send",
                 target_id=str(d.get("id") or ""), payload={},
             )
         targets = [d for d in targets if str(d.get("id")) not in unverified]
         if not targets:
-            return
+            return stats
+
+    # Resume guard for parent/process deaths before final submit. This is
+    # lower-risk than submit_attempted, but automatically retrying the same
+    # page can produce an endless stall/restart loop. Park it for review and
+    # keep the campaign moving to the next company.
+    interrupted = core_send_journal.interrupted_pre_submit_ids(journal_entries)
+    interrupted_targets = [d for d in targets if str(d.get("id")) in interrupted]
+    if interrupted_targets:
+        stats["interrupted"] = len(interrupted_targets)
+        stats["pending"] += len(interrupted_targets)
+        open_interrupted_attention = {
+            str(row.get("target_id") or "")
+            for row in list_open_needs_attention(DATA_DIR)
+            if "interrupted_before_submit" in str(row.get("reason") or "")
+        }
+        names = ", ".join(d.get("name", "?") for d in interrupted_targets)
+        print(
+            f"[send] ⚠ {len(interrupted_targets)} target(s) interrupted before "
+            f"final submit → needs_attention/resume skip: {names}"
+        )
+        for d in interrupted_targets:
+            tid = str(d.get("id") or "")
+            if tid not in open_interrupted_attention:
+                append_needs_attention(DATA_DIR, {
+                    "target_id": d.get("id"),
+                    "name": d.get("name"),
+                    "channel": "jp_form",
+                    "form_url": d.get("form_url") or d.get("url"),
+                    "reason_class": "interrupted_before_submit",
+                    "action_needed": "manual_review_or_retry",
+                    "reason": (
+                        "interrupted_before_submit: 前回runがこの会社の処理中に停止しました。"
+                        "最終送信クリック前のチェックポイントなので送信済み扱いにはしませんが、"
+                        "同じ会社で再停止ループするのを避けるため自動処理から退避しました。"
+                    ),
+                })
+                open_interrupted_attention.add(tid)
+            core_send_journal.append_journal(
+                DATA_DIR,
+                tid,
+                core_send_journal.PHASE_TARGET_FINISHED,
+                outcome="interrupted_before_submit_skipped_on_resume",
+                form_url=d.get("form_url") or d.get("url"),
+            )
+            _emit_event(
+                "send.interrupted_before_submit_resume_skip",
+                stage="send",
+                target_id=tid,
+                payload={},
+            )
+        targets = [d for d in targets if str(d.get("id")) not in interrupted]
+        if not targets:
+            return stats
 
     mode_label = {
         "interactive": "interactive (prompts after fill)",
@@ -7543,6 +7868,12 @@ def stage_send(
               + " · blockers→auto-skip")
     else:
         print(f"[send] processing {len(targets)} targets · mode={mode_label}")
+
+    lead_timeout_sec = _send_lead_soft_timeout_sec(config)
+    if lead_timeout_sec > 0:
+        print(f"[send] lead soft-timeout: {lead_timeout_sec}s/target")
+    else:
+        print("[send] lead soft-timeout: disabled")
 
     sent: list[dict[str, Any]] = []
     filled_only: list[dict[str, Any]] = []
@@ -7593,16 +7924,75 @@ def stage_send(
                 break
             idx = sendable.index(d) + 1
             tid = str(d.get("id") or d.get("name", "?"))
+            target_started_at = time.time()
+            _hb_stage(f"send {di + 1}/{len(targets)} {d.get('name', tid)}")
+            print(
+                f"  [send] ▶ {di + 1}/{len(targets)} {d.get('name', tid)} "
+                f"(id={tid})",
+                flush=True,
+            )
+            core_send_journal.append_journal(
+                DATA_DIR,
+                tid,
+                core_send_journal.PHASE_TARGET_STARTED,
+                idx=idx,
+                name=d.get("name"),
+                form_url=d.get("form_url") or d.get("url"),
+            )
             try:
-                result = _send_one_target(
-                    d, di=di, idx=idx, mode=mode, config=config,
-                    verify_strict=verify_strict, iterative_fill=iterative_fill,
-                    autonomous=autonomous, score_on=score_on,
-                    tab_isolation=tab_isolation, resolver_tab_ids=resolver_tab_ids,
-                    sent=sent, filled_only=filled_only,
-                )
+                with _lead_soft_timeout(lead_timeout_sec, target_id=tid):
+                    result = _send_one_target(
+                        d, di=di, idx=idx, mode=mode, config=config,
+                        verify_strict=verify_strict, iterative_fill=iterative_fill,
+                        autonomous=autonomous, score_on=score_on,
+                        tab_isolation=tab_isolation, resolver_tab_ids=resolver_tab_ids,
+                        sent=sent, filled_only=filled_only,
+                    )
             except KeyboardInterrupt:
                 raise
+            except LeadSoftTimeoutError as exc:
+                print(
+                    f"  [send] ⚠ lead timed out after {lead_timeout_sec}s: "
+                    f"{d.get('name', tid)} — continuing with next target",
+                    file=sys.stderr,
+                )
+                try:
+                    _emit_event(
+                        "send.target_timeout",
+                        stage="send",
+                        target_id=tid,
+                        outcome=core_outcomes.NETWORK_ERROR,
+                        payload={
+                            "timeout_sec": lead_timeout_sec,
+                            "elapsed_sec": int(max(0, time.time() - target_started_at)),
+                            "error": str(exc)[:200],
+                        },
+                    )
+                    _emit_event(
+                        "send.lead_timed_out",
+                        stage="send",
+                        target_id=tid,
+                        payload={
+                            "timeout_sec": lead_timeout_sec,
+                            "error": str(exc)[:200],
+                        },
+                    )
+                    append_needs_attention(DATA_DIR, {
+                        "target_id": d.get("id"),
+                        "name": d.get("name"),
+                        "channel": "jp_form",
+                        "form_url": d.get("form_url") or d.get("url"),
+                        "reason_class": "target_timeout",
+                        "action_needed": "manual_verify",
+                        "reason": (
+                            f"target_timeout/lead_soft_timeout: 1社処理が{lead_timeout_sec}秒を超過。"
+                            "ブラウザ/サイト応答詰まりの可能性があるため自動処理を退避しました。"
+                        ),
+                    })
+                except Exception:
+                    pass
+                _close_tab_safely(d.get("_send_tab_id"))
+                result = {"outcome": "timed_out", "reason": str(exc)}
             except Exception as exc:  # noqa: BLE001 — per-lead isolation (v15 §R1)
                 tb = traceback.format_exc()
                 print(f"  [send] ✗ lead crashed: {exc} — continuing with next target",
@@ -7620,9 +8010,37 @@ def stage_send(
                 except Exception:
                     pass
                 _close_tab_safely(d.get("_send_tab_id"))
-                result = {"outcome": "crashed"}
+                result = {"outcome": "crashed", "error": str(exc)[:200]}
+            try:
+                payload = core_outcomes.build_target_outcome_payload(
+                    target=d,
+                    result=result,
+                    started_at=target_started_at,
+                    finished_at=time.time(),
+                    timeline=d.get("_send_timeline") or [],
+                )
+                _emit_event(
+                    "send.target_outcome",
+                    stage="send",
+                    target_id=tid,
+                    outcome=payload["outcome"],
+                    payload=payload,
+                )
+            except Exception:  # noqa: BLE001 - observability must not break send
+                pass
+            try:
+                core_send_journal.append_journal(
+                    DATA_DIR,
+                    tid,
+                    core_send_journal.PHASE_TARGET_FINISHED,
+                    outcome=str((result or {}).get("outcome") or "done"),
+                    form_url=d.get("form_url") or d.get("url"),
+                )
+            except Exception:  # noqa: BLE001 - resume bookkeeping must not break send
+                pass
             d.pop("_send_tab_id", None)
             hb.tick(di + 1, f"{d.get('name', '?')} · {result.get('outcome', 'done')}")
+            _hb_stage(f"send {di + 1}/{len(targets)} done")
             core_progress.bump(DATA_DIR, outcome=result.get("outcome"),
                                name=d.get("name"))
 
@@ -7645,6 +8063,14 @@ def stage_send(
         ids_str = ",".join(str(sendable.index(d) + 1) for d in filled_only)
         print(f"[send] If you completed any of those manually:")
         print(f"      python run.py mark-sent --ids {ids_str}")
+    stats["sent"] = len(sent)
+    stats["pending"] = (
+        int(stats.get("unverified") or 0)
+        + int(stats.get("interrupted") or 0)
+        + len(filled_only)
+    )
+    stats["stopped"] = stopped_by_user
+    return stats
 
 
 def _resolve_ids_arg(ids_str: str | None, use_all: bool,
@@ -7840,9 +8266,9 @@ def stage_resolve_proceed(
 
     page_evidence = _evaluate(PAGE_EVIDENCE_JS)
     snap = oc_browser("snapshot")
-    combined = snap or ""
-    if isinstance(page_evidence, dict):
-        combined = f"{combined}\n{page_evidence.get('text', '')}\n{page_evidence.get('url', '')}"
+    combined = _combine_page_evidence_text(
+        snap, page_evidence if isinstance(page_evidence, dict) else None
+    )
     snap_path = DATA_DIR / f"verify_snapshot_{d.get('id', 0)}.txt"
     if combined.strip():
         snap_path.write_text(combined, encoding="utf-8")
@@ -7916,6 +8342,12 @@ def stage_mark_sent(input_path: Path, ids: set[int]) -> None:
         print(f"[mark-sent] no matches for ids {sorted(ids)}")
         return
     append_sent_history(sent)
+    for d in sent:
+        close_needs_attention(
+            DATA_DIR,
+            str(d.get("id") or ""),
+            resolution="mark-sent: user confirmed sent",
+        )
     print(f"[mark-sent] logged {len(sent)}: " + ", ".join(d.get("name", "?") for d in sent))
 
 
@@ -8050,13 +8482,23 @@ def main() -> None:
     brief_parent = argparse.ArgumentParser(add_help=False)
     brief_parent.add_argument(
         "--brief",
-        default=None,
+        default=argparse.SUPPRESS,
         help="Brief id (default: briefs/_active.txt)",
+    )
+    brief_parent.add_argument(
+        "--persona",
+        default=argparse.SUPPRESS,
+        help="Persona id (default: brief/thread binding)",
     )
     ap.add_argument(
         "--brief",
         default=None,
         help="Brief id (default: briefs/_active.txt or DOORMAN_SLACK_CHANNEL_ID)",
+    )
+    ap.add_argument(
+        "--persona",
+        default=None,
+        help="Persona id (default: brief/thread binding)",
     )
     ap.add_argument(
         "--slack-channel-id",
@@ -8102,6 +8544,8 @@ def main() -> None:
                    help="Stop at preview without sending (display only)")
     p.add_argument("--include-sent", action="store_true",
                    help="Also include companies marked status: sent (re-send mode)")
+    p.add_argument("--include-skipped", action="store_true",
+                   help="Also include companies present in skip_history.jsonl (for explicit retry)")
     refine_grp = p.add_mutually_exclusive_group()
     refine_grp.add_argument(
         "--refine",
@@ -8272,7 +8716,11 @@ def main() -> None:
         os.environ["DOORMAN_SLACK_THREAD_TS"] = args.slack_thread_ts
     brief_id = getattr(args, "brief", None)
     try:
-        configure_brief(brief_id, cmd=args.cmd)
+        configure_brief(
+            brief_id,
+            persona_id=getattr(args, "persona", None),
+            cmd=args.cmd,
+        )
     except BriefError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(2)
@@ -8315,6 +8763,7 @@ def main() -> None:
             skip_enrich=args.skip_enrich,
             skip_send=args.skip_send,
             include_sent=args.include_sent,
+            include_skipped=args.include_skipped,
             refine=refine,
             limit=args.limit,
             only_ids=only_ids,

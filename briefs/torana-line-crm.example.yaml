@@ -7,10 +7,7 @@ brief:
   active_since: "2026-05-26"
   notes: ""
 
-sender:
-  name: "Your Name"
-  company: "Your Company"
-  role: "Founder"
+persona_id: "your-persona-id"
 
 product:
   name: "Product Name"

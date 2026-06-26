@@ -29,8 +29,28 @@ _ALL_TASKS = frozenset(
     }
 )
 
+_TASK_LABELS = {
+    "research": "調査",
+    "campaign": "キャンペーン",
+    "fetch-leads": "リスト取得",
+    "fetch-from-csv": "CSV取込",
+    "enrich": "フォーム調査",
+    "draft": "ドラフト作成",
+    "send": "送信",
+    "resolve": "リゾルバ",
+}
 
-def resolve_heartbeat_mode(explicit: str | None, *, task: str) -> str | None:
+
+def _task_label(task: str) -> str:
+    return _TASK_LABELS.get(str(task), str(task))
+
+
+def resolve_heartbeat_mode(
+    explicit: str | None,
+    *,
+    task: str,
+    brief_id: str | None = None,
+) -> str | None:
     """
     Resolve heartbeat for a stage.
 
@@ -44,7 +64,7 @@ def resolve_heartbeat_mode(explicit: str | None, *, task: str) -> str | None:
         return "slack"
     if not webhook_configured():
         return None
-    brief = load_runtime_config()
+    brief = load_runtime_config(brief_id)
     hb = brief.get("heartbeat") or {}
     enabled = hb.get("enabled_for")
     if enabled is not None:
@@ -93,13 +113,13 @@ def compose_heartbeat_message(
     (sent/skipped/needs_attention/ETA), it carries the richer status; otherwise
     fall back to the bare current/total + elapsed line."""
     if progress_summary:
-        return f"[{task}] {progress_summary}"
+        return progress_summary
     mins = int((elapsed_sec or 0) / 60)
-    return f"[{task}] {current}/{total} 件目 · 経過 {mins} 分 · {last_action}"
+    return f"{_task_label(task)} {current}/{total}件目 · 経過 {mins}分 · {last_action}"
 
 
 class HeartbeatSession:
-    """Context manager: progress events + optional 5-min Slack webhook pings."""
+    """Context manager: progress events + lifecycle-scoped Slack pings."""
 
     def __init__(
         self,
@@ -111,11 +131,14 @@ class HeartbeatSession:
         data_dir: Path | None = None,
         brief_id: str | None = None,
         slack_thread_ts: str | None = None,
+        announce_start: bool = True,
     ) -> None:
         self.skill_dir = skill_dir
         self.task = task
         self.total = total
         self.heartbeat_mode = heartbeat
+        self._display_task = task
+        self._announce_start = announce_start
         self.data_dir = data_dir or (skill_dir / "data")
         self._thread_ts = slack_thread_ts or os.environ.get("DOORMAN_SLACK_THREAD_TS", "").strip() or None
         self._started_at: float | None = None
@@ -125,6 +148,7 @@ class HeartbeatSession:
         self._thread: threading.Thread | None = None
         self._keepalive_thread: threading.Thread | None = None
         self._keepalive_interval = _keepalive_interval()
+        self._heartbeat_poll_interval = 5.0
         try:
             cfg = load_merged_config(skill_dir, brief_id)
         except FileNotFoundError:
@@ -152,9 +176,14 @@ class HeartbeatSession:
         self._keepalive_thread = threading.Thread(target=self._keepalive_loop, daemon=True)
         self._keepalive_thread.start()
         if self.heartbeat_mode == "slack":
-            from _outreach_core.notify import post
+            if self._announce_start:
+                from _outreach_core.notify import post
 
-            post(f"[{self.task}] 開始 (全 {self.total} 件)", level="info", thread_ts=self._thread_ts)
+                post(
+                    f"{_task_label(self.task)}を開始しました（全{self.total}件）",
+                    level="info",
+                    thread_ts=self._thread_ts,
+                )
             self._thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
             self._thread.start()
 
@@ -207,10 +236,9 @@ class HeartbeatSession:
                 "message": summary,
             },
         )
-        if self.heartbeat_mode == "slack":
-            from _outreach_core.notify import post
-
-            post(summary, level="info", thread_ts=None)
+        # Do not post here. The detached supervisor owns the single terminal
+        # notification. This prevents a stage/campaign heartbeat from posting
+        # after its process has already stopped and avoids duplicate endings.
         self._sync_system_health()
 
     def _progress_summary_line(self) -> str | None:
@@ -235,7 +263,7 @@ class HeartbeatSession:
                 return
             ev = json.loads(lines[-1])
             if ev.get("task"):
-                self.task = str(ev["task"])
+                self._display_task = str(ev["task"])
             if ev.get("current") is not None:
                 self._current = int(ev.get("current") or 0)
             if ev.get("total") is not None:
@@ -249,7 +277,7 @@ class HeartbeatSession:
         from _outreach_core.notify import post
 
         last_post = time.time()
-        while not self._stop.wait(5.0):
+        while not self._stop.wait(self._heartbeat_poll_interval):
             if not self._started_at:
                 continue
             self._refresh_from_log()
@@ -260,7 +288,7 @@ class HeartbeatSession:
                 continue
             post(
                 compose_heartbeat_message(
-                    self.task, self._current, self.total, elapsed,
+                    self._display_task, self._current, self.total, elapsed,
                     self._last_action, self._progress_summary_line(),
                 ),
                 level="info",

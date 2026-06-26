@@ -57,7 +57,8 @@ def resolve_brief_id(brief_id: str | None) -> str:
         if ch:
             from _outreach_core.channel_state import resolve_brief_for_channel
 
-            resolved, _channels, is_new = resolve_brief_for_channel(ch)
+            thread_ts = os.environ.get("DOORMAN_SLACK_THREAD_TS", "").strip() or None
+            resolved, _channels, is_new = resolve_brief_for_channel(ch, thread_ts)
             if is_new or not resolved:
                 raise BriefError(
                     f"Slack channel {ch} is not bound to a brief.\n"
@@ -91,9 +92,19 @@ def load_brief(brief_id: str | None = None) -> dict[str, Any]:
     return data
 
 
-def load_merged_config(skill_dir: Path, brief_id: str | None = None) -> dict[str, Any]:
+def load_merged_config(
+    skill_dir: Path,
+    brief_id: str | None = None,
+    *,
+    persona_id: str | None = None,
+    channel: str | None = None,
+) -> dict[str, Any]:
     """
-    Merge: skill_dir/config.yaml then briefs/<id>.yaml (brief wins on overlap).
+    Merge skill defaults -> campaign brief -> persona.
+
+    Persona is last so an explicitly selected speaker can be reused across
+    campaigns without stale inline sender/tone fields winning. Legacy briefs
+    without persona_id continue to work unchanged.
     """
     _require_yaml()
     bid = resolve_brief_id(brief_id)
@@ -103,7 +114,20 @@ def load_merged_config(skill_dir: Path, brief_id: str | None = None) -> dict[str
         raise FileNotFoundError(skill_cfg_path)
     skill_cfg = yaml.safe_load(skill_cfg_path.read_text(encoding="utf-8")) or {}
     merged = _deep_merge(skill_cfg, brief_cfg)
+    from _outreach_core.persona import load_persona, resolve_persona_id
+
+    pid = resolve_persona_id(
+        persona_id,
+        brief_config=brief_cfg,
+        slack_channel_id=os.environ.get("DOORMAN_SLACK_CHANNEL_ID", "").strip() or None,
+        slack_thread_ts=os.environ.get("DOORMAN_SLACK_THREAD_TS", "").strip() or None,
+    )
+    if pid:
+        merged = _deep_merge(merged, load_persona(pid))
     merged["_brief_id"] = bid
+    merged["_persona_id"] = pid
+    if channel:
+        merged["_channel"] = channel
     return merged
 
 
@@ -116,8 +140,6 @@ def heartbeat_interval_sec(merged_config: dict[str, Any] | None = None) -> int:
     cfg = merged_config or load_runtime_config()
     hb = cfg.get("heartbeat") or {}
     try:
-        return int(hb.get("interval_sec", 300))
+        return int(hb.get("interval_sec", 600))
     except (TypeError, ValueError):
-        return 300
-
-
+        return 600

@@ -22,14 +22,14 @@ class TestComposeHeartbeatMessage(unittest.TestCase):
     def test_uses_progress_summary_when_present(self):
         msg = compose_heartbeat_message(
             "send", 12, 30, 360, "株式会社X · sent",
-            progress_summary="send 12/30 · 送信 9 · 要対応 1",
+            progress_summary="送信 12/30 · 送信OK 9 · 要対応 1",
         )
-        self.assertEqual(msg, "[send] send 12/30 · 送信 9 · 要対応 1")
+        self.assertEqual(msg, "送信 12/30 · 送信OK 9 · 要対応 1")
 
     def test_falls_back_to_bare_line(self):
         msg = compose_heartbeat_message("send", 5, 30, 120, "株式会社Y", None)
-        self.assertIn("[send] 5/30 件目", msg)
-        self.assertIn("経過 2 分", msg)
+        self.assertIn("送信 5/30件目", msg)
+        self.assertIn("経過 2分", msg)
         self.assertIn("株式会社Y", msg)
 
 
@@ -87,7 +87,27 @@ class TestProgress(unittest.TestCase):
                     hb.end()
             thread_values = [c.get("thread_ts") for c in calls]
             self.assertIn("1716714800.123456", thread_values)
-            self.assertIn(None, thread_values)
+            self.assertNotIn(None, thread_values)
+
+    def test_end_stops_periodic_posts_and_does_not_post_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / "data"
+            data.mkdir()
+            with mock.patch("_outreach_core.notify.post", return_value=True) as post:
+                hb = HeartbeatSession(
+                    Path(tmp), "campaign", 10, heartbeat="slack", data_dir=data,
+                    announce_start=False,
+                )
+                hb._interval = 0.03
+                hb._heartbeat_poll_interval = 0.01
+                hb.start()
+                time.sleep(0.09)
+                hb.end("done")
+                calls_at_end = post.call_count
+                time.sleep(0.06)
+            self.assertGreaterEqual(calls_at_end, 1)
+            self.assertEqual(post.call_count, calls_at_end)
+            self.assertNotIn("done", " ".join(str(c.args[0]) for c in post.call_args_list))
 
     def test_resolve_auto_respects_enabled_for(self) -> None:
         brief = {
@@ -99,6 +119,17 @@ class TestProgress(unittest.TestCase):
                 self.assertEqual(resolve_heartbeat_mode(None, task="enrich"), "slack")
                 self.assertIsNone(resolve_heartbeat_mode(None, task="draft"))
                 self.assertEqual(resolve_heartbeat_mode("off", task="enrich"), None)
+
+    def test_resolve_auto_loads_the_explicit_brief(self) -> None:
+        brief = {"heartbeat": {"enabled_for": ["all"]}}
+        with mock.patch(
+            "_outreach_core.progress.load_runtime_config", return_value=brief
+        ) as load, mock.patch(
+            "_outreach_core.progress.webhook_configured", return_value=True
+        ):
+            mode = resolve_heartbeat_mode(None, task="campaign", brief_id="tenbin-link")
+        self.assertEqual(mode, "slack")
+        load.assert_called_once_with("tenbin-link")
 
 
 if __name__ == "__main__":

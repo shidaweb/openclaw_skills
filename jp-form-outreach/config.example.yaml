@@ -81,6 +81,18 @@ model:
 draft:
   refine_default: true   # run.py draft / campaign use 2-pass unless --no-refine
 
+# Runtime safety valve. If one company gets stuck in browser/site/CLI
+# processing longer than this, Doorman routes only that company to
+# needs_attention and continues the batch. Set <=0 to disable.
+execution:
+  # 180s cut off several real forms immediately after fill/LLM planning in
+  # production.  300s still bounds a wedged company while leaving submit time.
+  per_target_timeout_sec: 300
+
+# Backward compatibility: existing briefs may still use
+# send.lead_soft_timeout_sec. execution.per_target_timeout_sec takes precedence.
+send: {}
+
 # Personalization rules
 personalization:
   must_reference: |

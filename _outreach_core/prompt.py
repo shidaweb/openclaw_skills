@@ -24,10 +24,22 @@ def _prefer_local(prompts_dir: Path, name: str) -> Path:
     return prompts_dir / name
 
 
-def resolve_prompts_dir(skill_dir: Path, config: dict[str, Any]) -> Path:
-    """Skill default prompts, or brief-specific override from prompts_overrides."""
+def _override_value(config: dict[str, Any], suffix: str, channel: str | None = None) -> Any:
     overrides = config.get("prompts_overrides") or {}
-    rel = overrides.get("jp_form_system_persona") or overrides.get("linkedin_system_persona")
+    selected = channel or config.get("_channel")
+    if selected:
+        return overrides.get(f"{selected}_{suffix}")
+    # Legacy callers without channel context retain the old fallback order.
+    return overrides.get(f"jp_form_{suffix}") or overrides.get(f"linkedin_{suffix}")
+
+
+def resolve_prompts_dir(
+    skill_dir: Path,
+    config: dict[str, Any],
+    channel: str | None = None,
+) -> Path:
+    """Skill default prompts, or brief-specific override from prompts_overrides."""
+    rel = _override_value(config, "system_persona", channel)
     if rel:
         path = skill_dir / str(rel)
         if path.is_file():
@@ -42,8 +54,20 @@ def build_system_block(config: dict[str, Any], prompts_dir: Path) -> str:
     """
     if yaml is None:
         raise RuntimeError("pyyaml required for build_system_block")
-    persona_path = _prefer_local(prompts_dir, "system_persona.md")
-    examples_path = _prefer_local(prompts_dir, "examples.md")
+    persona_override = _override_value(config, "system_persona")
+    examples_override = _override_value(config, "examples")
+    if persona_override:
+        persona_path = prompts_dir / Path(str(persona_override)).name
+    else:
+        persona_path = _prefer_local(prompts_dir, "system_persona.md")
+    if examples_override:
+        examples_path = prompts_dir / Path(str(examples_override)).name
+    elif persona_override:
+        # A campaign-specific persona must not accidentally inherit unrelated
+        # global few-shots (the Tenbin run inherited a CellCloud example).
+        examples_path = prompts_dir / "__no_campaign_examples__.md"
+    else:
+        examples_path = _prefer_local(prompts_dir, "examples.md")
     if not persona_path.is_file():
         raise FileNotFoundError(persona_path)
     persona = persona_path.read_text(encoding="utf-8")
