@@ -413,6 +413,14 @@ def start(
     if slack_thread_ts:
         env["DOORMAN_SLACK_THREAD_TS"] = slack_thread_ts
     env.setdefault("PYTHONPATH", str(SKILLS_ROOT))
+    # v30 §WS-D — propagate the notify.jsonl audit path + run identity so
+    # per-target Slack deliveries (notify.post_target_event) can append their
+    # own audit rows next to the existing run-level start/terminal entries.
+    env["DOORMAN_NOTIFY_AUDIT_PATH"] = str(
+        Path(log_path).with_suffix(".notify.jsonl")
+    )
+    env["DOORMAN_RUN_ID"] = run_id
+    env["DOORMAN_SKILL"] = skill
 
     supervisor_cmd = [
         sys.executable,

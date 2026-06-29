@@ -404,6 +404,253 @@ def post_problem(
     return ok
 
 
+# v30 §WS-D — per-target status notifications.
+#
+# Before this change, Slack only received a `start` line and a `terminal`
+# summary 45+ minutes later. Per-target outcomes lived in events.jsonl and
+# needs_attention.jsonl but never reached the operator's Slack thread, so the
+# user perceived the run as a black box. ``post_target_event`` adds a single
+# concise line per target so the thread reads like a live progress feed.
+
+# Result statuses the per-target line understands. Each maps to an emoji and a
+# Japanese label. Unknown statuses pass through with the raw status text.
+TARGET_STATUS_LABELS: dict[str, tuple[str, str]] = {
+    "sent": ("✅", "送信完了"),
+    "filled_only": ("✏️", "入力のみ（検証未確定）"),
+    "skipped": ("⏭", "スキップ"),
+    "queued": ("⚠️", "要確認キュー"),
+    "blocked": ("⛔", "送信不可"),
+    "timeout": ("⏰", "タイムアウト"),
+    "started": ("▶️", "開始"),
+}
+
+
+def _target_event_disabled() -> bool:
+    """``DOORMAN_TARGET_EVENT_NOTIFY=0`` turns the per-target Slack feed off.
+
+    Useful for large batches (100+ targets) where the operator would prefer to
+    rely on the events.jsonl audit + the final summary. Default is ON because
+    the original Slack-blackbox problem outweighs the noise risk for typical
+    batches of 5–20 targets.
+    """
+    raw = os.environ.get("DOORMAN_TARGET_EVENT_NOTIFY", "").strip().lower()
+    return raw in ("0", "false", "off", "no")
+
+
+def format_target_event(
+    *,
+    stage: str,
+    status: str,
+    name: str,
+    idx: int | None = None,
+    total: int | None = None,
+    detail: Mapping[str, Any] | str | None = None,
+) -> str:
+    """One-line Slack body for a per-target lifecycle event.
+
+    Layout (designed to be skimmable in a Slack thread):
+
+        [3/7] ✅ 株式会社X · send 送信完了
+              ↳ button=送信 reason=explicit_sent_status
+
+    The leading ``[i/N]`` is omitted when ``idx`` or ``total`` is missing.
+    Detail keys with falsy values are silently dropped so the line stays short.
+    """
+    label = TARGET_STATUS_LABELS.get(status, ("•", status))
+    emoji, status_label = label
+    head_parts: list[str] = []
+    if idx is not None and total is not None:
+        head_parts.append(f"[{idx}/{total}]")
+    head_parts.append(emoji)
+    head_parts.append(str(name or "?"))
+    head = " ".join(p for p in head_parts if p)
+    summary = f"{head} · {stage} {status_label}"
+    extras = _format_event_detail(detail)
+    if extras:
+        return f"{summary}\n　↳ {extras}"
+    return summary
+
+
+def _format_event_detail(detail: Mapping[str, Any] | str | None) -> str:
+    """Render a small set of key=value pairs from the detail mapping.
+
+    Strings pass through (after truncation). Mappings render selected keys in
+    a stable order so the Slack message format stays predictable. Unknown
+    keys are appended after the curated set, capped to keep the line short.
+    """
+    if not detail:
+        return ""
+    if isinstance(detail, str):
+        return detail.strip()[:180]
+    if not isinstance(detail, Mapping):
+        return ""
+    curated_keys = (
+        "reason",
+        "reason_class",
+        "button",
+        "verify_status",
+        "verify_reason",
+        "url",
+        "form_url",
+        "filled",
+        "unfilled",
+        "wizard_stuck",
+        "elapsed_sec",
+    )
+    parts: list[str] = []
+    used: set[str] = set()
+    for key in curated_keys:
+        if key not in detail:
+            continue
+        used.add(key)
+        value = detail.get(key)
+        if value in (None, "", [], {}):
+            continue
+        if isinstance(value, Mapping):
+            value = value.get("reason") or value.get("detail") or str(value)
+        text = str(value).replace("\n", " ").strip()
+        if not text:
+            continue
+        parts.append(f"{key}={text[:80]}")
+        if len(parts) >= 4:
+            break
+    for key, value in detail.items():
+        if len(parts) >= 5:
+            break
+        if key in used or key.startswith("_"):
+            continue
+        if value in (None, "", [], {}):
+            continue
+        if isinstance(value, (list, Mapping)):
+            continue
+        text = str(value).replace("\n", " ").strip()
+        if not text:
+            continue
+        parts.append(f"{key}={text[:60]}")
+    return " ".join(parts)
+
+
+def _audit_target_event(
+    *,
+    stage: str,
+    status: str,
+    target_id: str,
+    name: str,
+    ok: bool,
+    thread_ts: str | None,
+    channel_id: str | None,
+) -> None:
+    """Append a ``phase=target.<status>`` row to the notify.jsonl audit log when
+    the run-launcher has exposed the path via ``DOORMAN_NOTIFY_AUDIT_PATH``.
+
+    The notify.jsonl audit was previously populated only by
+    ``_outreach_core.helpers.run_job._record_notification`` for the run-level
+    ``start`` / ``terminal`` lifecycle. Per-target deliveries lived only in
+    events.jsonl, which made it harder to correlate "did the operator see X
+    in Slack?" with the .log file. This audit hook closes that gap without
+    disturbing the existing schema — old phases keep their shape, new rows
+    add ``target_id`` / ``stage`` / ``status`` / ``name`` fields.
+    """
+    path_raw = os.environ.get("DOORMAN_NOTIFY_AUDIT_PATH", "").strip()
+    if not path_raw:
+        return
+    try:
+        import datetime as _dt
+        from pathlib import Path as _Path
+        path = _Path(path_raw)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        row = {
+            "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "run_id": os.environ.get("DOORMAN_RUN_ID", "") or None,
+            "skill": os.environ.get("DOORMAN_SKILL", "") or None,
+            "phase": f"target.{status}",
+            "ok": bool(ok),
+            "channel_id": channel_id or os.environ.get("DOORMAN_SLACK_CHANNEL_ID") or None,
+            "thread": bool(thread_ts or os.environ.get("DOORMAN_SLACK_THREAD_TS")),
+            "route": last_delivery_route() or None,
+            "error": last_delivery_error() or None,
+            # v30 §WS-D — new fields populated only for per-target rows. The
+            # run-level start/terminal rows keep their original shape.
+            "target_id": str(target_id or "") or None,
+            "stage": str(stage or "") or None,
+            "status": str(status or "") or None,
+            "name": str(name or "") or None,
+        }
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError:
+        # Audit must never block the run.
+        pass
+
+
+def post_target_event(
+    *,
+    stage: str,
+    status: str,
+    target: Mapping[str, Any] | None = None,
+    detail: Mapping[str, Any] | str | None = None,
+    idx: int | None = None,
+    total: int | None = None,
+    name: str | None = None,
+    thread_ts: str | None = None,
+    channel_id: str | None = None,
+    level: str | None = None,
+) -> bool:
+    """Post a concise per-target lifecycle line to Slack. Never raises.
+
+    ``stage`` is a short tag (e.g. ``send``, ``enrich``, ``draft``). ``status``
+    must be a key of :data:`TARGET_STATUS_LABELS` for the curated emoji + label
+    treatment; unknown statuses are still accepted and pass through verbatim.
+
+    Returns ``True`` when at least one delivery route succeeded. When the
+    ``DOORMAN_TARGET_EVENT_NOTIFY=0`` env var is set, returns ``False`` without
+    attempting any delivery (events.jsonl still receives the audit row via the
+    caller's existing ``_emit_event`` calls — this function does not duplicate
+    that bookkeeping).
+
+    When ``DOORMAN_NOTIFY_AUDIT_PATH`` is set, also appends a row to that file
+    with ``phase=target.<status>`` plus the target_id / stage / status / name
+    fields. The existing ``start`` / ``terminal`` rows are unaffected.
+    """
+    if _target_event_disabled():
+        return False
+    display_name = (
+        name
+        or _target_value(target, "name", "company", "target_id", "id")
+        or "unknown"
+    )
+    text = format_target_event(
+        stage=stage, status=status, name=display_name,
+        idx=idx, total=total, detail=detail,
+    )
+    chosen_level = level or _level_for_status(status)
+    ok = post(
+        text,
+        level=chosen_level,
+        thread_ts=thread_ts,
+        channel_id=channel_id,
+    )
+    target_id = _target_value(target, "target_id", "id") or display_name
+    _audit_target_event(
+        stage=stage, status=status, target_id=target_id,
+        name=display_name, ok=ok,
+        thread_ts=thread_ts, channel_id=channel_id,
+    )
+    return ok
+
+
+def _level_for_status(status: str) -> str:
+    """Map a per-target status to the alert level used by ``_format_text``.
+
+    Sent/started/filled-only are informational. Queued/blocked/timeout warrant
+    a ⚠ prefix because the operator may want to intervene. Errors are reserved
+    for the run-level escalations (``run_give_up_*``).
+    """
+    if status in ("queued", "blocked", "timeout"):
+        return "warn"
+    return "info"
+
+
 def post(
     text: str,
     *,
