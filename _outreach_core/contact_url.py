@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import urljoin, urlparse
 
@@ -241,6 +242,10 @@ def extract_contact_urls_from_sitemap(xml_text: str | None) -> list[str]:
 
 
 # --- v15 §F3: iframe / hosted form services ---------------------------------
+#
+# v30 §WS-B adds hosts observed in production logs (LegalOn 2026-06-29) that
+# were silently missed because the parent page and the iframe host live on
+# different registrable domains.
 KNOWN_FORM_SERVICE_HOSTS = (
     "form.run",
     "formrun",
@@ -256,6 +261,10 @@ KNOWN_FORM_SERVICE_HOSTS = (
     "formmailer",
     "marketo.com",
     "salesforce.com",
+    # v30 §WS-B — LegalOn's hosted form embedded inside legalontech.jp/contact/.
+    "legalforce-cloud.com",
+    "mktoweb.com",
+    "pardot.com",
 )
 
 
@@ -441,54 +450,136 @@ def classify_form_type_v2(
 
 
 def classify_form_type(fields: dict, snapshot: str | None) -> tuple[str, str | None]:
+    """Heuristic form classifier driven by an ordered policy table.
+
+    Each policy is ``(check_fn) -> (kind, reason) | None``. The first policy
+    that returns a verdict wins. Policies are arranged from most-specific
+    (password field → register) to most-general (textarea + submit → contact).
+
+    v30 §WS-B refactor preserves the exact behaviour of the prior nested
+    if/else version (locked by ``test_contact_url*``) — the difference is
+    purely organizational: each rule now lives in a named function so a
+    failure can be attributed to the first rule that fired, and new rules
+    slot in by adding a row to ``_POLICY`` rather than threading another
+    branch through the nest.
+    """
     inputs = fields.get("inputs") or []
     textareas = fields.get("textareas") or []
     snap_head = (snapshot or "")[:3000]
+    name_blob = " ".join(
+        str(x.get("name") or x.get("label") or "") for x in inputs
+    ).lower()
+    recruit_field_hit = any(k.lower() in name_blob for k in _RECRUIT_FIELD_KW)
+    ctx = _ClassifyCtx(
+        fields=fields,
+        inputs=inputs,
+        textareas=textareas,
+        snap_head=snap_head,
+        name_blob=name_blob,
+        recruit_field_hit=recruit_field_hit,
+    )
+    for policy in _CLASSIFY_POLICIES:
+        verdict = policy(ctx)
+        if verdict is not None:
+            return verdict
+    return ("contact", None)
 
-    # Strong register signal
-    for inp in inputs:
+
+@dataclass
+class _ClassifyCtx:
+    """Pre-computed inputs shared by every policy in :data:`_CLASSIFY_POLICIES`."""
+
+    fields: dict
+    inputs: list
+    textareas: list
+    snap_head: str
+    name_blob: str
+    recruit_field_hit: bool
+
+
+def _policy_password_field(ctx: _ClassifyCtx) -> tuple[str, str] | None:
+    """Any password field → registration form, regardless of other signals."""
+    for inp in ctx.inputs:
         if str(inp.get("type", "")).lower() == "password":
             return ("register", "password field present")
+    return None
 
-    name_blob = " ".join(str(x.get("name") or x.get("label") or "") for x in inputs).lower()
-    if ("birth" in name_blob and "year" in name_blob) or ("生年月日" in name_blob):
+
+def _policy_birthdate_field(ctx: _ClassifyCtx) -> tuple[str, str] | None:
+    """A birth-date field (birth + year combo, or 生年月日) is strongly
+    register-indicating — contact forms never ask for it."""
+    if ("birth" in ctx.name_blob and "year" in ctx.name_blob) or (
+        "生年月日" in ctx.name_blob
+    ):
         return ("register", "birth-date field present")
+    return None
 
-    # Recruit should stay non-contact even with textarea when strong signals exist.
-    recruit_field_hit = any(k.lower() in name_blob for k in _RECRUIT_FIELD_KW)
-    if any(k in snap_head for k in _NON_CONTACT_HEADING_KW["recruit"]) and recruit_field_hit:
+
+def _policy_recruit_strong(ctx: _ClassifyCtx) -> tuple[str, str] | None:
+    """A recruit heading AND applicant fields → recruit (even with textarea).
+    A textarea alone on /careers/ would otherwise misclassify as contact."""
+    if (
+        any(k in ctx.snap_head for k in _NON_CONTACT_HEADING_KW["recruit"])
+        and ctx.recruit_field_hit
+    ):
         return ("recruit", "recruit heading + applicant fields")
+    return None
 
-    # Heading-based classification with B2B escape hatch for B2C/IR-like pages.
+
+def _policy_non_contact_headings(ctx: _ClassifyCtx) -> tuple[str, str] | None:
+    """Heading-based classification with B2B escape hatch for IR / b2c_support
+    / document_request. Recruit also lives here but only fires when applicant
+    fields are present or no textarea exists (a bare 採用 link in the global
+    nav must not poison a real /contact/ page)."""
     for kind, kws in _NON_CONTACT_HEADING_KW.items():
-        if any(kw in snap_head for kw in kws):
-            if kind in ("ir", "b2c_support", "document_request"):
-                if any(h in snap_head for h in _B2B_HINT_KW):
-                    continue
-                return (kind, f"heading mentions {kind}")
-            if kind == "recruit":
-                # Only declare recruit when applicant fields are also present
-                # OR there's no contact textarea at all. A bare 採用 link in
-                # the global nav must not poison a real /contact/ page.
-                if recruit_field_hit or not textareas:
-                    return (kind, "recruit heading detected")
+        if not any(kw in ctx.snap_head for kw in kws):
+            continue
+        if kind in ("ir", "b2c_support", "document_request"):
+            if any(h in ctx.snap_head for h in _B2B_HINT_KW):
                 continue
-            if not textareas:
-                return (kind, f"heading mentions {kind}")
+            return (kind, f"heading mentions {kind}")
+        if kind == "recruit":
+            if ctx.recruit_field_hit or not ctx.textareas:
+                return (kind, "recruit heading detected")
+            continue
+        if not ctx.textareas:
+            return (kind, f"heading mentions {kind}")
+    return None
 
-    # Pre-form gate page: no textarea yet, but this is still the right contact flow.
-    if _looks_like_contact_gate(fields, snap_head):
+
+def _policy_pre_form_gate(ctx: _ClassifyCtx) -> tuple[str, str] | None:
+    """A pre-form gate page (no textarea yet, but the page invites a contact
+    inquiry via radio / agreement checkbox) is still the right contact flow."""
+    if _looks_like_contact_gate(ctx.fields, ctx.snap_head):
         return ("contact", "pre_form_gate")
+    return None
 
-    has_contact_textarea = _has_contact_textarea(fields)
-    has_submit = _has_submit_control(fields, snap_head)
-    if has_contact_textarea and has_submit:
+
+def _policy_textarea_plus_submit(ctx: _ClassifyCtx) -> tuple[str, str] | None:
+    """The canonical contact form: an inquiry textarea + a submit control."""
+    if _has_contact_textarea(ctx.fields) and _has_submit_control(
+        ctx.fields, ctx.snap_head
+    ):
         return ("contact", "textarea_plus_submit")
+    return None
 
-    if not has_contact_textarea:
+
+def _policy_no_textarea(ctx: _ClassifyCtx) -> tuple[str, str] | None:
+    """No inquiry textarea (and not a pre-form gate) → cannot send."""
+    if not _has_contact_textarea(ctx.fields):
         return ("unknown_no_textarea", "no valid inquiry textarea")
+    return None
 
-    return ("contact", None)
+
+_CLASSIFY_POLICIES = (
+    _policy_password_field,
+    _policy_birthdate_field,
+    _policy_recruit_strong,
+    _policy_non_contact_headings,
+    _policy_pre_form_gate,
+    _policy_textarea_plus_submit,
+    _policy_no_textarea,
+)
 
 
 def is_error_page(snapshot: str | None, url: str | None = None, http_status: int | None = None) -> bool:
