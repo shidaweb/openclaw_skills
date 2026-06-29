@@ -149,22 +149,67 @@ def should_auto_check_checkbox(box: dict[str, Any] | None) -> bool:
     return required or is_agreement_label(label)
 
 
-def pick_checkboxes_to_check(checkboxes: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    if not isinstance(checkboxes, list):
-        return []
-    candidates = [box for box in checkboxes if should_auto_check_checkbox(box)]
-    out: list[dict[str, Any]] = []
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for box in candidates:
-        group_label = str(box.get("group_label") or "").strip()
-        if group_label and not is_agreement_label(str(box.get("label") or "")):
-            grouped.setdefault(group_label, []).append(box)
-        else:
-            out.append(box)
+# v30 §WS-A — concept-separated checkbox pickers.
+#
+# Previously a single ``pick_checkboxes_to_check`` collapsed three semantically
+# distinct decisions:
+#
+#   (a) Consent / agreement boxes  — 個人情報の取扱いに同意, 利用規約 …
+#   (b) Inquiry-type checkbox GROUPS — pick exactly one safe option
+#   (c) Standalone required boxes  — a lone required checkbox without a group
+#
+# Mixing them made unit-testing each rule independently awkward and meant a
+# brief-specific tweak to one concept could not be expressed without touching
+# the others. The three helpers below capture each concept in isolation; the
+# original ``pick_checkboxes_to_check`` is now a thin facade that concatenates
+# their outputs (preserving every existing call site).
 
-    # A shared visual 必須 marker often means "choose at least one" for the
-    # whole checkbox group.  Checking every option fabricates preferences and
-    # can itself make a form invalid.  Pick one semantically safe option.
+
+def _iter_actionable(checkboxes: list[dict[str, Any]] | None):
+    """Yield checkboxes that pass :func:`should_auto_check_checkbox`."""
+    if not isinstance(checkboxes, list):
+        return
+    for box in checkboxes:
+        if should_auto_check_checkbox(box):
+            yield box
+
+
+def pick_consent_actions(
+    checkboxes: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Consent / agreement checkboxes (privacy policy, terms of use).
+
+    Identified by :func:`is_agreement_label`. Always a single-checkbox commit
+    — never grouped because each agreement is independent.
+    """
+    return [
+        box
+        for box in _iter_actionable(checkboxes)
+        if is_agreement_label(str(box.get("label") or ""))
+    ]
+
+
+def pick_inquiry_type_actions(
+    checkboxes: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Inquiry-type checkbox GROUPS — pick exactly one safe option per group.
+
+    A shared visual 必須 marker on a group ("以下から選択してください") means the
+    operator must commit at least one option, not all. Checking every option
+    fabricates preferences and can itself fail validation, so we route the
+    group's options through :func:`choose_b2b_option` and pick the single
+    safest one.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for box in _iter_actionable(checkboxes):
+        label = str(box.get("label") or "")
+        if is_agreement_label(label):
+            continue
+        group_label = str(box.get("group_label") or "").strip()
+        if not group_label:
+            continue
+        grouped.setdefault(group_label, []).append(box)
+    out: list[dict[str, Any]] = []
     for boxes in grouped.values():
         if len(boxes) == 1:
             out.append(boxes[0])
@@ -173,6 +218,34 @@ def pick_checkboxes_to_check(checkboxes: list[dict[str, Any]] | None) -> list[di
         if picked is not None:
             out.append(picked)
     return out
+
+
+def pick_required_checkbox_actions(
+    checkboxes: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Standalone required checkboxes that aren't agreements and aren't part
+    of a multi-option group. A lone required box (e.g. 「キャンペーンに参加する」)
+    falls here.
+    """
+    return [
+        box
+        for box in _iter_actionable(checkboxes)
+        if not is_agreement_label(str(box.get("label") or ""))
+        and not str(box.get("group_label") or "").strip()
+    ]
+
+
+def pick_checkboxes_to_check(
+    checkboxes: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Backward-compatible facade — concatenates consent + inquiry-type group
+    + standalone required picks in that order. Existing call sites keep
+    working without change."""
+    return (
+        pick_consent_actions(checkboxes)
+        + pick_inquiry_type_actions(checkboxes)
+        + pick_required_checkbox_actions(checkboxes)
+    )
 
 
 def _pick_checkbox_group_candidate(
@@ -409,7 +482,75 @@ def validate_choice(options: list[Any] | None, chosen: str | None) -> bool:
     return False
 
 
-def choose_b2b_option(options: list[Any] | None) -> dict[str, Any] | None:
+# v30 §WS-A — B2B option scoring config.
+#
+# The +6 / +3 / -8 / -4 / sonota / floor numbers were hard-coded inside
+# choose_b2b_option, so a brief that wanted to soften the bias (e.g. ECC, where
+# the historically-strong "資料請求" avoid keyword is the right answer) had no
+# legitimate way to override without forking the module. These constants are
+# the legacy defaults; callers may pass a partial overlay via ``scores=`` or
+# ``brief_b2b_scoring(...)``.
+B2B_DEFAULT_SCORES: dict[str, int | float] = {
+    "strong_prefer": 6,
+    "weak_prefer": 3,
+    "strong_avoid": -8,
+    "weak_avoid": -4,
+    "sonota_bonus": 1,
+    # Decision floors — a top score below ``min_top_score`` is rejected so we
+    # never pick a "least bad" option that nothing actually preferred.
+    "min_top_score": 2,
+    # Confidence demotion: top scores below this OR within ``confidence_gap``
+    # of the second option are flagged "low" so the caller can escalate.
+    "high_confidence_floor": 5,
+    "confidence_gap": 1,
+}
+
+
+def b2b_scores_from_config(
+    config: Any,
+    *,
+    defaults: dict[str, int | float] | None = None,
+) -> dict[str, int | float]:
+    """Merge ``defaults`` with the brief / persona overlay at
+    ``b2b_scoring`` (top-level) or ``send.b2b_scoring``. Missing keys keep
+    their default value; unknown keys are ignored (so a yaml typo cannot
+    silently change behaviour). Non-numeric overlay values are ignored.
+    """
+    base = dict(defaults or B2B_DEFAULT_SCORES)
+    if not isinstance(config, dict):
+        return base
+    overlays: list[Any] = []
+    overlays.append(config.get("b2b_scoring"))
+    send_block = config.get("send")
+    if isinstance(send_block, dict):
+        overlays.append(send_block.get("b2b_scoring"))
+    for overlay in overlays:
+        if not isinstance(overlay, dict):
+            continue
+        for key, value in overlay.items():
+            if key not in base:
+                continue
+            if isinstance(value, bool):  # bool is a subclass of int — reject
+                continue
+            if isinstance(value, (int, float)):
+                base[key] = value
+    return base
+
+
+def choose_b2b_option(
+    options: list[Any] | None,
+    *,
+    scores: dict[str, int | float] | None = None,
+) -> dict[str, Any] | None:
+    """Pick the best B2B-aligned option from a select/radio/checkbox group.
+
+    The scoring weights default to :data:`B2B_DEFAULT_SCORES` but callers may
+    pass a brief-specific overlay via ``scores`` (already merged by
+    :func:`b2b_scores_from_config`). All numeric thresholds are read from the
+    same mapping so a partial overlay can soften or sharpen any axis without
+    forking the module.
+    """
+    s = dict(scores or B2B_DEFAULT_SCORES)
     candidates = _normalize_options(options or [])
     scored: list[dict[str, Any]] = []
     prefer_hits = 0
@@ -428,21 +569,21 @@ def choose_b2b_option(options: list[Any] | None) -> dict[str, Any] | None:
         weak_prefer = bool(_WEAK_PREFER_RE.search(text))
         strong_avoid = bool(_STRONG_AVOID_RE.search(text))
         weak_avoid = bool(_WEAK_AVOID_RE.search(text))
-        score = 0
+        score: float = 0
         if strong_prefer:
-            score += 6
+            score += s["strong_prefer"]
         elif weak_prefer:
-            score += 3
+            score += s["weak_prefer"]
         if strong_avoid:
-            score -= 8
+            score += s["strong_avoid"]
         elif weak_avoid:
-            score -= 4
+            score += s["weak_avoid"]
         if "その他" in text:
-            score += 1
+            score += s["sonota_bonus"]
             if sonota_candidate is None:
                 sonota_candidate = {
                     "value": label or value,
-                    "score": 1,
+                    "score": int(s["sonota_bonus"]),
                     "confidence": "low",
                     "reason": "fallback_sonota",
                 }
@@ -463,13 +604,16 @@ def choose_b2b_option(options: list[Any] | None) -> dict[str, Any] | None:
         return sonota_candidate
     scored.sort(key=lambda x: x["score"], reverse=True)
     top = scored[0]
-    if top["score"] < 2:
+    if top["score"] < s["min_top_score"]:
         return None
     second = scored[1] if len(scored) > 1 else None
     confidence = "high"
-    if top["score"] < 5 or (second and (top["score"] - second["score"]) <= 1):
+    if (
+        top["score"] < s["high_confidence_floor"]
+        or (second and (top["score"] - second["score"]) <= s["confidence_gap"])
+    ):
         confidence = "low"
-    reason = f"score={top['score']}, prefer_hits={prefer_hits}"
+    reason = f"score={int(top['score'])}, prefer_hits={prefer_hits}"
     return {
         "value": top["value"],
         "score": int(top["score"]),

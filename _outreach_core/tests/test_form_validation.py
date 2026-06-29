@@ -188,5 +188,77 @@ class TestParseValidationErrors(unittest.TestCase):
         self.assertEqual(errs[0]["kind"], "hankaku_numeric")
 
 
+class TestAriaSnapshotLeakage(unittest.TestCase):
+    """v30 §WS-A: production runs concatenated Playwright aria-snapshot output with
+    page text and fed both into the regex parser. Body paragraphs and row labels
+    got captured as 'required' fields, so the resolver looped clicking "次へ" with
+    nothing to fix. Reproduces Fujisoft, SUPER STUDIO, MIL needs_attention items
+    from 2026-06-29 / 2026-06-27 runs.
+    """
+
+    def test_fujisoft_consent_paragraph_not_flagged_as_required(self) -> None:
+        # The full privacy-policy paragraph from the Fujisoft form's consent table.
+        # Ends with 「が含まれます。」 — no 〜してください, no 必須 marker.
+        text = (
+            "- text: 自動的に収集・記録される個人情報には、お客様のアクセスログ情報"
+            "（アプリケーション異常終了時の情報、 アクセスしたページ、ドメイン名、IP"
+            " アドレス、参照元情報、使用しているブラウザの種類、アクセス日時、 Cookie"
+            " 情報、利用した検索エンジン、検索エンジンに入力した検索キーワード、弊社"
+            "から配信されるメール 文面記載のクリックカウント URL のうち、どの URLから"
+            "流入したかなど）が含まれます。"
+        )
+        errs = fv.parse_validation_errors(text)
+        self.assertEqual(
+            errs, [],
+            f"aria-snapshot text-node body should not be parsed as a field error: {errs}",
+        )
+
+    def test_fujisoft_instruction_paragraph_not_flagged(self) -> None:
+        # Instruction line that DOES contain a verb in the regex set: the aria
+        # tree leaks 「ご記入」 from the form help text.
+        text = "- text: 以下の項目に必要事項をご記入後、「次へ」ボタンを押してください。"
+        errs = fv.parse_validation_errors(text)
+        self.assertEqual(errs, [], f"instruction body should not be a field: {errs}")
+
+    def test_aria_tree_text_with_verb_not_flagged(self) -> None:
+        # A 「〜を入力し〜」 sentence appearing inside a body paragraph — exactly
+        # what Fujisoft's privacy text contained ("検索エンジンに入力した").
+        text = "- text: 弊社では、検索エンジンに入力した検索キーワードを記録します。"
+        errs = fv.parse_validation_errors(text)
+        self.assertEqual(errs, [])
+
+    def test_aria_tree_row_label_not_flagged(self) -> None:
+        # Row/cell labels with embedded errors-icon text ("！ 必ず…してください")
+        # — the SUPER STUDIO / MIL logs surfaced exactly this kind of leak.
+        text = (
+            '- row "部署名 必須 ！ 必ず入力してください" [ref=e35]:\n'
+            '  - rowheader "部署名 必須" [ref=e36]\n'
+            '  - cell "！ 必ず入力してください" [ref=e38]'
+        )
+        errs = fv.parse_validation_errors(text)
+        self.assertEqual(errs, [], f"row/cell tree nodes leaked as fields: {errs}")
+
+    def test_aria_tree_generic_node_not_flagged(self) -> None:
+        # Bare tree node descriptors must never produce a field entry.
+        text = "- generic [ref=e42]\n- paragraph [ref=e13]\n- /url: https://x.example/"
+        errs = fv.parse_validation_errors(text)
+        self.assertEqual(errs, [])
+
+    def test_genuine_error_alongside_snapshot_still_parsed(self) -> None:
+        # Mixing real error lines with snapshot noise: real ones survive, noise
+        # is filtered. (The aria-tree line below contains the SAME 「入力し」
+        # verb pattern as the real error.)
+        text = (
+            "- text: 自動的に収集・記録される個人情報を当社に入力してください。\n"
+            "メールアドレスを入力してください\n"
+            '- row "氏名 必須" [ref=e35]'
+        )
+        errs = fv.parse_validation_errors(text)
+        kinds = [(e["field"], e["kind"]) for e in errs]
+        self.assertIn(("メールアドレス", "required"), kinds)
+        # The aria-snapshot lines must NOT contribute extra required entries.
+        self.assertEqual(len(errs), 1, f"expected 1 error, got {kinds}")
+
+
 if __name__ == "__main__":
     unittest.main()

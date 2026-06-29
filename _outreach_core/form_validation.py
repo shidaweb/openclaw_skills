@@ -334,9 +334,70 @@ _ERR_HANKAKU_NUMERIC_RE = re.compile(
 )
 _JP_WORD_RE = re.compile(r"[ぁ-んァ-ヶ一-龠a-zA-Z0-9]")
 
+# v30 §WS-A — Playwright aria-snapshot tree leakage filter.
+#
+# Production runs (Fujisoft 2026-06-29, SUPER STUDIO / MIL 2026-06-27) fed the
+# regex parser a string containing the aria-snapshot tree (e.g.
+# 「- text: …検索エンジンに入力した…」, 「- row "氏名 必須" [ref=eXX]」). Body text
+# inside `text:` nodes triggered the 〜してください regex, producing phantom
+# "required" fields that the resolver could not match to any real input, so the
+# wizard looped clicking 「次へ」 indefinitely.
+#
+# Two complementary guards:
+#   1. _ARIA_TREE_LINE_RE skips structural tree lines that have no concrete
+#      error content (a node descriptor like `- generic [ref=e42]` on its own).
+#   2. _FIELD_LOOKS_LIKE_TREE_LEAK_RE rejects a captured field name whose head
+#      looks like an aria-tree role token leaking through ("text: …",
+#      'row "…', 'cell "…' etc.). Real form labels never start with those.
+#
+# We keep tree lines that DO contain a real inline error after the role prefix
+# (e.g. `- generic [ref=e386]: 数値を半角で入力してください。`) — see
+# test_hankaku_numeric_is_format_not_required.
+_ARIA_TREE_ROLE_WORDS = (
+    "text|row|cell|generic|paragraph|listitem|list|link|rowheader|rowgroup"
+    "|table|img|textbox|checkbox|radio|combobox|searchbox|navigation|main"
+    "|article|banner|contentinfo|complementary|heading|status|button"
+    "|tabpanel|tablist|tab|dialog|menu|menuitem|menubar|switch|slider"
+)
+# A *bare* tree node line — no inline content after the descriptor. These are
+# scaffolding (subtree headers / refs). We also catch URL leak lines.
+_ARIA_TREE_LINE_RE = re.compile(
+    rf"^\s*-\s+(?:{_ARIA_TREE_ROLE_WORDS})\b"
+    rf'(?:\s+"[^"]*")?\s*(?:\[[^\]]*\])?\s*:?\s*$'
+)
+_ARIA_URL_LINE_RE = re.compile(r"^\s*-?\s*/url:\s*\S")
+# A captured field name that starts with an aria-tree role token followed by
+# the syntactic separator the snapshot uses (":", `"`, `[`, ` `) is a leak.
+_FIELD_LOOKS_LIKE_TREE_LEAK_RE = re.compile(
+    rf"^(?:{_ARIA_TREE_ROLE_WORDS})\s*(?::|\"|\[|$)"
+)
+
+# Real field labels are short. Privacy-policy paragraphs that leak through as
+# "field names" are typically >30 chars because the regex captured a sentence
+# fragment. Cap defensively so body-text false positives don't survive even if
+# the leak filter misses a novel snapshot shape.
+_FIELD_MAX_LEN = 30
+
 
 def _clean_field(raw: str) -> str:
-    return raw.strip().strip(_QUOTE_CHARS).strip().strip("*＊").strip().strip(_QUOTE_CHARS).strip()
+    s = raw.strip().strip(_QUOTE_CHARS).strip().strip("*＊").strip()
+    # v30 §WS-A — leading list-bullet from aria-snapshot lines ("- text: …",
+    # "- row \"…") must be stripped so the tree-leak detector can see the role
+    # token at the start of the captured field.
+    s = re.sub(r"^-+\s+", "", s).strip()
+    return s.strip(_QUOTE_CHARS).strip()
+
+
+def _is_field_capture_valid(field: str) -> bool:
+    """Reject captured 'field' strings that came from aria-snapshot leakage or
+    are too long to plausibly be a form label."""
+    if not field:
+        return False
+    if len(field) > _FIELD_MAX_LEN:
+        return False
+    if _FIELD_LOOKS_LIKE_TREE_LEAK_RE.match(field):
+        return False
+    return True
 
 
 def parse_validation_errors(text: str | None) -> list[dict[str, str]]:
@@ -354,11 +415,18 @@ def parse_validation_errors(text: str | None) -> list[dict[str, str]]:
         line = line.strip()
         if not line:
             continue
+        # v30 §WS-A — drop pure aria-snapshot scaffolding lines. Lines that have
+        # real inline content after the role descriptor still flow through
+        # (e.g. `- generic [ref=e386]: 数値を半角で入力してください。`).
+        if _ARIA_TREE_LINE_RE.match(line) or _ARIA_URL_LINE_RE.match(line):
+            continue
         m = _ERR_FORMAT_RE.search(line) or _ERR_FORMAT2_RE.search(line)
         if m:
             field = _clean_field(m.group("f"))
+            if not _is_field_capture_valid(field):
+                continue
             key = (field, "format")
-            if field and key not in seen:
+            if key not in seen:
                 seen.add(key)
                 out.append({"field": field, "kind": "format", "raw": line})
             continue
@@ -366,7 +434,11 @@ def parse_validation_errors(text: str | None) -> list[dict[str, str]]:
         if m:
             field = _clean_field(m.group("f"))
             # length/content guard: drop bare hints like 「（全角で入力してください）」
-            if len(field) >= 2 and _JP_WORD_RE.search(field):
+            if (
+                len(field) >= 2
+                and _JP_WORD_RE.search(field)
+                and _is_field_capture_valid(field)
+            ):
                 key = (field, "zenkaku")
                 if key not in seen:
                     seen.add(key)
@@ -375,6 +447,12 @@ def parse_validation_errors(text: str | None) -> list[dict[str, str]]:
         m = _ERR_HANKAKU_NUMERIC_RE.search(line)
         if m:
             field = _clean_field(m.group("f")) or "数値"
+            # The hankaku-numeric rule legitimately allows aria-tree decorations
+            # to lead the line (e.g. `- generic [ref=eN]:` before 「数値を…」).
+            # We only reject if the cleaned field is itself a tree leak. The
+            # default 「数値」 fallback is always acceptable.
+            if field != "数値" and not _is_field_capture_valid(field):
+                field = "数値"
             key = (field, "hankaku_numeric")
             if key not in seen:
                 seen.add(key)
@@ -383,8 +461,10 @@ def parse_validation_errors(text: str | None) -> list[dict[str, str]]:
         m = _ERR_REQUIRED_RE.search(line) or _ERR_REQUIRED2_RE.search(line)
         if m:
             field = _clean_field(m.group("f"))
+            if not _is_field_capture_valid(field):
+                continue
             key = (field, "required")
-            if field and key not in seen:
+            if key not in seen:
                 seen.add(key)
                 out.append({"field": field, "kind": "required", "raw": line})
     return out
