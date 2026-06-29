@@ -276,3 +276,120 @@ def test_unfixable_validation_bounce_terminates_as_validation_stuck(monkeypatch)
         flow="single", mode="auto", trace=None, tid="t1", timeline=[],
     )
     assert res["status"] == "validation_stuck"
+
+
+# v30 §WS-A — wizard same-button-streak gate.
+#
+# Production failure: Fujisoft 2026-06-29 clicked 次へ three times against an
+# input page whose fingerprint flickered (validation banner re-rendered). The
+# legacy `no_progress` gate did NOT catch this because the fingerprint was
+# never identical twice in a row. The wizard's same-button gate must fire
+# even when the fingerprint flickers, as long as the observation state stays
+# the same and the same button is clicked repeatedly.
+
+
+class FlickeringFingerprintBrowser:
+    """Same observation_state across clicks, but a new fingerprint each time —
+    every iteration returns slightly different text so the legacy no_progress
+    counter never trips. Used to lock in the wizard's same-button-streak gate."""
+
+    def __init__(self, base_page: dict) -> None:
+        self.base = base_page
+        self.clicks = 0
+        self.observe_calls = 0
+
+    def evaluate(self, js: str):
+        if "probe_text_hits" in js:  # send_state evidence probe
+            self.observe_calls += 1
+            return {**self.base, "text": self.base["text"] + f" round={self.observe_calls}"}
+        if "__ocDialogArmed" in js:
+            return {"armed": True}
+        if js.strip().startswith("() => (window.__ocDialogLog"):
+            return []
+        if "title: document.title" in js:
+            return {"url": self.base["url"], "title": self.base["title"], "text": self.base["text"]}
+        if '"patterns"' in js and "const fn =" in js:
+            self.clicks += 1
+            return {"clicked": True, "text": "次へ", "scope": "form"}
+        return []
+
+
+def test_wizard_same_button_streak_short_circuits_loop(monkeypatch):
+    # Page state stays "input" through every observation; each click "succeeds"
+    # but does nothing useful. The wizard fires REASON_SAME_BUTTON after 3
+    # clicks of the same button text.
+    fake = FlickeringFingerprintBrowser(INPUT_PAGE)
+    _wire(monkeypatch, fake)
+    res = run._submission_loop(
+        _target(), CONFIG, "はじめまして。",
+        flow="single", mode="auto", trace=None, tid="t1", timeline=[],
+    )
+    assert res["status"] == "ineffective"
+    assert "wizard_stuck" in res
+    stuck = res["wizard_stuck"]
+    assert stuck["reason"] == "same_button_repeated"
+    assert "次へ" in stuck["detail"]
+    # The legacy MAX_FORM_STEPS+2=6 cap would have allowed up to 6 clicks; the
+    # wizard short-circuits at exactly 3.
+    assert res["clicks"] == 3
+
+
+# v30 §WS-E — target_state checkpoint is written from the send loop.
+#
+# The runtime snapshot is a diagnostic breadcrumb: each observation updates
+# hop / observation_state / last_button so a crashed process leaves enough
+# information on disk for the next run to surface "this target was at wizard
+# hop=N when the previous run died". send_journal owns the safety-critical
+# double-send decision; this only enriches diagnostics.
+
+
+def test_target_state_checkpoint_written_during_submission(monkeypatch, tmp_path):
+    from _outreach_core import target_state as ts_mod
+
+    fake = FakeBrowser([INPUT_PAGE, CONFIRM_PAGE, DONE_PAGE])
+    _wire(monkeypatch, fake)
+    captured: list[dict] = []
+    original_merge = ts_mod.merge_update
+
+    def _capture(*args, **kwargs):
+        captured.append(kwargs)
+        return original_merge(*args, **kwargs)
+
+    monkeypatch.setattr(ts_mod, "merge_update", _capture)
+    monkeypatch.setattr(run.core_target_state, "merge_update", _capture)
+    monkeypatch.setattr(run, "DATA_DIR", tmp_path)
+    res = run._submission_loop(
+        _target(), CONFIG, "はじめまして。",
+        flow="confirm", mode="auto", trace=None, tid="t1", timeline=[],
+    )
+    assert res["status"] == "done"
+    # Each observation produced a merge_update with phase="send.observed".
+    observed_phases = [c.get("phase") for c in captured]
+    assert "send.observed" in observed_phases
+    # The hop value progresses across observations (>=2 because confirm flow
+    # observes input → confirm → done).
+    hops = [c.get("hop") for c in captured if c.get("hop") is not None]
+    assert max(hops) >= 2
+
+
+def test_target_state_cleared_on_terminal_skipped(monkeypatch, tmp_path):
+    # When _auto_skip_and_log fires for a target, the runtime snapshot is
+    # removed — list_runtime_states should not show the skipped target.
+    from _outreach_core import target_state as ts_mod
+
+    monkeypatch.setattr(run, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(run, "append_skip_history", lambda *a, **k: None)
+    monkeypatch.setattr(run, "close_needs_attention", lambda *a, **k: True)
+    monkeypatch.setattr(run, "_emit_event", lambda *a, **k: None)
+    # Stub the WS-D notification so the test does not depend on Slack config.
+    from _outreach_core import notify as _notify
+    monkeypatch.setattr(_notify, "post_target_event", lambda **kw: True)
+
+    target = {"id": "t-skip", "name": "ABC株式会社",
+              "draft": {"body": "はじめまして。"}}
+    # Seed a snapshot to verify it gets cleared.
+    ts_mod.merge_update(tmp_path, "t-skip", phase="send.observed", hop=2)
+    assert ts_mod.read_state(tmp_path, "t-skip") is not None
+    run._auto_skip_and_log(target, "captcha_human_required: v2")
+    # Snapshot must be gone now.
+    assert ts_mod.read_state(tmp_path, "t-skip") is None

@@ -46,6 +46,8 @@ from _outreach_core import send_state as core_send_state
 from _outreach_core import send_timeline as core_timeline
 from _outreach_core import submit_progress as core_submit_progress
 from _outreach_core import tab_utils as core_tab_utils
+from _outreach_core import target_state as core_target_state
+from _outreach_core import wizard as core_wizard
 from _outreach_core import infer as core_infer
 from _outreach_core import preview as core_preview
 from _outreach_core import prompt as core_prompt
@@ -3241,9 +3243,24 @@ def _harvest_and_fix_validation_errors(
         return out
     try:
         ev_res = _evaluate(PAGE_EVIDENCE_JS)
-        page_text = ev_res.get("text", "") if isinstance(ev_res, dict) else ""
-        snap = oc_browser("snapshot") or ""
-        combined = f"{snap}\n{page_text}"
+        if isinstance(ev_res, dict):
+            page_text = ev_res.get("text", "") or ""
+            # v30 §WS-A — prefer the curated error containers (.error / [role=alert]
+            # / aria-live) over body innerText so we parse only short, located
+            # error messages, not body paragraphs. Fall back to innerText when
+            # the curated text is empty (sites whose errors aren't tagged).
+            curated = (
+                ev_res.get("cf7_response_text")
+                or ev_res.get("submission_status_text")
+                or ""
+            )
+            combined = f"{curated}\n{page_text}" if curated else page_text
+        else:
+            combined = ""
+        # The aria-snapshot tree is intentionally NOT included here. It used to
+        # be concatenated for "more signal" but caused phantom required-field
+        # captures from body paragraphs and row labels — see
+        # form_validation._ARIA_TREE_LINE_RE and the WS-A regression tests.
     except Exception:
         return out
 
@@ -4385,6 +4402,35 @@ def _has_form_analyzer_escalation(config: dict[str, Any] | None) -> bool:
     base = _form_analyzer_base_model(config)
     escalated = _form_analyzer_escalation_model(config)
     return bool(escalated and escalated != base)
+
+
+def _verify_model(config: dict[str, Any] | None) -> str:
+    """v30 §WS-F — model used for verify-stage LLM tiebreak.
+
+    Resolution order:
+
+      * ``config.model.verify_name`` — brief- or persona-specific override
+      * ``model.form_analyzer_name`` — legacy fallback (the verify tiebreak
+        historically reused the form analyzer's base model, which conflated
+        two unrelated concerns)
+      * ``model.name`` — global default
+      * :data:`core_infer.DEFAULT_MODEL` — Sonnet, the canonical fast judge
+
+    Separating verify from the form analyzer matters because:
+
+      * Verify is called once per target on the final page evidence — a fast
+        Sonnet judge keeps cost predictable.
+      * The form analyzer may legitimately be escalated to Opus on hard
+        forms; that escalation should not bleed into verify and inflate
+        every send's LLM bill.
+    """
+    model_cfg = (config or {}).get("model", {}) or {}
+    return str(
+        model_cfg.get("verify_name")
+        or model_cfg.get("form_analyzer_name")
+        or model_cfg.get("name")
+        or DEFAULT_MODEL
+    )
 
 
 def _config_with_form_analyzer_model(
@@ -5856,6 +5902,27 @@ def _auto_skip_and_log(target: dict[str, Any], reason: str) -> None:
         target_id=str(tid),
         payload={"reason": reason[:160]},
     )
+    # v30 §WS-E — drop the runtime snapshot for a definitively skipped
+    # target. send_journal still records the lifecycle; this only clears
+    # the diagnostic "last position" file so list_runtime_states reflects
+    # in-flight targets only.
+    try:
+        core_target_state.clear_state(DATA_DIR, str(tid))
+    except Exception:  # noqa: BLE001
+        pass
+    # v30 §WS-D — surface auto-skips to Slack so the thread stops looking
+    # silent when several targets are skipped in a row. Best-effort; the
+    # decision is already persisted to skip_history above.
+    try:
+        from _outreach_core import notify as _notify
+        _notify.post_target_event(
+            stage="send",
+            status="skipped",
+            target=target,
+            detail={"reason": reason[:160]},
+        )
+    except Exception:  # noqa: BLE001 - Slack must never abort the loop
+        pass
 
 
 def _config_with_warmup_sec(config: dict[str, Any] | None, warm_sec: int) -> dict[str, Any]:
@@ -6034,6 +6101,39 @@ _PAGE_TEXT_HEAD_JS = r"""
 """
 
 
+def _try_iframe_form_takeover(
+    d: dict[str, Any],
+    fields: dict[str, Any] | None,
+    trace: Any,
+    tid: str,
+) -> str | None:
+    """v30 §WS-B / §WS-E — thin shim over
+    :func:`_outreach_core.send_pipeline.try_iframe_form_takeover` so the
+    existing call site stays intact while the underlying logic now lives in
+    a unit-testable module without hidden globals.
+
+    Behaviour is identical to the pre-extraction version: when the top-level
+    page has no form but a hosted-form iframe is present, navigate to the
+    iframe src and let the send pipeline operate against that page directly.
+    Returns the iframe src on success, ``None`` otherwise.
+    """
+    from _outreach_core import send_pipeline as _sp
+
+    def _open(src: str) -> None:
+        print(f"  [send] ↳ iframe-hosted form 検出 → open {src}")
+        oc_browser("open", src)
+
+    return _sp.try_iframe_form_takeover(
+        d, fields,
+        open_url=_open,
+        sleep_fn=time.sleep,
+        sleep_sec=float(RATE_LIMIT_SECONDS),
+        emit_event=_emit_event,
+        trace_dir=trace,
+        target_id=tid,
+    )
+
+
 def _assess_page_and_recover(
     d: dict[str, Any],
     timeline: list[dict[str, Any]],
@@ -6061,9 +6161,38 @@ def _assess_page_and_recover(
         )
 
     state, page_fields, page_text = _scan()
+    # v30 §WS-B — progressive poll for client-rendered (SPA) forms. The legacy
+    # single 3s wait was a magic number that fired too early for Medley /
+    # ROXX class pages where React + code-splitting takes 5–8 seconds to
+    # populate the DOM. Poll at 1.5s + 3s (cumulative 4.5s); stop as soon as a
+    # form materialises. Total worst case ≈ 5s, equal to the legacy budget
+    # but with a chance to succeed earlier and a chance to succeed at all on
+    # slower SPAs.
     if state.get("state") == "empty_render":
-        time.sleep(3)
-        state, page_fields, page_text = _scan()
+        for wait_sec in (1.5, 3.0):
+            time.sleep(wait_sec)
+            state, page_fields, page_text = _scan()
+            if state.get("state") != "empty_render":
+                _emit_event(
+                    "send.client_rendered.rescued",
+                    stage="send", target_id=tid,
+                    payload={
+                        "state": state.get("state"),
+                        "wait_sec": float(wait_sec),
+                    },
+                    trace_dir=trace,
+                )
+                break
+        else:
+            # v30 §WS-B — if the form never rendered, look for a hosted-form
+            # iframe (HubSpot / formrun / Tayori / Salesforce / same-domain
+            # embed). LegalOn-class: the form lives on lp.legalforce-cloud.com
+            # inside the parent /contact/ page. We don't drive the iframe in
+            # place — instead, navigate to the iframe src as a top-level page
+            # so the rest of the send pipeline operates without iframe scoping.
+            iframe_src = _try_iframe_form_takeover(d, page_fields, trace, tid)
+            if iframe_src:
+                state, page_fields, page_text = _scan()
     ok = state.get("state") in ("form_ok", "gate_like")
     core_timeline.add(
         timeline, "page_state", ok,
@@ -6187,7 +6316,13 @@ def _queue_for_resolver(
         "diagnostics": diag,
     }
     core_resolve_queue.enqueue(DATA_DIR, entry)
-    slack_message = core_resolve_queue.build_actionable_message(entry, auto_resolver=autonomous)
+    # v30 §WS-F — emit BOTH the legacy text and the structured action list so
+    # the OpenClaw Slack bot can render buttons (URL/retry/skip) once its end
+    # is updated. Existing consumers that only read ``slack_message`` keep
+    # working unchanged.
+    actionable = core_resolve_queue.build_actionable_payload(entry, auto_resolver=autonomous)
+    slack_message = actionable["text"]
+    slack_actions = actionable["actions"]
     append_needs_attention(
         DATA_DIR,
         {
@@ -6200,6 +6335,7 @@ def _queue_for_resolver(
             "buttons": diag.get("buttons"),
             "snapshot_path": diag.get("snapshot_path"),
             "slack_message": slack_message,
+            "slack_actions": slack_actions,
         },
     )
     _emit_event(
@@ -6648,6 +6784,12 @@ def _submission_loop(
     input_rescue_done = False
     last_validation_errors: list[dict[str, str]] = []
     phase = "first" if flow == "confirm" else "final"
+    # v30 §WS-A — runs alongside the legacy counters so the same-button-streak
+    # gate (Fujisoft 「次へ」 ×3 / SUPER STUDIO 「内容確認へ」 ×3) has a chance to
+    # fire before the per-iteration ineffective check. Legacy counters remain
+    # the primary fingerprint/validation gates for now.
+    wizard_state = core_wizard.WizardState()
+    wizard_cfg = core_wizard.WizardConfig()
 
     for step in range(MAX_FORM_STEPS + 2):
         _arm_dialog_autoaccept()
@@ -6673,6 +6815,72 @@ def _submission_loop(
             timeline, "live_state", state not in ("no_form",),
             step=step, state=state,
         )
+        # v30 §WS-A — pure state update + stuck check. Returns early ONLY for
+        # the same-button-clicks gate, which the legacy counters did not
+        # catch (Fujisoft 「次へ」×3 with fingerprint flicker). The other stuck
+        # codes are also produced (REASON_NO_PROGRESS, REASON_MAX_HOPS,
+        # REASON_VALIDATION_UNRECOVERABLE) but fall through to the existing
+        # legacy gates so the behaviour for well-behaved forms is unchanged.
+        core_wizard.bump_after_observation(
+            wizard_state,
+            observation_state=state,
+            fingerprint=obs.get("fingerprint"),
+        )
+        # v30 §WS-E — persist a last-known-position snapshot so a crashed
+        # process leaves a breadcrumb on disk: when the next run scans
+        # data/briefs/<id>/runtime/ it can see "this target was at wizard
+        # hop=N, observation_state=input, last_button=次へ when the previous
+        # run died". send_journal still owns the safety-critical
+        # double-send decision; this is purely diagnostic enrichment.
+        try:
+            from _outreach_core import events as _ev_mod  # local — avoid cycle
+            core_target_state.merge_update(
+                DATA_DIR, tid,
+                run_id=_ev_mod.get_run_id(),
+                name=str(d.get("name") or ""),
+                form_url=str(d.get("form_url") or ""),
+                phase="send.observed",
+                hop=wizard_state.hop,
+                observation_state=state,
+                same_button_count=wizard_state.same_button_count,
+                last_button=wizard_state.last_button_text or "",
+            )
+        except Exception:  # noqa: BLE001 - snapshot is best-effort
+            pass
+        wizard_stuck = core_wizard.compute_stuck_reason(wizard_state, wizard_cfg)
+        if (
+            wizard_stuck is not None
+            and wizard_stuck.code == core_wizard.REASON_SAME_BUTTON
+            and state not in ("done", "no_form")
+        ):
+            print(f"  [send] ⚠ wizard stuck: {wizard_stuck.detail}")
+            _emit_event(
+                "send.wizard.stuck", stage="send", target_id=tid,
+                payload={
+                    "reason": wizard_stuck.code,
+                    "detail": wizard_stuck.detail,
+                    "hop": wizard_state.hop,
+                    "same_button_count": wizard_state.same_button_count,
+                    "last_button_text": wizard_state.last_button_text,
+                    "observation_state": state,
+                },
+                trace_dir=trace,
+            )
+            # v30 §WS-E — pin the stuck reason in the runtime snapshot so
+            # the next run / report can show "this target hit
+            # same_button_repeated" without re-reading events.jsonl.
+            try:
+                core_target_state.merge_update(
+                    DATA_DIR, tid,
+                    phase="send.wizard_stuck",
+                    wizard_stuck=wizard_stuck.code,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return _result(
+                "ineffective", obs, phase=phase,
+                wizard_stuck=wizard_stuck.as_payload(),
+            )
 
         if state == "done":
             return _result("done", obs)
@@ -6893,6 +7101,10 @@ def _submission_loop(
         clicks += 1
         click_res = cl["click_res"] or {}
         btn_text = (click_res.get("text") or "")[:80]
+        # v30 §WS-A — track which button we just clicked so a same-button
+        # streak (3+ clicks of e.g. 「次へ」 without an observation-state
+        # transition) can be detected on the next loop iteration.
+        core_wizard.record_click(wizard_state, btn_text)
         print(f"  [send] clicked ({phase}): {btn_text}")
         core_timeline.add(
             timeline, "final_submit" if phase == "final" else "first_submit", True,
@@ -7552,9 +7764,12 @@ def _send_one_target(
             data_dir=DATA_DIR,
             snapshot_path=snap_path if combined.strip() else None,
             verify_strict=verify_strict,
-            # v15 §V2: LLM tiebreak ONLY for the uncertain middle band.
+            # v15 §V2 / v30 §WS-F: LLM tiebreak ONLY for the uncertain middle
+            # band. The verify model is read from a dedicated ``model.verify_name``
+            # config key so the form analyzer's potentially-Opus escalation does
+            # not bleed into the verify path.
             infer_fn=lambda p, m: oc_infer(p, m or core_infer.DEFAULT_MODEL),
-            tiebreak_model=_form_analyzer_base_model(config),
+            tiebreak_model=_verify_model(config),
         )
         verify_evidence = vresult.get("evidence") or {}
         d["_last_verify_verdict"] = (
@@ -7688,8 +7903,40 @@ def _send_one_target(
         core_send_journal.append_journal(
             DATA_DIR, tid, core_send_journal.PHASE_VERIFIED, outcome=final_outcome
         )
+    # v30 §WS-E — clear the runtime snapshot once a verdict settles. The
+    # send_journal still preserves the safety-critical lifecycle history,
+    # but the per-target last_state.json is purely "what was the target
+    # doing right now" and should not linger across runs once we have a
+    # final answer.
+    try:
+        core_target_state.clear_state(DATA_DIR, tid)
+    except Exception:  # noqa: BLE001
+        pass
+    # v30 §WS-D — concise per-target verdict for the Slack thread. ``sent``
+    # ones land green, anything else (filled_only, not_confirmed) lands as
+    # filled_only so the operator knows the verify step did not certify it.
+    was_sent = any(x is d for x in sent)
+    try:
+        from _outreach_core import notify as _notify
+        _notify.post_target_event(
+            stage="send",
+            status="sent" if was_sent else "filled_only",
+            target=d,
+            idx=idx,
+            total=None,
+            detail={
+                "verify_status": d.get("_last_verify_status"),
+                "verify_reason": (
+                    (d.get("_last_verify_verdict") or "")
+                    if was_sent else None
+                ),
+                "form_url": d.get("form_url"),
+            },
+        )
+    except Exception:  # noqa: BLE001 - Slack must never abort the loop
+        pass
     return {
-        "outcome": "sent" if any(x is d for x in sent) else "done",
+        "outcome": "sent" if was_sent else "done",
         "verify_verdict": d.get("_last_verify_verdict"),
         "verify_status": d.get("_last_verify_status"),
     }
@@ -7989,6 +8236,20 @@ def stage_send(
                             "ブラウザ/サイト応答詰まりの可能性があるため自動処理を退避しました。"
                         ),
                     })
+                    # v30 §WS-D — concise per-target one-liner for the thread.
+                    # The append_needs_attention call above already triggers a
+                    # verbose post_problem; this is the lightweight progress
+                    # marker so the operator sees the timeout at the right
+                    # position in the per-target feed.
+                    from _outreach_core import notify as _notify
+                    _notify.post_target_event(
+                        stage="send", status="timeout",
+                        target=d, idx=idx,
+                        detail={
+                            "reason_class": "target_timeout",
+                            "elapsed_sec": int(max(0, time.time() - target_started_at)),
+                        },
+                    )
                 except Exception:
                     pass
                 _close_tab_safely(d.get("_send_tab_id"))
