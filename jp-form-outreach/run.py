@@ -7106,20 +7106,32 @@ def _submission_loop(
                 fixed=vfix.get("fixed"),
                 errors=last_validation_errors[:8] or None,
             )
-            # v30 next: native validity errors (valueMissing / patternMismatch
-            # / ...) on the FIRST validation round mean the original LLM plan
-            # missed a required field. Re-snapshot and re-analyze ONCE so a
-            # stale plan from an earlier enrich gets refreshed before we
-            # waste more clicks. _refresh_llm_plan_and_refill is idempotent
-            # via the ``_plan_refreshed`` flag.
-            if (
-                validation_rounds == 1
-                and not d.get("_plan_refreshed")
-                and _validation_errors_suggest_plan_refresh(errs)
-            ):
+            # v30 next: re-analyze the form when validation_error suggests the
+            # cached LLM plan was wrong. Two firing paths (both gated by
+            # ``_plan_refreshed`` for one-shot idempotency):
+            #
+            #   * **Native validity** (valueMissing / patternMismatch / ...)
+            #     fires on its FIRST appearance regardless of round number.
+            #     Pilot 2026-06-29 (kagome) showed the native error surfacing
+            #     only on round 2 because the form's first bounce contained
+            #     only server-side text-extracted complaints — gating to
+            #     round 1 missed it.
+            #   * **Text-only required** that never escalates to native fires
+            #     on round 2+ as the last-ditch attempt before
+            #     ``validation_rounds > 2`` aborts the wizard. Pilot
+            #     (sunstar) showed text-only "全角64文字以内で[required]"
+            #     loops that never produce a native kind.
+            should_refresh = not d.get("_plan_refreshed") and (
+                _validation_errors_suggest_plan_refresh(errs)
+                or (validation_rounds >= 2 and bool(errs))
+            )
+            if should_refresh:
+                trigger_kind = (errs[0] or {}).get("kind") if errs else "n/a"
                 _refresh_llm_plan_and_refill(
                     d, config, send_body,
-                    trigger_reason=f"validation_round1:{(errs[0] or {}).get('kind') if errs else 'native'}",
+                    trigger_reason=(
+                        f"validation_round{validation_rounds}:{trigger_kind}"
+                    ),
                     trace_dir=trace,
                 )
             # Beyond kana/subject guardrails, retry the generic gate auto-fill —
