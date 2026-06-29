@@ -332,6 +332,22 @@ _ERR_ZENKAKU_RE = re.compile(r"(?P<f>.+?)\s*(?:は|を)?\s*全角で(?:ご)?(?:�
 _ERR_HANKAKU_NUMERIC_RE = re.compile(
     r"(?P<f>.*?)\s*数値を半角で(?:ご)?(?:入力|記入)"
 )
+# v30 next — three production format-class messages mis-classified as required
+# (sunstar 2026-06-29). All run BEFORE _ERR_REQUIRED_RE so the trailing
+# 「入力してください」 catch-all does not swallow them.
+#
+#   * 「X は全角64文字以内で入力してください」 → zenkaku (existing fixer)
+#   * 「X はひらがなのみで入力してください」    → hiragana (new fixer)
+#   * 「X は電話番号形式で入力してください」    → format with phone-y field
+_ERR_ZENKAKU_LENGTH_RE = re.compile(
+    r"(?P<f>.+?)\s*(?:は|を)?\s*全角\d+文字(?:以内|まで|程度)?で(?:ご)?(?:入力|記入)"
+)
+_ERR_HIRAGANA_RE = re.compile(
+    r"(?P<f>.+?)\s*(?:は|を)?\s*ひらがな(?:のみ)?で(?:ご)?(?:入力|記入)"
+)
+_ERR_PHONE_FORMAT_RE = re.compile(
+    r"(?P<f>.+?)\s*(?:は|を)?\s*電話番号(?:形式)?で(?:ご)?(?:入力|記入)"
+)
 _JP_WORD_RE = re.compile(r"[ぁ-んァ-ヶ一-龠a-zA-Z0-9]")
 
 # v30 §WS-A — Playwright aria-snapshot tree leakage filter.
@@ -457,6 +473,42 @@ def parse_validation_errors(text: str | None) -> list[dict[str, str]]:
             if key not in seen:
                 seen.add(key)
                 out.append({"field": field, "kind": "hankaku_numeric", "raw": line})
+            continue
+        m = _ERR_ZENKAKU_LENGTH_RE.search(line)
+        if m:
+            field = _clean_field(m.group("f"))
+            if (
+                len(field) >= 2
+                and _JP_WORD_RE.search(field)
+                and _is_field_capture_valid(field)
+            ):
+                key = (field, "zenkaku")
+                if key not in seen:
+                    seen.add(key)
+                    out.append({"field": field, "kind": "zenkaku", "raw": line})
+            continue
+        m = _ERR_HIRAGANA_RE.search(line)
+        if m:
+            field = _clean_field(m.group("f"))
+            if (
+                len(field) >= 2
+                and _JP_WORD_RE.search(field)
+                and _is_field_capture_valid(field)
+            ):
+                key = (field, "hiragana")
+                if key not in seen:
+                    seen.add(key)
+                    out.append({"field": field, "kind": "hiragana", "raw": line})
+            continue
+        m = _ERR_PHONE_FORMAT_RE.search(line)
+        if m:
+            field = _clean_field(m.group("f"))
+            if not _is_field_capture_valid(field):
+                field = "電話番号"
+            key = (field, "format")
+            if key not in seen:
+                seen.add(key)
+                out.append({"field": field, "kind": "format", "raw": line})
             continue
         m = _ERR_REQUIRED_RE.search(line) or _ERR_REQUIRED2_RE.search(line)
         if m:

@@ -188,6 +188,59 @@ class TestParseValidationErrors(unittest.TestCase):
         self.assertEqual(errs[0]["kind"], "hankaku_numeric")
 
 
+class TestFormatCategorization(unittest.TestCase):
+    """v30 next — format-class errors (zenkaku-length, hiragana, phone-format)
+    must NOT slip through ``_ERR_REQUIRED_RE``'s trailing 「入力してください」
+    catch-all. Production 2026-06-29 (sunstar) showed text-extracted errors
+    like 「全角64文字以内で[required]」 / 「ひらがなのみで[required]」 /
+    「電話番号形式で[required]」 — all real format constraints mis-labeled as
+    'required', so the existing zenkaku / phone format fixers never fired.
+    """
+
+    def test_zenkaku_length_classified_as_zenkaku(self) -> None:
+        text = "お名前 は全角64文字以内で入力してください"
+        errs = fv.parse_validation_errors(text)
+        kinds = [(e["field"], e["kind"]) for e in errs]
+        self.assertIn(("お名前", "zenkaku"), kinds)
+        # Not also re-classified as required.
+        self.assertFalse(any(k == "required" for _, k in kinds))
+
+    def test_zenkaku_length_three_digit_chars(self) -> None:
+        # 255-char limit (sunstar 住所 case) — the digit must be allowed any
+        # length, not just single digits.
+        text = "住所 は全角255文字以内で入力してください"
+        errs = fv.parse_validation_errors(text)
+        self.assertTrue(any(e["kind"] == "zenkaku" for e in errs))
+
+    def test_hiragana_only_classified_as_hiragana(self) -> None:
+        text = "フリガナ はひらがなのみで入力してください"
+        errs = fv.parse_validation_errors(text)
+        kinds = [(e["field"], e["kind"]) for e in errs]
+        self.assertIn(("フリガナ", "hiragana"), kinds)
+        self.assertFalse(any(k == "required" for _, k in kinds))
+
+    def test_hiragana_without_nomi_still_matches(self) -> None:
+        text = "ふりがな はひらがなで入力してください"
+        errs = fv.parse_validation_errors(text)
+        self.assertTrue(any(e["kind"] == "hiragana" for e in errs))
+
+    def test_phone_format_classified_as_format(self) -> None:
+        # 「電話番号形式で入力してください」 → format kind so the existing
+        # _fix_phone_format_errors helper picks it up.
+        text = "電話番号 は電話番号形式で入力してください"
+        errs = fv.parse_validation_errors(text)
+        kinds = [(e["field"], e["kind"]) for e in errs]
+        self.assertTrue(any("電話番号" in f and k == "format" for f, k in kinds))
+
+    def test_other_required_still_classified_as_required(self) -> None:
+        # A plain 「お名前を入力してください」 keeps its required kind — the
+        # new regexes are additions, not replacements.
+        text = "お名前を入力してください"
+        errs = fv.parse_validation_errors(text)
+        self.assertEqual(errs[0]["field"], "お名前")
+        self.assertEqual(errs[0]["kind"], "required")
+
+
 class TestAriaSnapshotLeakage(unittest.TestCase):
     """v30 §WS-A: production runs concatenated Playwright aria-snapshot output with
     page text and fed both into the regex parser. Body paragraphs and row labels

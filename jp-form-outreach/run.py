@@ -3187,6 +3187,72 @@ def _fix_zenkaku_errors(errors: list[dict[str, Any]]) -> list[str]:
         return []
 
 
+_KANA_INPUTS_JS = r"""
+(() => {
+  const out = [];
+  const kanaRe = /(フリガナ|ふりがな|カナ|かな|よみがな|読み仮名)/i;
+  for (const el of document.querySelectorAll('input[type="text"], input:not([type])')) {
+    const t = (el.type || '').toLowerCase();
+    if (['hidden','submit','button','image','checkbox','radio','file'].includes(t)) continue;
+    const name = el.name || el.id || '';
+    let lbl = '';
+    if (el.id) {
+      try {
+        const l = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+        if (l) lbl = l.textContent || '';
+      } catch (e) {}
+    }
+    const row = el.closest('tr, dl, .form-group, .form-row, li, p');
+    let head = '';
+    if (row) {
+      const h = row.querySelector('th, dt, label, .label, [class*="label" i]');
+      if (h && !h.contains(el)) head = h.textContent || '';
+    }
+    const blob = `${name} ${el.placeholder || ''} ${lbl} ${head}`;
+    if (kanaRe.test(blob)) {
+      out.push({ name: name, value: String(el.value || '') });
+    }
+  }
+  return out;
+})()
+"""
+
+
+def _fix_hiragana_errors(errors: list[dict[str, Any]]) -> list[str]:
+    """v30 next — convert katakana in kana-class inputs to hiragana when the
+    page surfaces 「ひらがなのみで入力してください」 (sunstar 2026-06-29 class).
+
+    Returns diagnostics entries for every field rewritten. Never raises.
+    Operates only when at least one ``kind=="hiragana"`` error is present so
+    we never spuriously demote a legitimate katakana field.
+    """
+    from _outreach_core import form_validation as fv
+
+    try:
+        if not any(e.get("kind") == "hiragana" for e in errors):
+            return []
+        rows = _evaluate(_KANA_INPUTS_JS)
+        fixed: list[str] = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name") or "").strip()
+            cur = str(row.get("value") or "").strip()
+            if not name or not cur:
+                continue
+            if fv.is_hiragana(cur):
+                continue
+            new = fv.katakana_to_hiragana(cur)
+            if new == cur:
+                continue
+            out = _apply_field_action(name, "set_text", new)
+            if out and out.get("ok"):
+                fixed.append(f"hiragana:{name[:24]}={new[:24]}")
+        return fixed
+    except Exception:  # noqa: BLE001 — recovery must not abort the send loop
+        return []
+
+
 def _fix_phone_format_errors(errors: list[dict[str, Any]]) -> list[str]:
     """Toggle hyphen format on phone inputs when a format error names them.
 
@@ -3274,16 +3340,23 @@ def _harvest_and_fix_validation_errors(
     summary = _apply_fill_guardrails(target, sender, body, diagnostics)
     phone_fixed = _fix_phone_format_errors(errors)
     zenkaku_fixed = _fix_zenkaku_errors(errors)
+    # v30 next — convert kana fields to hiragana when the page surfaces
+    # 「ひらがなのみで入力してください」. Pairs with the parser's new
+    # _ERR_HIRAGANA_RE so the trio (zenkaku-length, hiragana, phone-format)
+    # all get actively rescued instead of looping in validation_unrecoverable.
+    hiragana_fixed = _fix_hiragana_errors(errors)
     fixed = (
         len(summary.get("kana_fixed") or [])
         + len(summary.get("postal_fixed") or [])
         + (1 if summary.get("subject_filled") else 0)
         + len(phone_fixed)
         + len(zenkaku_fixed)
+        + len(hiragana_fixed)
     )
     out["fixed"] = fixed
     out["phone_fixed"] = phone_fixed
     out["zenkaku_fixed"] = zenkaku_fixed
+    out["hiragana_fixed"] = hiragana_fixed
     # Recoverable if we fixed something, or if all errors are kinds our guardrails
     # target (format on a kana field / a required subject). Even with fixed==0 the
     # caller may still benefit from re-clicking once after a generic re-fill.
