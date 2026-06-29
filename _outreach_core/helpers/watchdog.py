@@ -863,6 +863,20 @@ def tick(skills_root: Path | None = None) -> str:
         now = datetime.now(timezone.utc)
         now_epoch = now.timestamp()
 
+        # §W6 (v30): refresh data/system_health/<host>.json on every tick.
+        # The launchd watchdog runs every ~60s independently of any operator
+        # activity; refreshing the heartbeat here means an idle but healthy
+        # host appears "alive within 60s" instead of going dark for hours
+        # between Slack commands. Production observation 2026-06-30:
+        # MacMiniHome's heartbeat was 9h stale despite the watchdog being
+        # actively running — that's exactly the gap this closes.
+        try:
+            from _outreach_core.helpers import healthcheck as _hc
+            _hc.write_heartbeat(root)
+        except Exception:
+            # Heartbeat refresh is best-effort; never block tick on it.
+            pass
+
         # §W2: detect a wake-from-sleep gap before overwriting last_tick_epoch.
         woke = detect_wake(
             now_epoch=now_epoch,

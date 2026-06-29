@@ -451,6 +451,118 @@ def cmd_status(_args: argparse.Namespace) -> int:
     return 0
 
 
+# v30: stale-host detection across the whole fleet.
+#
+# Each host writes its own data/system_health/<host>.json (when running
+# commands, when its watchdog ticks, or via ``./healthcheck write-heartbeat``).
+# A primary host that's been silent for hours is a real outage signal — but
+# until now there was no one-shot command to surface it. ``./healthcheck
+# stale`` reads every JSON under data/system_health/ and reports rows whose
+# ts is older than ``threshold``. Exit code 2 when stale rows exist so a
+# launchd / cron caller can route to Slack.
+
+STALE_HEARTBEAT_THRESHOLD_SEC = 600  # 10 minutes — twice the default watchdog tick
+
+
+def collect_host_health(
+    skills_root: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Read every per-host system_health/*.json under ``skills_root``.
+
+    Returns a list of ``{host, age_sec, ts, openclaw_pid, active_runs, ...}``
+    dicts sorted by oldest heartbeat first so the call site can present the
+    stalest hosts at the top of a Slack message.
+    """
+    root = skills_root or SKILLS_ROOT
+    out: list[dict[str, Any]] = []
+    dir_path = system_health_dir(root)
+    if not dir_path.is_dir():
+        return out
+    for entry in dir_path.iterdir():
+        if not entry.is_file() or entry.suffix.lower() != ".json":
+            continue
+        try:
+            data = json.loads(entry.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        age = heartbeat_age_seconds(data)
+        out.append({
+            "host": str(data.get("host") or entry.stem),
+            "age_sec": age,
+            "ts": data.get("ts"),
+            "openclaw_pid": data.get("openclaw_pid"),
+            "active_runs": data.get("active_runs") or [],
+            "last_command_at": data.get("last_command_at"),
+            "open_needs_attention_count": data.get("open_needs_attention_count"),
+            "file": str(entry),
+        })
+    out.sort(key=lambda r: (r["age_sec"] is None, r["age_sec"] or 0), reverse=True)
+    return out
+
+
+def find_stale_hosts(
+    rows: list[dict[str, Any]],
+    *,
+    threshold_sec: int,
+) -> list[dict[str, Any]]:
+    """Filter ``rows`` (from :func:`collect_host_health`) to those whose
+    heartbeat exceeds ``threshold_sec`` or is missing entirely. Pure helper
+    so the report and the CLI exit-code share the same definition.
+    """
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        age = row.get("age_sec")
+        if age is None or age > threshold_sec:
+            out.append(row)
+    return out
+
+
+def format_stale_report(
+    rows: list[dict[str, Any]],
+    stale: list[dict[str, Any]],
+    *,
+    threshold_sec: int,
+) -> str:
+    """Pretty-print the stale-host report. Always lists every host's state
+    (not just the stale ones) so the operator can confirm that the OTHER
+    hosts are healthy in one glance."""
+    if not rows:
+        return "稼働中ホストがまだ記録されていません。"
+    lines = [
+        f"ホスト稼働状況（threshold={threshold_sec}s, "
+        f"stale {len(stale)}/{len(rows)}）:",
+    ]
+    for r in rows:
+        age_label = _fmt_age(r.get("age_sec"))
+        flag = "🔴" if r in stale else "🟢"
+        active = len(r.get("active_runs") or [])
+        lines.append(
+            f"  {flag} {r['host']:<16} heartbeat {age_label}"
+            f" · active_runs={active}"
+        )
+    if stale:
+        lines.append("")
+        lines.append("停止疑いのホスト:")
+        for r in stale:
+            lines.append(
+                f"  - {r['host']}: 最終 ts={r.get('ts')} "
+                f"(復旧: 当該機で ./healthcheck write-heartbeat か watchdog 再起動)"
+            )
+    return "\n".join(lines)
+
+
+def cmd_stale(args: argparse.Namespace) -> int:
+    threshold = int(getattr(args, "threshold_sec", STALE_HEARTBEAT_THRESHOLD_SEC))
+    rows = collect_host_health()
+    stale = find_stale_hosts(rows, threshold_sec=threshold)
+    print(format_stale_report(rows, stale, threshold_sec=threshold))
+    # Exit 2 (distinct from ``error``=1) when stale hosts exist so cron /
+    # Slack glue can branch on it cleanly.
+    return 2 if stale else 0
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Doorman system health (v4 §15-B)")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -458,6 +570,16 @@ def main() -> None:
     sub.add_parser("touch-command", help="Update last_command_at (Slack message received)")
     sub.add_parser("ping", help="One-line alive summary")
     sub.add_parser("status", help="Ping + health JSON + recent events")
+    stale_parser = sub.add_parser(
+        "stale",
+        help="List hosts whose heartbeat is older than the threshold",
+    )
+    stale_parser.add_argument(
+        "--threshold-sec",
+        type=int,
+        default=STALE_HEARTBEAT_THRESHOLD_SEC,
+        help=f"Age threshold in seconds (default: {STALE_HEARTBEAT_THRESHOLD_SEC})",
+    )
     args = ap.parse_args()
     if args.cmd == "write-heartbeat":
         sys.exit(cmd_write_heartbeat(args))
@@ -465,6 +587,8 @@ def main() -> None:
         sys.exit(cmd_touch_command(args))
     if args.cmd == "status":
         sys.exit(cmd_status(args))
+    if args.cmd == "stale":
+        sys.exit(cmd_stale(args))
     sys.exit(cmd_ping(args))
 
 
