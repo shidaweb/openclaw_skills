@@ -149,6 +149,82 @@ def humanize_reason(reason_class: str) -> str:
     return _REASON_LABEL.get(reason_class, reason_class)
 
 
+# v30 §WS-F — structured action hints accompanying the Slack message.
+#
+# The OpenClaw side currently surfaces ``slack_message`` as plain text and
+# requires the operator to TYPE the next command. The structured hints below
+# let the OpenClaw Slack bot render Block-Kit buttons (or any other UI) once
+# its end is updated, without requiring further changes on the doorman side.
+#
+# Each action is one of:
+#
+#   * ``{"label": "...", "command": "..."}``        — chat-style command
+#   * ``{"label": "...", "url": "https://..."}``    — link / "Open URL"
+#   * ``{"label": "...", "command": "...", "style": "primary" | "danger" | "neutral"}``
+#
+# Backward compatibility: the legacy :func:`build_actionable_message` continues
+# to return the same human-readable text; only the new
+# :func:`build_actionable_payload` exposes the structured actions.
+
+
+def _actions_for_entry(entry: dict[str, Any]) -> list[dict[str, str]]:
+    """The default action set for a needs_attention entry. Tailored per
+    ``reason_class`` so the operator sees the relevant moves first.
+
+    The action labels are kept short (≤8 characters where possible) so the
+    OpenClaw bot can lay them out as Block-Kit buttons without truncation.
+    """
+    tid = str(entry.get("target_id") or "").strip()
+    reason_class = str(entry.get("reason_class") or "").strip()
+    diag = entry.get("diagnostics") or {}
+    form_url = str(diag.get("url") or entry.get("form_url") or "").strip()
+    actions: list[dict[str, str]] = []
+    if form_url:
+        actions.append({
+            "label": "URL を開く",
+            "url": form_url,
+            "style": "primary",
+        })
+    # The resolver pass retries automatically; an explicit retry trigger is
+    # useful for reasons the resolver can plausibly fix on a second attempt.
+    if reason_class in RESOLVABLE_REASONS and tid:
+        actions.append({
+            "label": "再試行",
+            "command": f"doorman resolve {tid}",
+            "style": "neutral",
+        })
+    if tid:
+        actions.append({
+            "label": "スキップ",
+            "command": f"{tid} skip",
+            "style": "danger",
+        })
+    return actions
+
+
+def build_actionable_payload(
+    entry: dict[str, Any], *, auto_resolver: bool
+) -> dict[str, Any]:
+    """Structured Slack payload — text + actions.
+
+    Returns ``{"text": str, "actions": list[dict]}``. The text is identical to
+    :func:`build_actionable_message`'s output (so callers that only consume the
+    string keep working); the actions list is the new structured channel.
+
+    Why a separate function rather than extending ``build_actionable_message``:
+
+      * The legacy function is widely called and persisted to
+        ``needs_attention.jsonl`` as a string field. Changing its return type
+        would force a schema migration.
+      * Tests and dashboards that grep the text field would suddenly see
+        JSON. A new helper keeps backward compat ironclad.
+    """
+    return {
+        "text": build_actionable_message(entry, auto_resolver=auto_resolver),
+        "actions": _actions_for_entry(entry),
+    }
+
+
 def build_actionable_message(entry: dict[str, Any], *, auto_resolver: bool) -> str:
     """A message that states the detection detail AND what is actually wanted.
 
