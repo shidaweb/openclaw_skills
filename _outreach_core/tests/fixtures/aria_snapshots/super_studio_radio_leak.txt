@@ -1,0 +1,23 @@
+# Source: jp-form-outreach run 20260627-013232, target=super_studio
+# Failure mode: a 必須 radio group for お問い合わせ項目 was left unselected;
+# the validation banner re-rendered the input page but state stayed "input"
+# (not "validation_error"), so the wizard clicked "内容確認へ" 3x with no
+# progress. The aria-tree node descriptors ("generic [ref=e...", text: 必須)
+# bled into parse_validation_errors as ghost required fields.
+# Fix:   WS-A #5 (parser leak guard) closes the ghost-field path. WS-A #6
+#        (wizard.same_button_count) is the dedicated stuck guard for the
+#        button-loop pattern even when validation_error is never observed.
+# Asserts:
+#   - parse_validation_errors(this) == []
+#   - WizardState with 3 clicks of 内容確認へ → REASON_SAME_BUTTON
+- generic [ref=e10]:
+  - heading "お問い合わせ" [ref=e11]
+  - form [ref=e12]:
+    - generic [ref=e20]:
+      - text: お問い合わせ項目
+      - generic [ref=e21]: 必須
+    - generic [ref=e30]:
+      - radio "資料請求" [ref=e31]
+      - radio "サービスについて" [ref=e32]
+      - radio "その他" [ref=e33]
+    - button "内容確認へ" [ref=e99]

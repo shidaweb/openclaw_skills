@@ -1,0 +1,16 @@
+# Source: jp-form-outreach run 20260629-070205, target=legalon
+# Failure mode: the top-level page /contact/ was form_ok at enrich time
+# (had a heading + a wrapping form) but at send time the actually-interactive
+# form lived inside an iframe on a different registrable domain
+# (lp.legalforce-cloud.com). The send pipeline never switched into the
+# iframe, so fields landed on the wrapper and submit produced no result.
+# Fix:   WS-B (send_pipeline.try_iframe_form_takeover) navigates to the
+#        iframe src as a new top-level page; legalforce-cloud.com added to
+#        KNOWN_FORM_SERVICE_HOSTS.
+# Asserts: iframe_form_src(<this fields>, base_url) returns the iframe src.
+{
+  "iframes": [
+    {"src": "https://lp.legalforce-cloud.com/index.php/form/XDFrame"}
+  ],
+  "base_url": "https://legalontech.example/contact/"
+}

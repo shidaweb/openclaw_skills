@@ -1,0 +1,2 @@
+[6/7] ⚠️ 富士ソフト株式会社 · send 要確認キュー
+　↳ reason_class=validation_unrecoverable form_url=https://sem-inq.example/public/application/add/68

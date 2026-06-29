@@ -1,0 +1,12 @@
+[
+  {
+    "label": "URL を開く",
+    "url": "https://sem-inq.example/public/application/add/68",
+    "style": "primary"
+  },
+  {
+    "label": "スキップ",
+    "command": "fujisoft skip",
+    "style": "danger"
+  }
+]

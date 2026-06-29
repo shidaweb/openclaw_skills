@@ -187,12 +187,33 @@ bash scripts/install-watchdog.sh
 
 ## 開発・検証
 
+ローカルで CI と同じ手順を踏むには:
+
 ```bash
 cd ~/.openclaw/skills
-python3 -m pytest _outreach_core/tests
+./scripts/test.sh
 ```
 
-`pytest` / `pyyaml` が未導入の環境では、一時 venv かローカル venv に入れてから実行します。
+このスクリプトは `jp-form-outreach/.venv/bin/python3` を優先採用し、
+未導入なら `pytest` / `pyyaml` を自動で入れます。フィルタは pytest 引数
+をそのまま渡せます (`./scripts/test.sh -k snapshot --tb=short`)。
+
+CI (`.github/workflows/test.yml`) は GitHub Actions で Python 3.10 / 3.11 /
+3.12 のマトリクスで毎 push / PR に対して `pytest _outreach_core/tests` を
+実行します。
+
+### Slack 通知フォーマットの golden file
+
+`_outreach_core/tests/fixtures/slack_golden/` 配下に per-target Slack 行
+の正解形と、`build_actionable_payload` の actions 構造を golden file 化
+しています。意図的にフォーマットを更新するときは、
+
+```bash
+UPDATE_GOLDEN=1 ./scripts/test.sh _outreach_core/tests/test_slack_golden.py
+```
+
+を実行して fixture をリフレッシュ → `git diff` で差分をレビューしてから
+commit してください。
 
 ## ドキュメント
 

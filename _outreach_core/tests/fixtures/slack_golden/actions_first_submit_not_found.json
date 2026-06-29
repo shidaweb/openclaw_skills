@@ -1,0 +1,17 @@
+[
+  {
+    "label": "URL を開く",
+    "url": "https://www.example.co.jp/contact/",
+    "style": "primary"
+  },
+  {
+    "label": "再試行",
+    "command": "doorman resolve geocode",
+    "style": "neutral"
+  },
+  {
+    "label": "スキップ",
+    "command": "geocode skip",
+    "style": "danger"
+  }
+]

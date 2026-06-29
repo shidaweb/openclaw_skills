@@ -1,0 +1,35 @@
+# Source: jp-form-outreach run 20260629-070205, target=fujisoft
+# Failure mode: parse_validation_errors fed the aria-tree concatenated with
+# page text. The privacy-policy body paragraph contained "...入力した検索
+# キーワード..." which the regex captured as a required field, producing
+# the ghost entries that caused 「次へ」 to be clicked 3x with no progress.
+# Fix:   _outreach_core/form_validation.py:_ARIA_TREE_LINE_RE +
+#        _FIELD_LOOKS_LIKE_TREE_LEAK_RE + _FIELD_MAX_LEN guard.
+# Asserts: parse_validation_errors(this) == [] (no field captured).
+- generic [active] [ref=e1]:
+  - img "FUJISOFT" [ref=e3]
+  - generic [ref=e4]:
+    - generic [ref=e7]:
+      - text: 技術者様のご提案などお取り引きに関するお問い合わせ
+      - generic [ref=e8]: 富士ソフト株式会社への技術者様のご提案などお取り引きに関する窓口となります。
+    - list [ref=e9]:
+      - listitem [ref=e10]: ユーザー情報/アンケート登録>
+      - listitem [ref=e11]: 申し込み内容確認>
+      - listitem [ref=e12]: 完了
+    - paragraph [ref=e13]:
+      - text: 以下の項目に必要事項をご記入後、「次へ」ボタンをクリックしてください。
+      - generic [ref=e14]: 必須
+      - text: の項目は必ずご記入ください。
+    - generic [ref=e16]:
+      - table [ref=e17]:
+        - rowgroup [ref=e18]:
+          - row [ref=e19]:
+            - rowheader "個人情報の取扱い" [ref=e20]
+            - cell [ref=e21]:
+              - generic [ref=e22]:
+                - text: 自動的に収集・記録される個人情報には、お客様のアクセスログ情報（アプリケーション異常終了時の情報、 アクセスしたページ、ドメイン名、IP アドレス、参照元情報、使用しているブラウザの種類、アクセス日時、 Cookie 情報、利用した検索エンジンに入力した検索キーワード、弊社から配信されるメール 文面記載のクリックカウント URL のうち、どの URLから流入したかなど）が含まれます。
+      - table [ref=e26]:
+        - rowgroup [ref=e27]:
+          - row "氏名 必須 ！ 必ず入力してください" [ref=e35]:
+            - rowheader "氏名 必須" [ref=e36]
+            - cell "！ 必ず入力してください" [ref=e38]

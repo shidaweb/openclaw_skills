@@ -1,0 +1,2 @@
+[1/7] ✅ 株式会社LegalOn Technologies · send 送信完了
+　↳ verify_status=sent_ok form_url=https://legalontech.example/contact/

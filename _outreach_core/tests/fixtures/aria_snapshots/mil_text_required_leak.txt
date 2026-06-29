@@ -1,0 +1,17 @@
+# Source: jp-form-outreach resolver run 20260627-013232, target=mil
+# Failure mode: short aria-tree nodes ("- text:[required]", "- paragraph
+# [ref[required]") leaked into the validation parser as length-3 "field"
+# names. The auto-fix loop could not map them to any real input, but the
+# wizard kept clicking 「送信する」 because validation_rounds reached the
+# legacy threshold via these phantom errors.
+# Fix:   WS-A #5 _clean_field strips leading "- " bullets and
+#        _FIELD_LOOKS_LIKE_TREE_LEAK_RE rejects role-token leads.
+# Asserts: parse_validation_errors(this) == []
+- text:[required]
+- paragraph [ref[required]
+- generic [ref=e[required]
+- /url: https://www.mil.example/privacy
+- /url: https://www.mil.example/terms
+- generic [ref=e42]
+- paragraph [ref=e13]
+- rowheader "区分" [ref=e44]
