@@ -5374,6 +5374,126 @@ def fill_form_with_plan(
     return diag
 
 
+def _validation_errors_suggest_plan_refresh(
+    validation_errors: list[dict[str, Any]] | None,
+) -> bool:
+    """v30 next: should we burn an extra LLM call to refresh the form plan?
+
+    Yes ONLY when the page reported a native DOM-level reason
+    (``valueMissing`` / ``patternMismatch`` / ``typeMismatch`` etc.) — those
+    pin point a REAL required field the original plan didn't fill, which is
+    exactly the case a fresh re-analysis can rescue. Generic 「必須項目」
+    text-extracted errors are NOT a refresh trigger because they may also
+    surface for fields the plan already mapped (placeholder mismatches,
+    server-side re-validation noise).
+    """
+    if not validation_errors:
+        return False
+    native_kinds = {
+        "valueMissing", "patternMismatch", "typeMismatch",
+        "tooLong", "tooShort", "rangeUnderflow", "rangeOverflow",
+        "stepMismatch", "badInput",
+    }
+    for err in validation_errors:
+        kind = str((err or {}).get("kind") or "")
+        # Native kinds may be concatenated by ``_native_validation_errors``
+        # via "+" — split and check membership.
+        if any(k in native_kinds for k in kind.split("+")):
+            return True
+    return False
+
+
+def _refresh_llm_plan_and_refill(
+    target: dict[str, Any],
+    config: dict[str, Any],
+    body: str,
+    *,
+    trigger_reason: str,
+    trace_dir: Path | None = None,
+) -> dict[str, Any]:
+    """v30 next: re-snapshot the form and re-run the LLM analyzer against the
+    CURRENT DOM, then re-apply the fresh plan.
+
+    Production observation 2026-06-29: targets that hit ``submit_click_ineffective``
+    in the resolver pass often had a stale ``_llm_plan`` (selectors no longer
+    match the live DOM, or the original plan missed a required field that
+    only became visible after a state transition). The validation_error
+    handler had a "live_rescue" pass for radios/selects but no way to call
+    the analyzer again. This helper fills that gap.
+
+    Triggered AT MOST ONCE PER TARGET (``_plan_refreshed`` flag) so a
+    pathological form does not burn one Opus call per validation round.
+
+    Returns ``{"refreshed": bool, "fields": int, "filled": int, "errors": int}``.
+    The caller must treat ``refreshed=False`` as "skipped" and continue with
+    its existing recovery path.
+    """
+    if target.get("_plan_refreshed"):
+        return {"refreshed": False, "reason": "already_refreshed_once"}
+    tid = str(target.get("id") or target.get("name") or "?")
+    print(f"  [send] LLM plan refresh: {trigger_reason} → re-analyzing form ...")
+    target["_plan_refreshed"] = True
+
+    fresh_fields = _evaluate(_FORM_FIELDS_JS) or {}
+    if isinstance(fresh_fields, dict) and fresh_fields:
+        target["form_fields"] = fresh_fields
+        if fresh_fields.get("form_root_selector"):
+            target["form_root_selector"] = fresh_fields["form_root_selector"]
+
+    target.pop("_llm_plan", None)
+    target.pop("_llm_plan_meta", None)
+
+    # Prefer the escalation model if configured — a fresh re-analysis is the
+    # right moment to spend Opus, since we know the cheaper plan was wrong.
+    refresh_cfg = config
+    if _has_form_analyzer_escalation(config):
+        escalated_model = _form_analyzer_escalation_model(config)
+        if escalated_model:
+            refresh_cfg = _config_with_form_analyzer_model(config, escalated_model)
+
+    from _outreach_core.draft import resolve_max_chars
+    model_cfg = config.get("model", {}) or {}
+    char_limit = resolve_max_chars(
+        target, config,
+        default_max=int(model_cfg.get("max_chars", 400)),
+        extended_max=int(model_cfg.get("max_chars_extended", 400)),
+    )
+    plan = _llm_analyze_form(
+        target, refresh_cfg,
+        body_max_chars=char_limit,
+        force_refresh=True,
+        escalation_reason=f"plan_refresh:{trigger_reason}",
+    )
+    if not plan or not plan.get("fields"):
+        _emit_event(
+            "send.plan.refresh_failed",
+            stage="send", target_id=tid,
+            payload={"trigger": trigger_reason},
+            trace_dir=trace_dir,
+        )
+        return {"refreshed": True, "fields": 0, "filled": 0, "errors": 0}
+
+    target["_llm_plan"] = plan
+    diag = fill_form_with_plan(plan, body, target=target, evaluate_fn=_evaluate)
+    filled = len(diag.get("filled") or [])
+    errors = len(diag.get("errors") or [])
+    _emit_event(
+        "send.plan.refreshed",
+        stage="send", target_id=tid,
+        payload={
+            "trigger": trigger_reason,
+            "fields": len(plan.get("fields") or []),
+            "filled": filled,
+            "errors": errors,
+            "model": str((target.get("_llm_plan_meta") or {}).get("model") or ""),
+        },
+        trace_dir=trace_dir,
+    )
+    print(f"  [send] LLM plan refresh: {filled} filled / {errors} errors")
+    return {"refreshed": True, "fields": len(plan.get("fields") or []),
+            "filled": filled, "errors": errors}
+
+
 def fill_form_for_target(
     target: dict[str, Any],
     config: dict[str, Any],
@@ -6986,6 +7106,22 @@ def _submission_loop(
                 fixed=vfix.get("fixed"),
                 errors=last_validation_errors[:8] or None,
             )
+            # v30 next: native validity errors (valueMissing / patternMismatch
+            # / ...) on the FIRST validation round mean the original LLM plan
+            # missed a required field. Re-snapshot and re-analyze ONCE so a
+            # stale plan from an earlier enrich gets refreshed before we
+            # waste more clicks. _refresh_llm_plan_and_refill is idempotent
+            # via the ``_plan_refreshed`` flag.
+            if (
+                validation_rounds == 1
+                and not d.get("_plan_refreshed")
+                and _validation_errors_suggest_plan_refresh(errs)
+            ):
+                _refresh_llm_plan_and_refill(
+                    d, config, send_body,
+                    trigger_reason=f"validation_round1:{(errs[0] or {}).get('kind') if errs else 'native'}",
+                    trace_dir=trace,
+                )
             # Beyond kana/subject guardrails, retry the generic gate auto-fill —
             # dynamically-revealed required selects/radios live here. Radios run
             # AGGRESSIVE here (v25): the validation bounce itself is the evidence
