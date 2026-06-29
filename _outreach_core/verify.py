@@ -354,13 +354,23 @@ def verdict_from_score(score: int) -> str:
     return "uncertain"
 
 
-def _record_submission_result(evidence: dict[str, Any]) -> dict[str, Any]:
-    """Attach the shared send-state verdict fields to evidence and return it."""
+def _record_submission_result(
+    evidence: dict[str, Any], *, pass_label: str | None = None
+) -> dict[str, Any]:
+    """Attach the shared send-state verdict fields to evidence and return it.
+
+    v30 §WS-C — ``pass_label`` lets the caller mark which observation pass the
+    score came from (``pre_visibility`` / ``post_visibility`` / ``recheck``).
+    Without this tag, the events.jsonl trace shows two scoring rows per
+    target whose flip looks unexplained; with it, the operator can see that
+    the first pass ran without visibility data and the second pass refined.
+    """
     result = core_send_state.assess_submission_result(evidence)
     evidence["score"] = result["score"]
     evidence["send_verdict"] = result["verdict"]
     evidence["send_reason"] = result["reason"]
     evidence["send_signals"] = result["signals"]
+    evidence["score_breakdown"] = result.get("score_breakdown") or []
     evidence["has_success_keyword"] = result["has_success_keyword"]
     evidence["has_error_keyword"] = result["has_error_keyword"]
     evidence["url_success"] = result["url_success"]
@@ -368,6 +378,19 @@ def _record_submission_result(evidence: dict[str, Any]) -> dict[str, Any]:
     evidence["form_still_present"] = result["form_still_present"]
     evidence["explicit_sent"] = result["explicit_sent"]
     evidence["explicit_invalid"] = result["explicit_invalid"]
+    if pass_label:
+        history = list(evidence.get("score_history") or [])
+        history.append({
+            "pass": str(pass_label),
+            "score": int(result["score"]),
+            "verdict": result["verdict"],
+            "reason": result["reason"],
+            "signals": list(result["signals"]),
+            "score_breakdown": list(result.get("score_breakdown") or []),
+        })
+        # Cap to keep the evidence blob bounded even if double-check runs
+        # multiple times in pathological cases.
+        evidence["score_history"] = history[-6:]
     return result
 
 
@@ -402,6 +425,38 @@ def llm_tiebreak_verdict(
     return parse_llm_tiebreak(raw, page_text)
 
 
+def _normalize_quote(s: str | None) -> str:
+    """v30 §WS-C — NFKC + whitespace collapse for the LLM tiebreak hallucination
+    guard.
+
+    Production rejections were caused by harmless variation between the
+    LLM's quote and the page text:
+
+      * 全角/半角 differences (「お問い合わせ」 vs 「お問合わせ」/ASCII parens)
+      * full-width spaces (U+3000) the LLM normalised to ASCII spaces
+      * trailing punctuation the LLM dropped
+
+    NFKC unifies the compatibility-equivalent characters (half-/full-width,
+    parens, digits, kana), then we drop all whitespace and a small set of
+    cosmetic punctuation so the match focuses on substantive content. The
+    hallucination guard is preserved: only quotes that DO appear on the page
+    after normalization survive — fabricated text still fails the membership
+    check.
+    """
+    import unicodedata
+
+    if not s:
+        return ""
+    n = unicodedata.normalize("NFKC", s)
+    # Drop all whitespace categories (regular, full-width 3000, ZWSP, etc.).
+    n = re.sub(r"\s+", "", n)
+    # Drop a small set of cosmetic punctuation the LLM frequently re-renders
+    # in or out of the quote. (Quotation marks, parentheses, ideographic
+    # commas/periods that may be added/dropped at sentence boundaries.)
+    n = re.sub(r"[「」『』\"”“'’()（）、。．,.!?！？～~・]", "", n)
+    return n
+
+
 def parse_llm_tiebreak(raw: str | None, page_text: str) -> dict[str, Any] | None:
     """Parse + guard the tiebreak JSON (pure). Quote must appear in page text."""
     if not raw:
@@ -420,12 +475,83 @@ def parse_llm_tiebreak(raw: str | None, page_text: str) -> dict[str, Any] | None
         return None
     quote = str(data.get("quote") or "").strip()
     if verdict in ("sent", "not_sent"):
-        # Hallucination guard: the supporting quote must literally exist on the
-        # page (whitespace-normalized). No quote → downgrade to unclear.
-        norm = lambda s: re.sub(r"\s+", "", s or "")  # noqa: E731
-        if not quote or norm(quote) not in norm(page_text):
+        # v30 §WS-C — NFKC-normalize both sides before checking membership.
+        # The legacy regex-whitespace-strip alone allowed 全角/半角 variants
+        # to slip through occasionally and rejected harmless punctuation
+        # differences other times. NFKC + punctuation drop is consistent.
+        if not quote:
+            return None
+        if _normalize_quote(quote) not in _normalize_quote(page_text):
             return None
     return {"verdict": verdict, "quote": quote}
+
+
+def _double_check_sent_ok(
+    *,
+    evaluate_fn: Callable[[str], Any] | None,
+    recheck_after_sec: float,
+    sleep_fn: Callable[[float], None] | None,
+) -> dict[str, Any] | None:
+    """v30 §WS-C — fetch a fresh evidence snapshot ``recheck_after_sec`` later
+    and re-score it. Returns the re-scored result (which may be sent_ok,
+    failed, or uncertain) or ``None`` if the recheck cannot run.
+
+    Why two-shot:
+
+      * The page is often mid-transition at the moment the first verdict
+        fires (AJAX status not yet rendered; URL still settling).
+      * Production logs showed a single observation reporting ``sent_ok``
+        immediately after a click that later turned out to be a confirm-page
+        echo, not the real success page.
+      * A second observation 1–2 seconds later, when sent_ok PERSISTS,
+        materially reduces these flips.
+
+    Honest failure mode: if the recheck can't fetch fresh data (no
+    evaluate_fn / no recheck budget), return ``None`` and let the caller
+    keep its first verdict — we never downgrade for lack of evidence.
+    """
+    if evaluate_fn is None or recheck_after_sec <= 0:
+        return None
+    try:
+        if sleep_fn is not None:
+            sleep_fn(recheck_after_sec)
+        fresh = evaluate_fn(PAGE_EVIDENCE_JS)
+    except Exception:
+        return None
+    if not isinstance(fresh, dict):
+        return None
+    fresh_ev: dict[str, Any] = {}
+    page_url = str(fresh.get("url") or "")
+    if page_url:
+        fresh_ev["url"] = page_url
+        fresh_ev["url_success"] = _url_looks_like_success(page_url)
+    snap = str(fresh.get("text") or "")
+    if snap:
+        fresh_ev["text"] = snap[:8000]
+        fresh_ev["has_success_keyword"] = _text_has_keyword(snap, FORM_SUCCESS_KEYWORDS)
+        fresh_ev["has_error_keyword"] = _text_has_keyword(snap, FORM_ERROR_KEYWORDS)
+    for key in (
+        "visible_forms",
+        "visible_textareas",
+        "editable_visible",
+        "submit_controls",
+        "final_submit_controls",
+        "probe_text_hits",
+        "probe_field_hits",
+        "form_gone_visible",
+        "form_still_present",
+        "cf7_sent",
+        "cf7_invalid",
+        "cf7_statuses",
+        "cf7_response_text",
+        "submission_sent",
+        "submission_invalid",
+        "submission_statuses",
+        "submission_status_text",
+    ):
+        if key in fresh:
+            fresh_ev[key] = fresh.get(key)
+    return core_send_state.assess_submission_result(fresh_ev)
 
 
 def _required_not_in_plan(target: dict[str, Any], plan: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -467,6 +593,8 @@ def verify_send_completed(
     verify_strict: bool = True,
     infer_fn: Callable[[str, str], str | None] | None = None,
     tiebreak_model: str = "",
+    recheck_after_sec: float = 0.0,
+    sleep_fn: Callable[[float], None] | None = None,
 ) -> dict[str, Any]:
     """
     Returns dict with status: ok | uncertain | needs_attention, reason, evidence, etc.
@@ -560,7 +688,7 @@ def verify_send_completed(
         evidence["has_success_keyword"] = _text_has_keyword(snap, FORM_SUCCESS_KEYWORDS)
         evidence["has_error_keyword"] = _text_has_keyword(snap, FORM_ERROR_KEYWORDS)
 
-    submission = _record_submission_result(evidence)
+    submission = _record_submission_result(evidence, pass_label="pre_visibility")
 
     # Guardrail: if an explicit input error banner is present and we don't also
     # have strong success evidence, treat as failure (Benesse false-positive).
@@ -578,6 +706,34 @@ def verify_send_completed(
         }
 
     if submission["sent"]:
+        # v30 §WS-C — opt-in double-check. Fetch a fresh observation and
+        # confirm the verdict persists. If the recheck disagrees, downgrade
+        # to uncertain so we never report a flake as ok.
+        recheck = _double_check_sent_ok(
+            evaluate_fn=evaluate_fn,
+            recheck_after_sec=recheck_after_sec,
+            sleep_fn=sleep_fn,
+        )
+        if recheck is not None:
+            evidence.setdefault("score_history", []).append({
+                "pass": "recheck",
+                "score": int(recheck["score"]),
+                "verdict": recheck["verdict"],
+                "reason": recheck["reason"],
+                "signals": list(recheck["signals"]),
+                "score_breakdown": list(recheck.get("score_breakdown") or []),
+            })
+            if recheck["verdict"] != "sent_ok":
+                return {
+                    "status": "uncertain",
+                    "reason": (
+                        f"{name}: 1回目=sent_ok だが再確認で {recheck['verdict']} "
+                        f"({recheck['reason']}, score={recheck['score']}) — 揺れあり"
+                    ),
+                    "evidence": evidence,
+                    "snapshot_path": str(snapshot_path) if snapshot_path else None,
+                    "unresolved_fields": None,
+                }
         return {
             "status": "ok",
             "reason": f"{name}: 送信完了を確認 ({submission['reason']}, score={submission['score']})",
@@ -620,9 +776,35 @@ def verify_send_completed(
                     evidence[key] = vis.get(key)
 
     # v15 §V1: weighted score settles cases keywords alone could not.
-    submission = _record_submission_result(evidence)
+    submission = _record_submission_result(evidence, pass_label="post_visibility")
     score = int(submission["score"])
     if submission["verdict"] == "sent_ok":
+        # v30 §WS-C — double-check at the score-based exit too.
+        recheck = _double_check_sent_ok(
+            evaluate_fn=evaluate_fn,
+            recheck_after_sec=recheck_after_sec,
+            sleep_fn=sleep_fn,
+        )
+        if recheck is not None:
+            evidence.setdefault("score_history", []).append({
+                "pass": "recheck",
+                "score": int(recheck["score"]),
+                "verdict": recheck["verdict"],
+                "reason": recheck["reason"],
+                "signals": list(recheck["signals"]),
+                "score_breakdown": list(recheck.get("score_breakdown") or []),
+            })
+            if recheck["verdict"] != "sent_ok":
+                return {
+                    "status": "uncertain",
+                    "reason": (
+                        f"{name}: スコア判定=sent_ok (score={score}) だが再確認で "
+                        f"{recheck['verdict']} (score={recheck['score']}) — 揺れあり"
+                    ),
+                    "evidence": evidence,
+                    "snapshot_path": str(snapshot_path) if snapshot_path else None,
+                    "unresolved_fields": None,
+                }
         return {
             "status": "ok",
             "reason": f"{name}: 送信完了をスコア判定で確認 (score={score})",

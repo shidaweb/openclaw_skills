@@ -416,22 +416,35 @@ def assess_submission_result(evidence: dict[str, Any] | None) -> dict[str, Any]:
     status_success_text = _text_has_keyword(str(ev.get("submission_status_text") or ev.get("cf7_response_text") or ""), FORM_SUCCESS_KEYWORDS)
     status_error_text = _text_has_keyword(str(ev.get("submission_status_text") or ev.get("cf7_response_text") or ""), FORM_ERROR_KEYWORDS)
 
+    # v30 §WS-C — per-signal contribution breakdown. Production logs showed
+    # `send_score=-8` flipping to `+11` for the same target across consecutive
+    # observations (pre/post visibility data), which made the verify trace
+    # impossible to interpret at a glance. Recording each contribution lets
+    # ``./report`` and Slack escalations explain WHICH evidence moved the
+    # score, not just the final number.
     score = 0
     signals: list[str] = []
+    score_breakdown: list[dict[str, Any]] = []
+
+    def _add(signal: str, points: int) -> None:
+        nonlocal score
+        score += points
+        signals.append(signal)
+        score_breakdown.append({"signal": signal, "points": int(points)})
+
     if pre_submit_intro:
         signals.append("pre_submit_intro_success_ignored")
+        score_breakdown.append(
+            {"signal": "pre_submit_intro_success_ignored", "points": 0}
+        )
     if explicit_sent and not explicit_invalid:
-        score += 5
-        signals.append("explicit_sent_status")
+        _add("explicit_sent_status", 5)
     if status_success_text and not explicit_invalid:
-        score += 4
-        signals.append("success_status_text")
+        _add("success_status_text", 4)
     if url_success:
-        score += 2
-        signals.append("success_url")
+        _add("success_url", 2)
     if success_kw:
-        score += 2
-        signals.append("success_keyword")
+        _add("success_keyword", 2)
     if (
         success_kw
         and has_visibility
@@ -441,26 +454,19 @@ def assess_submission_result(evidence: dict[str, Any] | None) -> dict[str, Any]:
         and final_submit_controls == 0
         and not explicit_invalid
     ):
-        score += 2
-        signals.append("success_without_pending_submit")
+        _add("success_without_pending_submit", 2)
     if form_gone:
-        score += 2
-        signals.append("form_gone")
+        _add("form_gone", 2)
     if explicit_invalid:
-        score -= 4
-        signals.append("explicit_invalid_status")
+        _add("explicit_invalid_status", -4)
     if error_kw or status_error_text:
-        score -= 3
-        signals.append("error_keyword")
+        _add("error_keyword", -3)
     if form_still:
-        score -= 2
-        signals.append("form_still_present")
+        _add("form_still_present", -2)
     if field_hits:
-        score -= 2
-        signals.append("our_values_still_editable")
+        _add("our_values_still_editable", -2)
     if final_submit_controls > 0 and not explicit_sent:
-        score -= 2
-        signals.append("pending_submit_control")
+        _add("pending_submit_control", -2)
 
     # Confirm pages may contain "受け付けます" but still ask the user to press
     # the final submit button. Do not let those success-looking words settle ok.
@@ -471,8 +477,7 @@ def assess_submission_result(evidence: dict[str, Any] | None) -> dict[str, Any]:
     except Exception:
         confirm_instruction = False
     if confirm_instruction and submit_controls > 0 and not explicit_sent:
-        score -= 2
-        signals.append("confirm_instruction")
+        _add("confirm_instruction", -2)
 
     if score >= 3:
         verdict = "sent_ok"
@@ -500,6 +505,7 @@ def assess_submission_result(evidence: dict[str, Any] | None) -> dict[str, Any]:
         "score": score,
         "reason": reason,
         "signals": signals,
+        "score_breakdown": score_breakdown,
         "has_success_keyword": success_kw,
         "has_error_keyword": error_kw,
         "url_success": url_success,
