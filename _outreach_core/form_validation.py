@@ -339,14 +339,19 @@ _ERR_HANKAKU_NUMERIC_RE = re.compile(
 #   * 「X は全角64文字以内で入力してください」 → zenkaku (existing fixer)
 #   * 「X はひらがなのみで入力してください」    → hiragana (new fixer)
 #   * 「X は電話番号形式で入力してください」    → format with phone-y field
+# Field prefix is OPTIONAL — production pilot redux #3 (sunstar 2026-06-29)
+# showed pages emit bare "全角64文字以内で入力してください" with no preceding
+# label, so the parser must still classify those as zenkaku rather than
+# letting them fall through to _ERR_REQUIRED_RE. When the prefix is missing
+# the captured field defaults to a generic placeholder downstream.
 _ERR_ZENKAKU_LENGTH_RE = re.compile(
-    r"(?P<f>.+?)\s*(?:は|を)?\s*全角\d+文字(?:以内|まで|程度)?で(?:ご)?(?:入力|記入)"
+    r"(?P<f>.*?)\s*(?:は|を)?\s*全角\d+文字(?:以内|まで|程度)?で(?:ご)?(?:入力|記入)"
 )
 _ERR_HIRAGANA_RE = re.compile(
-    r"(?P<f>.+?)\s*(?:は|を)?\s*ひらがな(?:のみ)?で(?:ご)?(?:入力|記入)"
+    r"(?P<f>.*?)\s*(?:は|を)?\s*ひらがな(?:のみ)?で(?:ご)?(?:入力|記入)"
 )
 _ERR_PHONE_FORMAT_RE = re.compile(
-    r"(?P<f>.+?)\s*(?:は|を)?\s*電話番号(?:形式)?で(?:ご)?(?:入力|記入)"
+    r"(?P<f>.*?)\s*(?:は|を)?\s*電話番号(?:形式)?で(?:ご)?(?:入力|記入)"
 )
 _JP_WORD_RE = re.compile(r"[ぁ-んァ-ヶ一-龠a-zA-Z0-9]")
 
@@ -477,33 +482,31 @@ def parse_validation_errors(text: str | None) -> list[dict[str, str]]:
         m = _ERR_ZENKAKU_LENGTH_RE.search(line)
         if m:
             field = _clean_field(m.group("f"))
-            if (
-                len(field) >= 2
-                and _JP_WORD_RE.search(field)
-                and _is_field_capture_valid(field)
-            ):
-                key = (field, "zenkaku")
-                if key not in seen:
-                    seen.add(key)
-                    out.append({"field": field, "kind": "zenkaku", "raw": line})
+            if not field or not _is_field_capture_valid(field):
+                field = "全角文字"  # generic fallback for prefix-less messages
+            elif len(field) < 2 or not _JP_WORD_RE.search(field):
+                field = "全角文字"
+            key = (field, "zenkaku")
+            if key not in seen:
+                seen.add(key)
+                out.append({"field": field, "kind": "zenkaku", "raw": line})
             continue
         m = _ERR_HIRAGANA_RE.search(line)
         if m:
             field = _clean_field(m.group("f"))
-            if (
-                len(field) >= 2
-                and _JP_WORD_RE.search(field)
-                and _is_field_capture_valid(field)
-            ):
-                key = (field, "hiragana")
-                if key not in seen:
-                    seen.add(key)
-                    out.append({"field": field, "kind": "hiragana", "raw": line})
+            if not field or not _is_field_capture_valid(field):
+                field = "ふりがな"
+            elif len(field) < 2 or not _JP_WORD_RE.search(field):
+                field = "ふりがな"
+            key = (field, "hiragana")
+            if key not in seen:
+                seen.add(key)
+                out.append({"field": field, "kind": "hiragana", "raw": line})
             continue
         m = _ERR_PHONE_FORMAT_RE.search(line)
         if m:
             field = _clean_field(m.group("f"))
-            if not _is_field_capture_valid(field):
+            if not field or not _is_field_capture_valid(field):
                 field = "電話番号"
             key = (field, "format")
             if key not in seen:

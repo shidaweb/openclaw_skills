@@ -240,6 +240,28 @@ class TestFormatCategorization(unittest.TestCase):
         self.assertEqual(errs[0]["field"], "お名前")
         self.assertEqual(errs[0]["kind"], "required")
 
+    def test_prefix_less_zenkaku_uses_fallback_label(self) -> None:
+        # Production redux #3 (sunstar 2026-06-29) — pages emit bare
+        # 「全角64文字以内で入力してください」 with NO leading field label.
+        # Must still classify as zenkaku (was leaking to required before).
+        text = "全角64文字以内で入力してください"
+        errs = fv.parse_validation_errors(text)
+        kinds = [(e["field"], e["kind"]) for e in errs]
+        self.assertIn(("全角文字", "zenkaku"), kinds)
+        self.assertNotIn(("全角64文字以内で", "required"), kinds)
+
+    def test_prefix_less_hiragana_uses_fallback_label(self) -> None:
+        text = "ひらがなのみで入力してください"
+        errs = fv.parse_validation_errors(text)
+        kinds = [(e["field"], e["kind"]) for e in errs]
+        self.assertIn(("ふりがな", "hiragana"), kinds)
+
+    def test_prefix_less_phone_format_uses_fallback_label(self) -> None:
+        text = "電話番号形式で入力してください"
+        errs = fv.parse_validation_errors(text)
+        kinds = [(e["field"], e["kind"]) for e in errs]
+        self.assertIn(("電話番号", "format"), kinds)
+
 
 class TestAriaSnapshotLeakage(unittest.TestCase):
     """v30 §WS-A: production runs concatenated Playwright aria-snapshot output with
