@@ -44,6 +44,7 @@ from _outreach_core import run_supervisor as core_run_supervisor
 from _outreach_core import send_journal as core_send_journal
 from _outreach_core import send_state as core_send_state
 from _outreach_core import send_timeline as core_timeline
+from _outreach_core import target_lint as core_target_lint
 from _outreach_core import submit_progress as core_submit_progress
 from _outreach_core import tab_utils as core_tab_utils
 from _outreach_core import target_state as core_target_state
@@ -281,18 +282,39 @@ def _bootstrap_url_issue(c: dict[str, Any]) -> str | None:
     return None if _normalize_http_url(url) else "invalid_url"
 
 
+def _dedup_key_for_url(url: str) -> str:
+    """v31 §WS1a — dedup key for one URL.
+
+    Registrable domain, EXCEPT on hosted-form services (forms.gle, form.run,
+    HubSpot, …) where different companies legitimately share the domain —
+    there the full normalized URL is the key, so one Google-Forms target in
+    history no longer filters every future one.
+    """
+    if not url:
+        return ""
+    if core_contact_url.is_form_service_url(url):
+        from _outreach_core.contact_url import _normalize_http_url
+        return _normalize_http_url(url) or ""
+    return core_contact_url.registrable_domain(url)
+
+
 def _bootstrap_domain(c: dict[str, Any]) -> str:
-    """Registrable domain key for dedup (form_url, else first candidate)."""
+    """Dedup key for a targets.yaml row (form_url, else first candidate)."""
     url = str(c.get("form_url") or "").strip()
     if not url:
         cands = c.get("contact_url_candidates")
         if isinstance(cands, list) and cands:
             url = str(cands[0] or "").strip()
-    return core_contact_url.registrable_domain(url) if url else ""
+    return _dedup_key_for_url(url)
 
 
-def _history_form_url_domains() -> set[str]:
-    """Registrable domains of form_urls already in sent/skip history."""
+def _history_form_url_domains(exclude_ids: set[str] | None = None) -> set[str]:
+    """Dedup keys of form_urls already in sent/skip history.
+
+    ``exclude_ids`` (v31 §WS1c): rows for ids whose latest skip was transient
+    (e.g. invalid_url) don't contribute — the curator fixed the URL and the
+    domain must become eligible again.
+    """
     domains: set[str] = set()
     for path in (SENT_HISTORY_PATH, SKIP_HISTORY_PATH):
         try:
@@ -307,9 +329,11 @@ def _history_form_url_domains() -> set[str]:
                         row = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+                    if exclude_ids and str(row.get("id") or "") in exclude_ids:
+                        continue
                     url = str(row.get("form_url") or "").strip()
                     if url:
-                        dom = core_contact_url.registrable_domain(url)
+                        dom = _dedup_key_for_url(url)
                         if dom:
                             domains.add(dom)
         except OSError:
@@ -340,10 +364,15 @@ def stage_bootstrap(targets_path: Path, out_path: Path,
 
     sent_ids = load_sent_set()
     skip_ids = load_skip_set()
+    # v31 §WS1c — ids whose LATEST skip was transient (invalid_url) become
+    # eligible again: the curator fixed targets.yaml, so neither the id
+    # filter nor the history-domain filter may keep excluding them.
+    transient_skip_ids = core_history.load_transient_skip_ids(DATA_DIR)
+    skip_ids -= transient_skip_ids
     only_id_set = set(only_ids) if only_ids else None
 
     # v15 §L1: domain-level dedup — against history AND within this batch.
-    history_domains = _history_form_url_domains()
+    history_domains = _history_form_url_domains(exclude_ids=transient_skip_ids)
     seen_domains: set[str] = set()
 
     written: list[dict[str, Any]] = []
@@ -353,10 +382,22 @@ def stage_bootstrap(targets_path: Path, out_path: Path,
     filtered_only_ids = 0
     filtered_invalid_url = 0
     filtered_dup_domain = 0
-    for c in companies:
-        cid = c.get("id")
+    filtered_missing_id = 0
+    lint_warnings = 0
+    for row_idx, c in enumerate(companies, 1):
+        cid = c.get("id") if isinstance(c, dict) else None
         if not cid:
+            # v31 §WS1b — id-less rows used to vanish without a trace; the
+            # curator had no way to notice a YAML indentation slip.
+            filtered_missing_id += 1
+            name_hint = str((c or {}).get("name") or "?") if isinstance(c, dict) else "?"
+            print(f"[bootstrap] ⚠ row {row_idx} ({name_hint}): missing `id` "
+                  f"— skipped (missing_id)")
             continue
+        # v31 §WS1d — enum lint (warn-only; never filters).
+        for warning in core_target_lint.validate_target_row(c):
+            lint_warnings += 1
+            print(f"[bootstrap] ⚠ {cid}: {warning}")
         status = (c.get("status") or "pending").lower()
 
         if only_id_set is not None and cid not in only_id_set:
@@ -420,13 +461,28 @@ def stage_bootstrap(targets_path: Path, out_path: Path,
     if filtered_skip: drops.append(f"{filtered_skip} skipped")
     if filtered_invalid_url: drops.append(f"{filtered_invalid_url} invalid_url")
     if filtered_dup_domain: drops.append(f"{filtered_dup_domain} dup_domain")
+    if filtered_missing_id: drops.append(f"{filtered_missing_id} missing_id")
     if drops:
         msg += f"  (filtered: {', '.join(drops)})"
+    if lint_warnings:
+        msg += f"  [{lint_warnings} lint warning(s)]"
     if capped:
         msg += f"  [limited to first {limit}]"
     if only_id_set:
         msg += f"  [restricted to ids: {','.join(sorted(only_id_set))}]"
     print(msg)
+    # v31 §WS1b — a silently-shrinking list is the kind of divergence the
+    # operator can only catch if it reaches Slack. Best-effort.
+    if filtered_missing_id:
+        try:
+            from _outreach_core.notify import post as _notify_post
+            _notify_post(
+                f"bootstrap: targets.yaml に id 無しの行が {filtered_missing_id} 件"
+                "あり読み込めませんでした。YAML のインデント/入力漏れを確認してください。",
+                level="warn",
+            )
+        except Exception:  # noqa: BLE001 - Slack must never break bootstrap
+            pass
 
 
 # ============================================================================

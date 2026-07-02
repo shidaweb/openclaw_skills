@@ -88,6 +88,48 @@ def load_skip_set(data_dir: Path) -> set[str]:
     return _load_id_set(skip_history_path(data_dir))
 
 
+# v31 §WS1c — skip reasons that describe a fixable data problem, not a
+# property of the company. A target skipped for one of these should become
+# eligible again once the curator fixes targets.yaml; before this, a single
+# malformed URL permanently excluded the id (and its domain) from every
+# future batch.
+TRANSIENT_SKIP_PREFIXES = ("invalid_url",)
+
+
+def load_transient_skip_ids(
+    data_dir: Path,
+    prefixes: tuple[str, ...] = TRANSIENT_SKIP_PREFIXES,
+) -> set[str]:
+    """Ids whose LATEST skip_history reason starts with a transient prefix.
+
+    Latest-wins matters: an id first skipped as ``invalid_url`` and later
+    re-skipped as ``non_contact_form`` is NOT transient — the newer verdict
+    reflects an actual attempt.
+    """
+    path = skip_history_path(data_dir)
+    if not path.exists():
+        return set()
+    latest_reason: dict[str, str] = {}
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except Exception:
+                continue
+            eid = entry.get("id")
+            if not eid:
+                continue
+            latest_reason[str(eid)] = str(entry.get("reason") or "")
+    return {
+        eid
+        for eid, reason in latest_reason.items()
+        if any(reason.startswith(p) for p in prefixes)
+    }
+
+
 def load_sent_set(data_dir: Path) -> set[str]:
     return _load_id_set(sent_history_path(data_dir))
 
