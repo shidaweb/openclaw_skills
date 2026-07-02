@@ -409,6 +409,46 @@ def _clean_field(raw: str) -> str:
     return s.strip(_QUOTE_CHARS).strip()
 
 
+# v30 next — broken-form-structure detection.
+#
+# A poorly-implemented JS framework can stringify HTMLInputElement / Object
+# references straight into the `name` attribute, producing values like
+# "[object HTMLInputElement]". The form's submit handler then never finds
+# its own fields. Production observation 2026-06-30 (株式会社テンダ): the
+# legacy path attempted fill + submit and finally timed out at 300s. We
+# detect this early so the target skips immediately with a precise reason
+# instead of burning the timeout budget.
+_BROKEN_NAME_RE = re.compile(r"^\[object\s+\w+\]$")
+
+
+def field_name_is_broken(name: Any) -> bool:
+    """True when ``name`` looks like a JS object stringified into the DOM
+    (`"[object HTMLInputElement]"` etc.). Empty / missing names are NOT
+    treated as broken — they fall through to the existing label-based fill
+    heuristics.
+    """
+    if not name:
+        return False
+    return bool(_BROKEN_NAME_RE.match(str(name).strip()))
+
+
+def form_has_broken_structure(fields: dict[str, Any] | None) -> bool:
+    """True when at least one input/textarea/select in ``fields`` carries a
+    broken object-stringification name. Even one such field is enough to
+    abort: the page's submit handler typically can't address ANY of its
+    fields once this pattern surfaces.
+    """
+    if not isinstance(fields, dict):
+        return False
+    for group in ("inputs", "textareas", "selects"):
+        for item in fields.get(group) or []:
+            if not isinstance(item, dict):
+                continue
+            if field_name_is_broken(item.get("name")):
+                return True
+    return False
+
+
 def _is_field_capture_valid(field: str) -> bool:
     """Reject captured 'field' strings that came from aria-snapshot leakage or
     are too long to plausibly be a form label."""

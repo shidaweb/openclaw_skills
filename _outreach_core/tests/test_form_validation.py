@@ -153,6 +153,53 @@ class TestSubject(unittest.TestCase):
         self.assertLessEqual(len(fv.derive_subject({"subject": "あ" * 100})), 48)
 
 
+class TestFormStructureHealth(unittest.TestCase):
+    """v30 next — detect broken form structure early so a 300s lead timeout
+    is replaced by an immediate skip with a precise reason.
+
+    Pilot 2026-06-30 V9 batch (株式会社テンダ): the form's input.name attribute
+    rendered as "[object HTMLInputElement]" — a JS framework bug that defies
+    every field-by-name fixer. The legacy path ran the full fill/submit
+    cycle, hit a disabled submit button, and finally timed out at 300s.
+    """
+
+    def test_object_html_name_detected_as_broken(self) -> None:
+        self.assertTrue(fv.field_name_is_broken("[object HTMLInputElement]"))
+        self.assertTrue(fv.field_name_is_broken("[object HTMLTextAreaElement]"))
+        self.assertTrue(fv.field_name_is_broken("[object Object]"))
+
+    def test_normal_field_names_not_broken(self) -> None:
+        for name in ("email", "company_name", "your-name", "tel", "data[User][email]"):
+            self.assertFalse(fv.field_name_is_broken(name))
+
+    def test_empty_name_not_treated_as_broken(self) -> None:
+        # Empty / missing names are a different problem (heuristic fallback
+        # by label / placeholder). field_name_is_broken specifically targets
+        # the malformed-object-stringification case.
+        self.assertFalse(fv.field_name_is_broken(""))
+        self.assertFalse(fv.field_name_is_broken(None))
+
+    def test_form_has_broken_structure_one_or_more_object_names(self) -> None:
+        fields = {
+            "inputs": [
+                {"name": "name", "type": "text"},
+                {"name": "[object HTMLInputElement]", "type": "text"},
+            ],
+        }
+        self.assertTrue(fv.form_has_broken_structure(fields))
+
+    def test_form_has_broken_structure_clean_form(self) -> None:
+        fields = {
+            "inputs": [{"name": "name"}, {"name": "email"}],
+            "textareas": [{"name": "message"}],
+        }
+        self.assertFalse(fv.form_has_broken_structure(fields))
+
+    def test_form_has_broken_structure_handles_missing_dict(self) -> None:
+        self.assertFalse(fv.form_has_broken_structure(None))
+        self.assertFalse(fv.form_has_broken_structure({}))
+
+
 class TestParseValidationErrors(unittest.TestCase):
     def test_parses_yamaha_errors(self) -> None:
         text = (
