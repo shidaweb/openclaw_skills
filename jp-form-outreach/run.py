@@ -6967,8 +6967,15 @@ def _read_dialog_log() -> list[dict[str, Any]]:
         return []
 
 
-def _observe_send_state(sender: dict[str, Any], body: str) -> dict[str, Any]:
-    """One evaluate round-trip → classified live page state (see send_state)."""
+def _observe_send_state(
+    sender: dict[str, Any], body: str, *, include_raw: bool = False
+) -> dict[str, Any]:
+    """One evaluate round-trip → classified live page state (see send_state).
+
+    ``include_raw`` (v31 §WS7b): attach the raw page evidence as
+    ``_raw_evidence`` so the caller can stash a pre-submit baseline. Opt-in
+    because the raw blob carries up to 16k of page text.
+    """
     probes = core_send_state.build_probes(sender, body)
     js = core_send_state.evidence_js(probes)
     raw = _evaluate(js)
@@ -6981,6 +6988,8 @@ def _observe_send_state(sender: dict[str, Any], body: str) -> dict[str, Any]:
     obs = core_send_state.classify_send_state(raw if isinstance(raw, dict) else {})
     if not isinstance(raw, dict):
         obs["observe_failed"] = True
+    elif include_raw:
+        obs["_raw_evidence"] = raw
     return obs
 
 
@@ -7149,8 +7158,26 @@ def _submission_loop(
 
     for step in range(MAX_FORM_STEPS + 2):
         _arm_dialog_autoaccept()
-        obs = _observe_send_state(sender, send_body)
+        obs = _observe_send_state(sender, send_body, include_raw=(step == 0))
         state = obs["state"]
+        # v31 §WS7b — stash the FIRST (pre-submit) observation so verify can
+        # demote success markers that were already present before any click
+        # (a framework stamping "complete" on the input container, a page
+        # living at /contact/thanks-*, an intro sentence matching a success
+        # keyword). Only step 0, only before any click.
+        raw0 = obs.pop("_raw_evidence", None)
+        if step == 0 and clicks == 0 and isinstance(raw0, dict):
+            baseline = {
+                k: raw0.get(k)
+                for k in (
+                    "url", "cf7_sent", "cf7_statuses",
+                    "submission_sent", "submission_statuses",
+                    "submission_status_text", "cf7_response_text",
+                )
+                if raw0.get(k) is not None
+            }
+            baseline["text"] = str(raw0.get("text") or "")[:4000]
+            d["_pre_submit_evidence"] = baseline
         _emit_event(
             "send.state.observed", stage="send", target_id=tid,
             payload={
@@ -8183,6 +8210,13 @@ def _send_one_target(
             # not bleed into the verify path.
             infer_fn=lambda p, m: oc_infer(p, m or core_infer.DEFAULT_MODEL),
             tiebreak_model=_verify_model(config),
+            # v31 §WS7d — the sent_ok double-check was dead code in production
+            # because no caller passed recheck_after_sec. Default ON (2s):
+            # a mid-transition flake must not be reported as sent.
+            recheck_after_sec=float(
+                (config.get("verify") or {}).get("recheck_after_sec", 2.0)
+            ),
+            sleep_fn=time.sleep,
         )
         _refresh_last_verify(d, vresult)
         ev.dump_trace(trace, "verify_evidence.json", vresult.get("evidence") or {})
@@ -8968,6 +9002,11 @@ def stage_resolve_proceed(
         evaluate_fn=_evaluate,
         data_dir=DATA_DIR,
         snapshot_path=snap_path if combined.strip() else None,
+        # v31 §WS7d — double-check on by default (see stage_send site).
+        recheck_after_sec=float(
+            (config.get("verify") or {}).get("recheck_after_sec", 2.0)
+        ),
+        sleep_fn=time.sleep,
     )
     outcome = handle_verify_result(d, vresult, DATA_DIR, channel="jp_form")
     if outcome == "sent_ok":

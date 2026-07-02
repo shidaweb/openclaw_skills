@@ -288,3 +288,113 @@ def test_dialog_js_shape():
     assert "return true" in send_state.DIALOG_AUTOACCEPT_JS
     assert "onbeforeunload" in send_state.DIALOG_AUTOACCEPT_JS
     assert send_state.READ_DIALOG_LOG_JS.startswith("() =>")
+
+
+# --- v31 §WS7a: URL success tokens ------------------------------------------
+
+def test_url_success_token_matches():
+    ok = send_state.url_looks_like_success
+    assert ok("https://example.co.jp/contact/thanks/")
+    assert ok("https://example.co.jp/contact/thank-you")
+    assert ok("https://example.co.jp/inquiry/complete.html")
+    assert ok("https://example.co.jp/form/kanryo")
+    assert ok("https://example.co.jp/contact?mode=complete")
+    assert ok("https://example.co.jp/contact/?sent=1")
+    assert ok("https://example.co.jp/contact/done")
+
+
+def test_url_success_rejects_substring_false_positives():
+    ok = send_state.url_looks_like_success
+    # the old substring matcher scored all of these +2
+    assert not ok("https://example.co.jp/london/contact/")          # "done" in london
+    assert not ok("https://example.co.jp/contact/?completed=0")     # explicit NOT completed
+    assert not ok("https://example.co.jp/successstory/")            # no token boundary
+    assert not ok("https://thanks.example.co.jp/contact/")          # hostname doesn't count
+    assert not ok("https://example.co.jp/contact/")
+    assert not ok("")
+
+
+# --- v31 §WS7b: pre-submit baseline demotion --------------------------------
+
+def _thanks_page_ev():
+    return {
+        "url": "https://example.co.jp/contact/thanks-guide/",
+        "text": "お問い合わせを受け付けました。ありがとうございました。",
+        "visible_forms": 0,
+        "visible_textareas": 0,
+        "editable_visible": 0,
+        "submit_controls": 0,
+        "final_submit_controls": 0,
+        "probe_text_hits": 0,
+        "probe_field_hits": 0,
+    }
+
+
+def test_baseline_demotes_pre_existing_success_markers():
+    ev = _thanks_page_ev()
+    # WITHOUT baseline the markers score (url +2, keyword +2, ...) → sent_ok
+    no_base = send_state.assess_submission_result(ev)
+    assert no_base["verdict"] == "sent_ok"
+    # WITH a pre-submit baseline showing the SAME markers, they demote to 0.
+    baseline = {
+        "url": "https://example.co.jp/contact/thanks-guide/",
+        "text": "お問い合わせを受け付けました。ありがとうございました。",
+    }
+    with_base = send_state.assess_submission_result(ev, baseline=baseline)
+    assert with_base["verdict"] != "sent_ok"
+    assert "success_url_present_pre_submit" in with_base["signals"]
+    assert "success_keyword_present_pre_submit" in with_base["signals"]
+    # demoted entries carry 0 points in the breakdown
+    zeroed = {
+        b["signal"] for b in with_base["score_breakdown"] if b["points"] == 0
+    }
+    assert "success_url_present_pre_submit" in zeroed
+
+
+def test_baseline_does_not_demote_new_markers():
+    # baseline was a normal input page → post-submit markers score normally
+    ev = _thanks_page_ev()
+    baseline = {
+        "url": "https://example.co.jp/contact/",
+        "text": "お名前 メールアドレス お問い合わせ内容",
+    }
+    result = send_state.assess_submission_result(ev, baseline=baseline)
+    assert result["verdict"] == "sent_ok"
+
+
+def test_baseline_demotes_pre_stamped_explicit_sent():
+    # a framework that stamps "complete" on the INPUT page's container
+    ev = _ev(
+        submission_statuses=["form complete"],
+        submission_sent=True,
+        visible_textareas=0,
+        editable_visible=0,
+        submit_controls=0,
+    )
+    baseline = {"submission_statuses": ["form complete"], "submission_sent": True}
+    result = send_state.assess_submission_result(ev, baseline=baseline)
+    assert "explicit_sent_status_present_pre_submit" in result["signals"]
+    assert result["verdict"] != "sent_ok"
+
+
+# --- v31 §WS7: FINAL_SUBMIT_RE_JS consolidation ------------------------------
+
+def test_final_submit_re_single_source():
+    # the tightened regex: no bare 問い合わせ/完了, word-bounded send
+    re_js = send_state.FINAL_SUBMIT_RE_JS
+    assert "問い合わせ" not in re_js
+    assert "完了" not in re_js
+    assert r"\bsend\b" in re_js
+    assert "送信" in re_js
+    # evidence_js interpolates it (no leftover placeholder)
+    js = send_state.evidence_js(["probe"])
+    assert "__FINAL_SUBMIT_RE__" not in js
+    assert re_js in js
+
+
+def test_verify_js_uses_shared_final_submit_re():
+    from _outreach_core import verify
+    assert "__FINAL_SUBMIT_RE__" not in verify.PAGE_EVIDENCE_JS
+    assert "__FINAL_SUBMIT_RE__" not in verify.FORM_VISIBILITY_JS
+    assert send_state.FINAL_SUBMIT_RE_JS in verify.PAGE_EVIDENCE_JS
+    assert send_state.FINAL_SUBMIT_RE_JS in verify.FORM_VISIBILITY_JS

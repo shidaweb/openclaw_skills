@@ -32,6 +32,12 @@ import json
 import re
 from typing import Any
 
+# v31 §WS7c — top-level import (no cycle: submit_progress only imports
+# send_state/verify function-locally). This used to be a function-local
+# import wrapped in a bare ``except Exception`` that silently disabled the
+# confirm-instruction penalty on any import failure.
+from _outreach_core.submit_progress import detect_confirm_instruction
+
 SEND_STATES = ("input", "validation_error", "confirm", "done", "no_form")
 
 FORM_SUCCESS_KEYWORDS = (
@@ -71,6 +77,14 @@ FORM_ERROR_KEYWORDS = (
     "failed to send",
     "submission failed",
 )
+
+# v31 §WS7 — single source of truth for the "final submit"-looking control
+# regex. It was triple-duplicated (verify.PAGE_EVIDENCE_JS, verify.
+# FORM_VISIBILITY_JS, send_state evidence_js) and over-broad: bare
+# 問い合わせ/完了 matched thanks-page nav links (「お問い合わせはこちら」),
+# and substring "send" matched e.g. "recommend" — each counted as a pending
+# submit control and pushed real successes into the uncertain band (-2).
+FINAL_SUBMIT_RE_JS = r"/送信|送る|submit|\bsend\b|confirm|確定/i"
 
 _SUCCESS_STATUS_RE = re.compile(
     r"(^|[\s_-])(sent|success|succeeded|complete|completed|submitted|thanks|thankyou|"
@@ -215,7 +229,7 @@ _EVIDENCE_JS_TMPL = r"""
     const v = String(el.value || '');
     if (v) fieldValues.push(v.toLowerCase());
   }
-  const finalSubmitRe = /送信|送る|問い合わせ|お問い合わせ|submit|send|confirm|確定|完了/i;
+  const finalSubmitRe = __FINAL_SUBMIT_RE__;
   for (const el of document.querySelectorAll(
     'button, input[type="submit"], input[type="button"], input[type="image"], [role="button"]'
   )) {
@@ -289,7 +303,7 @@ def build_probes(sender: dict[str, Any] | None, body: str | None) -> list[str]:
 def evidence_js(probes: list[str] | None) -> str:
     return _EVIDENCE_JS_TMPL.replace(
         "__PROBES__", json.dumps(list(probes or []), ensure_ascii=False)
-    )
+    ).replace("__FINAL_SUBMIT_RE__", FINAL_SUBMIT_RE_JS)
 
 
 def page_fingerprint(evidence: dict[str, Any] | None) -> str:
@@ -325,21 +339,55 @@ def _looks_like_pre_submit_intro(text: str) -> bool:
     )
 
 
+# v31 §WS7a — success tokens matched against path SEGMENTS and query pairs,
+# not the raw URL substring. The old substring check scored +2 for
+# "?completed=0", "/london/…", or a page that always lives at
+# /contact/thanks-guide — enough to flip a borderline verdict to sent_ok.
+_URL_SUCCESS_TOKENS = frozenset({
+    "thanks", "thank", "thankyou",
+    "complete", "completed",
+    "success",
+    "done",
+    "finish", "finished",
+    "arigato", "arigatou",
+    "kanryo", "kanryou",
+    "sent",
+})
+_FALSY_QUERY_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+def _tokens(part: str) -> list[str]:
+    return [t for t in re.split(r"[-_.]", part) if t]
+
+
 def url_looks_like_success(url: str) -> bool:
     u = _norm(url)
-    markers = (
-        "thanks",
-        "thank",
-        "complete",
-        "completed",
-        "success",
-        "done",
-        "finish",
-        "/thanks",
-        "arigato",
-        "kanryo",
-    )
-    return any(m in u for m in markers)
+    if not u:
+        return False
+    path, _, tail = u.partition("?")
+    query = tail.split("#", 1)[0]
+    path = path.split("#", 1)[0]
+    # strip scheme+host so a hostname like thanks.example.jp doesn't count
+    if "://" in path:
+        path = path.split("://", 1)[1]
+        path = path[path.find("/"):] if "/" in path else ""
+    for seg in path.split("/"):
+        if not seg:
+            continue
+        if seg in _URL_SUCCESS_TOKENS or any(t in _URL_SUCCESS_TOKENS for t in _tokens(seg)):
+            return True
+    for pair in query.split("&"):
+        if not pair:
+            continue
+        name, _, value = pair.partition("=")
+        if any(t in _URL_SUCCESS_TOKENS for t in _tokens(name)):
+            # ?completed=0 / ?done=false explicitly says NOT completed
+            if value.strip() in _FALSY_QUERY_VALUES:
+                continue
+            return True
+        if any(t in _URL_SUCCESS_TOKENS for t in _tokens(value)):
+            return True
+    return False
 
 
 def _status_blob(evidence: dict[str, Any]) -> str:
@@ -360,14 +408,51 @@ def _combined_page_text(evidence: dict[str, Any]) -> str:
     )
 
 
-def assess_submission_result(evidence: dict[str, Any] | None) -> dict[str, Any]:
+def _success_markers(evidence: dict[str, Any] | None) -> set[str]:
+    """v31 §WS7b — which success signals does this evidence already carry?
+
+    Used to compute the PRE-submit baseline: a marker that was present before
+    we ever clicked submit (a framework that stamps "complete" on the input
+    container, a page that permanently lives at /contact/thanks-guide, an
+    intro sentence in the success-keyword list) proves nothing about the
+    submission and must not score.
+    """
+    ev = evidence or {}
+    markers: set[str] = set()
+    status_blob = _status_blob(ev)
+    if (
+        bool(ev.get("cf7_sent"))
+        or bool(ev.get("submission_sent"))
+        or bool(ev.get("sent"))
+        or bool(_SUCCESS_STATUS_RE.search(status_blob))
+    ):
+        markers.add("explicit_sent")
+    if bool(ev.get("url_success")) or url_looks_like_success(str(ev.get("url") or "")):
+        markers.add("url_success")
+    text = _combined_page_text(ev)
+    if bool(ev.get("has_success_keyword")) or (
+        text and _text_has_keyword(text, FORM_SUCCESS_KEYWORDS)
+    ):
+        markers.add("success_kw")
+    return markers
+
+
+def assess_submission_result(
+    evidence: dict[str, Any] | None,
+    *,
+    baseline: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Score generic post-submit evidence independent of any one form library.
 
     This is the shared truth for both the live send-state loop and the final
     verifier. A visible leftover form is not automatically failure when a
     framework/status region explicitly says the submission was accepted.
+
+    ``baseline`` (v31 §WS7b) is the PRE-submit page evidence; success markers
+    already present there are demoted to 0 points post-submit.
     """
     ev = evidence or {}
+    baseline_markers = _success_markers(baseline) if baseline else frozenset()
     text = _combined_page_text(ev)
     status_blob = _status_blob(ev)
     visible_forms = int(ev.get("visible_forms") or 0)
@@ -432,19 +517,32 @@ def assess_submission_result(evidence: dict[str, Any] | None) -> dict[str, Any]:
         signals.append(signal)
         score_breakdown.append({"signal": signal, "points": int(points)})
 
+    def _demoted(marker: str, signal: str) -> bool:
+        """v31 §WS7b — record a pre-submit-present marker at 0 points."""
+        if marker not in baseline_markers:
+            return False
+        signals.append(f"{signal}_present_pre_submit")
+        score_breakdown.append(
+            {"signal": f"{signal}_present_pre_submit", "points": 0}
+        )
+        return True
+
     if pre_submit_intro:
         signals.append("pre_submit_intro_success_ignored")
         score_breakdown.append(
             {"signal": "pre_submit_intro_success_ignored", "points": 0}
         )
     if explicit_sent and not explicit_invalid:
-        _add("explicit_sent_status", 5)
+        if not _demoted("explicit_sent", "explicit_sent_status"):
+            _add("explicit_sent_status", 5)
     if status_success_text and not explicit_invalid:
         _add("success_status_text", 4)
     if url_success:
-        _add("success_url", 2)
+        if not _demoted("url_success", "success_url"):
+            _add("success_url", 2)
     if success_kw:
-        _add("success_keyword", 2)
+        if not _demoted("success_kw", "success_keyword"):
+            _add("success_keyword", 2)
     if (
         success_kw
         and has_visibility
@@ -470,12 +568,7 @@ def assess_submission_result(evidence: dict[str, Any] | None) -> dict[str, Any]:
 
     # Confirm pages may contain "受け付けます" but still ask the user to press
     # the final submit button. Do not let those success-looking words settle ok.
-    try:
-        from _outreach_core.submit_progress import detect_confirm_instruction
-
-        confirm_instruction = detect_confirm_instruction(text)
-    except Exception:
-        confirm_instruction = False
+    confirm_instruction = detect_confirm_instruction(text)
     if confirm_instruction and submit_controls > 0 and not explicit_sent:
         _add("confirm_instruction", -2)
 
@@ -529,8 +622,6 @@ def classify_send_state(evidence: dict[str, Any] | None) -> dict[str, Any]:
       - ``input``            — an editable form is present
       - ``no_form``          — nothing form-like at all (error page / redirect)
     """
-    from _outreach_core.submit_progress import detect_confirm_instruction
-
     ev = evidence or {}
     text = str(ev.get("text") or "")
     url = str(ev.get("url") or "")

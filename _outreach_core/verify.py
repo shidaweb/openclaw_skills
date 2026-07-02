@@ -90,7 +90,7 @@ PAGE_EVIDENCE_JS = r"""
 	    if (el.disabled || el.readOnly) continue;
 	    editableVisible++;
 	  }
-	  const finalSubmitRe = /送信|送る|問い合わせ|お問い合わせ|submit|send|confirm|確定|完了/i;
+	  const finalSubmitRe = __FINAL_SUBMIT_RE__;
 	  for (const el of document.querySelectorAll(
 	    'button, input[type="submit"], input[type="button"], input[type="image"], [role="button"]'
 	  )) {
@@ -148,7 +148,7 @@ FORM_VISIBILITY_JS = r"""
 	    if (el.disabled || el.readOnly) continue;
 	    editableVisible++;
 	  }
-	  const finalSubmitRe = /送信|送る|問い合わせ|お問い合わせ|submit|send|confirm|確定|完了/i;
+	  const finalSubmitRe = __FINAL_SUBMIT_RE__;
 	  for (const el of document.querySelectorAll(
 	    'button, input[type="submit"], input[type="button"], input[type="image"], [role="button"]'
 	  )) {
@@ -183,6 +183,16 @@ FORM_VISIBILITY_JS = r"""
   };
 }
 """
+
+# v31 §WS7 — the final-submit regex is owned by send_state.FINAL_SUBMIT_RE_JS
+# (single source of truth; the old triple-duplicated copies drifted and were
+# over-broad). Interpolated once at import time.
+PAGE_EVIDENCE_JS = PAGE_EVIDENCE_JS.replace(
+    "__FINAL_SUBMIT_RE__", core_send_state.FINAL_SUBMIT_RE_JS
+)
+FORM_VISIBILITY_JS = FORM_VISIBILITY_JS.replace(
+    "__FINAL_SUBMIT_RE__", core_send_state.FINAL_SUBMIT_RE_JS
+)
 
 
 def _norm(text: str) -> str:
@@ -355,7 +365,10 @@ def verdict_from_score(score: int) -> str:
 
 
 def _record_submission_result(
-    evidence: dict[str, Any], *, pass_label: str | None = None
+    evidence: dict[str, Any],
+    *,
+    pass_label: str | None = None,
+    baseline: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Attach the shared send-state verdict fields to evidence and return it.
 
@@ -365,7 +378,7 @@ def _record_submission_result(
     target whose flip looks unexplained; with it, the operator can see that
     the first pass ran without visibility data and the second pass refined.
     """
-    result = core_send_state.assess_submission_result(evidence)
+    result = core_send_state.assess_submission_result(evidence, baseline=baseline)
     evidence["score"] = result["score"]
     evidence["send_verdict"] = result["verdict"]
     evidence["send_reason"] = result["reason"]
@@ -693,7 +706,14 @@ def verify_send_completed(
         evidence["has_success_keyword"] = _text_has_keyword(snap, FORM_SUCCESS_KEYWORDS)
         evidence["has_error_keyword"] = _text_has_keyword(snap, FORM_ERROR_KEYWORDS)
 
-    submission = _record_submission_result(evidence, pass_label="pre_visibility")
+    # v31 §WS7b — success markers already present BEFORE submit (stashed by
+    # the send loop) are demoted: they prove nothing about this submission.
+    pre_submit_baseline = target.get("_pre_submit_evidence")
+    if not isinstance(pre_submit_baseline, dict):
+        pre_submit_baseline = None
+    submission = _record_submission_result(
+        evidence, pass_label="pre_visibility", baseline=pre_submit_baseline
+    )
 
     # Guardrail: if an explicit input error banner is present and we don't also
     # have strong success evidence, treat as failure (Benesse false-positive).
@@ -781,7 +801,9 @@ def verify_send_completed(
                     evidence[key] = vis.get(key)
 
     # v15 §V1: weighted score settles cases keywords alone could not.
-    submission = _record_submission_result(evidence, pass_label="post_visibility")
+    submission = _record_submission_result(
+        evidence, pass_label="post_visibility", baseline=pre_submit_baseline
+    )
     score = int(submission["score"])
     if submission["verdict"] == "sent_ok":
         # v30 §WS-C — double-check at the score-based exit too.
