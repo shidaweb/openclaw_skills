@@ -102,6 +102,38 @@ class TestHealthcheck(unittest.TestCase):
             self.assertTrue(health_path.is_file())
 
 
+class TestForwardProgressAge(unittest.TestCase):
+    """v32 FX1 — the supervisor's stall signal must ignore files that
+    background threads refresh."""
+
+    def test_none_when_no_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(hc.forward_progress_age_seconds(Path(tmp)))
+
+    def test_picks_freshest_of_the_three(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            now = time.time()
+            (d / "current_task.jsonl").write_text("{}\n")
+            os.utime(d / "current_task.jsonl", (now - 500, now - 500))
+            (d / "run_progress.json").write_text("{}")
+            os.utime(d / "run_progress.json", (now - 100, now - 100))
+            age = hc.forward_progress_age_seconds(d, now_epoch=now)
+            self.assertAlmostEqual(age, 100, delta=2)
+
+    def test_fresh_events_jsonl_does_not_mask_stale_progress(self) -> None:
+        # REGRESSION — heartbeat.tick lands in events.jsonl from a background
+        # thread; a wedged main thread must still read as stale.
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            now = time.time()
+            (d / "current_task.jsonl").write_text("{}\n")
+            os.utime(d / "current_task.jsonl", (now - 2000, now - 2000))
+            (d / "events.jsonl").write_text("{}\n")  # fresh (background write)
+            age = hc.forward_progress_age_seconds(d, now_epoch=now)
+            self.assertAlmostEqual(age, 2000, delta=2)
+
+
 class TestWatchdogErrorLine(unittest.TestCase):
     """v32 FX5 — a non-empty watchdog.err must be visible (it once hid a
     month-long watchdog outage)."""

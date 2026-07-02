@@ -152,7 +152,10 @@ class TestRunJob(unittest.TestCase):
         return (
             mock.patch.object(run_job, "_post",
                               side_effect=lambda t, level="info", **k: posts.append((level, t))),
-            mock.patch.object(run_job, "_health_files", return_value=[]),
+            # v32 FX1 — the stall probe is _stall_age (per-brief forward
+            # progress). Default: no signal → never stalled, matching the
+            # old empty _health_files patch.
+            mock.patch.object(run_job, "_stall_age", return_value=None),
             mock.patch.object(RS, "save_state", _save),
             mock.patch.object(RS, "load_state", _load),
             # Neutralize the caffeinate sibling so it doesn't consume the mocked
@@ -250,7 +253,7 @@ class TestRunJob(unittest.TestCase):
 
         p1, p2, p3, p4, p5 = self._patches(posts)
         with p1, p2, p3, p4, p5, \
-                mock.patch.object(RS, "latest_activity_age_sec", return_value=10 ** 6), \
+                mock.patch.object(run_job, "_stall_age", return_value=10 ** 6), \
                 mock.patch("subprocess.Popen", side_effect=[stalled, healthy]) as popen:
             code = run_job._supervise("jp-form-outreach", "rid", "/tmp/x.log", ["campaign"])
         self.assertEqual(code, 0)
@@ -269,7 +272,7 @@ class TestRunJob(unittest.TestCase):
 
         p1, p2, p3, p4, p5 = self._patches(posts)
         with p1, p2, p3, p4, p5, \
-                mock.patch.object(RS, "latest_activity_age_sec", return_value=10 ** 6), \
+                mock.patch.object(run_job, "_stall_age", return_value=10 ** 6), \
                 mock.patch.object(RS, "decide", return_value=RS.ACTION_GIVE_UP_STALLED), \
                 mock.patch.object(run_job, "_post_problem", return_value=True) as problem, \
                 mock.patch("subprocess.Popen", return_value=stalled):

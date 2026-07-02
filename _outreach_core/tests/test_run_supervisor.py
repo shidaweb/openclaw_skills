@@ -269,3 +269,27 @@ class TestPerBriefState(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEffectiveActivityAge(unittest.TestCase):
+    """v32 FX1 — young-child guard."""
+
+    def test_young_child_is_never_stalled(self):
+        # files carry the PREVIOUS run's mtimes right after a relaunch
+        self.assertIsNone(RS.effective_activity_age(10**6, 30))
+        self.assertIsNone(RS.effective_activity_age(10**6, RS.STALL_SEC - 1))
+
+    def test_old_child_trusts_file_age(self):
+        self.assertEqual(
+            RS.effective_activity_age(1200, RS.STALL_SEC + 1), 1200
+        )
+
+    def test_unknown_ages_pass_through(self):
+        self.assertIsNone(RS.effective_activity_age(None, RS.STALL_SEC + 1))
+        self.assertEqual(RS.effective_activity_age(1200, None), 1200)
+
+    def test_stall_sec_default_raised_to_900(self):
+        # env override still respected; default must cover a legitimately
+        # slow single lead (adaptive warmup + Opus retries > 7 min)
+        self.assertEqual(RS._env_int("_MISSING_ENV_", 900), 900)
+        self.assertGreaterEqual(RS.STALL_SEC, 900)

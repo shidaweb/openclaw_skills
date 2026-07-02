@@ -488,13 +488,27 @@ def start(
     }
 
 
-def _health_files() -> list[Path]:
-    """system_health/*.json — the child run's heartbeat advances these."""
-    d = SKILLS_ROOT / "data" / "system_health"
-    try:
-        return list(d.glob("*.json"))
-    except OSError:
-        return []
+def _stall_age(brief_dir: "Path | None", child_started_ts: float) -> float | None:
+    """v32 FX1 — effective activity age for the stall decision.
+
+    Per-brief FORWARD-progress files only. The previous signal —
+    ``[log_path] + system_health/*.json`` — was refreshed every ~60s by the
+    stdout-keepalive thread (log) and by the watchdog/keepalive host
+    heartbeat (system_health), so ``is_stalled`` could never fire and a
+    wedged run hung forever. None (= don't kill) for briefless runs and for
+    children younger than the stall threshold (their brief files still carry
+    the previous run's mtimes).
+    """
+    from _outreach_core import run_supervisor as RS
+    from _outreach_core.helpers import healthcheck as hc
+
+    age: float | None = None
+    if brief_dir is not None:
+        try:
+            age = hc.forward_progress_age_seconds(brief_dir)
+        except Exception:  # noqa: BLE001 — probe failure must not kill runs
+            age = None
+    return RS.effective_activity_age(age, time.time() - child_started_ts)
 
 
 def _supervise(skill: str, run_id: str, log_path: str, run_args: list[str]) -> int:
@@ -522,6 +536,13 @@ def _supervise(skill: str, run_id: str, log_path: str, run_args: list[str]) -> i
         except Exception:  # noqa: BLE001 — unknown alias → briefless key
             brief_resolved = brief_raw
     state_key = RS.state_key(skill, brief_resolved)
+    # v32 FX1 — per-brief forward-progress dir for the stall probe.
+    brief_dir: Path | None = None
+    if brief_resolved:
+        try:
+            brief_dir = brief_data_dir(_skill_dir(skill), brief_resolved)
+        except Exception:  # noqa: BLE001
+            brief_dir = None
 
     while True:
         try:
@@ -543,6 +564,7 @@ def _supervise(skill: str, run_id: str, log_path: str, run_args: list[str]) -> i
 
         # Keep the machine awake while this run lives (auto-exits with the child).
         caf = _start_caffeinate(proc.pid)
+        child_started_ts = time.time()
 
         killed_for_stall = False
         code: int | None = None
@@ -551,7 +573,7 @@ def _supervise(skill: str, run_id: str, log_path: str, run_args: list[str]) -> i
                 code = proc.wait(timeout=RS.POLL_SEC)
                 break  # child exited
             except subprocess.TimeoutExpired:
-                age = RS.latest_activity_age_sec([Path(log_path)] + _health_files())
+                age = _stall_age(brief_dir, child_started_ts)
                 # v32 FX2 — fresh state per decision (per-brief file).
                 state = RS.load_state(state_dir, state_key)
                 action = RS.decide(child_alive=True, exit_code=None,

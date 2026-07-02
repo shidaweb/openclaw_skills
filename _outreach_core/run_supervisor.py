@@ -36,7 +36,12 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-STALL_SEC = _env_int("DOORMAN_RUN_STALL_SEC", 420)        # no activity this long → stalled
+# v32 FX1 — raised 420 → 900. The stall signal is now per-brief FORWARD
+# progress (main-thread writes only); a single legitimate lead (adaptive
+# warmup + Opus analyzer retries) can exceed 7 minutes without any
+# per-item file write, and real wedges hang for hours — 15-minute
+# detection loses nothing and removes the false-kill class.
+STALL_SEC = _env_int("DOORMAN_RUN_STALL_SEC", 900)        # no activity this long → stalled
 POLL_SEC = _env_int("DOORMAN_RUN_POLL_SEC", 30)           # supervisor poll cadence
 MAX_RESTARTS = _env_int("DOORMAN_RUN_MAX_RESTARTS", 3)    # within the window
 RESTART_WINDOW_MIN = _env_int("DOORMAN_RUN_RESTART_WINDOW_MIN", 30)
@@ -78,6 +83,28 @@ def should_abort_target(started_at: float | None, now: float | None, limit: int 
     except (TypeError, ValueError):
         return False
     return max(0.0, current - start) >= lim
+
+
+def effective_activity_age(
+    activity_age_sec: float | None,
+    child_age_sec: float | None,
+    *,
+    stall_sec: int = STALL_SEC,
+) -> float | None:
+    """v32 FX1 — young-child guard for the stall decision (pure).
+
+    Right after a (re)launch, the per-brief progress files still carry the
+    PREVIOUS run's mtimes, so the raw activity age can read hours old while
+    the child has been alive for seconds. A child younger than the stall
+    threshold is never stalled → return None (unknown / don't kill). Once
+    the child has lived past the threshold, trust the file-based age.
+    """
+    try:
+        if child_age_sec is not None and float(child_age_sec) < float(stall_sec):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return activity_age_sec
 
 
 def latest_activity_age_sec(paths: list[Path], now: float | None = None) -> float | None:

@@ -53,6 +53,36 @@ class TestKeepalive(unittest.TestCase):
         self.assertIsNone(hb._thread)
         hb.end()
 
+    def test_keepalive_never_touches_forward_progress_files(self):
+        """v32 FX1 CONTRACT — the keepalive thread must not refresh any file
+        the supervisor's stall probe reads (current_task.jsonl,
+        run_progress.json, active_run.lock). If it did, a wedged main thread
+        would look alive forever and stall detection would be dead again —
+        exactly the production failure this contract prevents."""
+        import tempfile
+
+        data_dir = Path(tempfile.mkdtemp())
+        hb = self.progress.HeartbeatSession(
+            Path("jp-form-outreach"), "draft", 5,
+            heartbeat=None, data_dir=data_dir,
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            hb.start("drafting")
+            task_file = data_dir / "current_task.jsonl"
+            mtime_after_start = task_file.stat().st_mtime
+            size_after_start = task_file.stat().st_size
+            # let the keepalive fire at least twice (interval=1s) while the
+            # "main thread" does nothing
+            time.sleep(2.3)
+            self.assertGreaterEqual(buf.getvalue().count("[keepalive]"), 1)
+            # forward-progress files unchanged by the background thread
+            self.assertEqual(task_file.stat().st_size, size_after_start)
+            self.assertEqual(task_file.stat().st_mtime, mtime_after_start)
+            self.assertFalse((data_dir / "run_progress.json").exists())
+            self.assertFalse((data_dir / "active_run.lock").exists())
+            hb.end("done")
+
 
 if __name__ == "__main__":
     unittest.main()

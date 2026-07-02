@@ -1422,28 +1422,34 @@ def stage_enrich(
 
     enriched: list[dict[str, Any]] = []
     total = len(targets)
-    for i, t in enumerate(targets, 1):
-        try:
-            _enrich_one_target(t, i, total, config, enriched)
-        except KeyboardInterrupt:
-            raise
-        except Exception as exc:  # noqa: BLE001 — per-lead isolation (v15 §R1)
-            tb = traceback.format_exc()
-            print(f"[enrich] ✗ ({i}/{total}) {t.get('name')}: crashed: {exc} — continuing",
-                  file=sys.stderr)
+    # v32 FX1 — keepalive-only heartbeat with per-target forward-progress
+    # ticks. The supervisor's stall probe reads current_task.jsonl; enrich
+    # previously wrote NOTHING to it for the whole stage, so a legitimate
+    # multi-target enrich (1-3 min/target) would read as stalled.
+    with HeartbeatSession(SKILL_DIR, "enrich", total, heartbeat=None, data_dir=DATA_DIR) as hb:
+        for i, t in enumerate(targets, 1):
             try:
-                _emit_event(
-                    "enrich.lead_crashed", stage="enrich",
-                    target_id=str(t.get("id") or ""),
-                    payload={"error": str(exc)[:200], "tb_tail": tb[-800:]},
-                )
-            except Exception:
-                pass
-            enriched.append({
-                **t,
-                "_enrich_skipped": "lead_crashed",
-                "_enrich_skip_reason": str(exc)[:200],
-            })
+                _enrich_one_target(t, i, total, config, enriched)
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:  # noqa: BLE001 — per-lead isolation (v15 §R1)
+                tb = traceback.format_exc()
+                print(f"[enrich] ✗ ({i}/{total}) {t.get('name')}: crashed: {exc} — continuing",
+                      file=sys.stderr)
+                try:
+                    _emit_event(
+                        "enrich.lead_crashed", stage="enrich",
+                        target_id=str(t.get("id") or ""),
+                        payload={"error": str(exc)[:200], "tb_tail": tb[-800:]},
+                    )
+                except Exception:
+                    pass
+                enriched.append({
+                    **t,
+                    "_enrich_skipped": "lead_crashed",
+                    "_enrich_skip_reason": str(exc)[:200],
+                })
+            hb.tick(i, f"enrich {t.get('name', '?')}")
 
     with out_path.open("w") as f:
         for e in enriched:
@@ -1697,7 +1703,7 @@ def stage_draft(
         n_leads = sum(1 for l in input_path.open() if l.strip())
     except OSError:
         n_leads = 0
-    with HeartbeatSession(SKILL_DIR, "draft", n_leads, heartbeat=None, data_dir=DATA_DIR):
+    with HeartbeatSession(SKILL_DIR, "draft", n_leads, heartbeat=None, data_dir=DATA_DIR) as hb:
         core_draft.stage_draft(
             input_path,
             out_path,
@@ -1708,6 +1714,10 @@ def stage_draft(
             append_skip_fn=append_skip_history,
             default_model=DEFAULT_MODEL,
             refine_fn=refine_fn,
+            # v32 FX1 — per-lead forward-progress tick. The supervisor's
+            # stall probe now reads current_task.jsonl; without a per-item
+            # write, a long multi-lead draft pass would look wedged.
+            on_progress=lambda i, total, msg: hb.tick(i, msg),
             skill="jp-form-outreach",
             data_dir=DATA_DIR,
             run_id=run_id or ev.get_run_id(),

@@ -99,6 +99,51 @@ def run_activity_age_seconds(
     return max(0, int(now - max(mtimes)))
 
 
+def forward_progress_age_seconds(
+    data_dir: Path,
+    *,
+    now_epoch: float | None = None,
+) -> int | None:
+    """v32 FX1 — age of the freshest MAIN-THREAD forward-progress write.
+
+    Unlike :func:`run_activity_age_seconds` (the watchdog's "is anything
+    alive-ish" probe), this feeds the run supervisor's STALL decision, so it
+    must ignore every file a background thread can refresh while the main
+    thread is wedged:
+
+    - events.jsonl        — excluded: ``HeartbeatSession._heartbeat_loop``
+                            emits ``heartbeat.tick`` from a timer thread.
+    - system_health/*.json — never included: the keepalive thread and the
+                            watchdog refresh it host-wide every ~60s (this
+                            is what silently neutralized stall detection).
+    - the run log         — not a file candidate here: the stdout keepalive
+                            thread prints every ~60s regardless of progress.
+
+    current_task.jsonl (hb.start/tick/note/end), run_progress.json
+    (start/transition/bump/finish) and active_run.lock (acquire/update_lock)
+    are written exclusively by main-thread forward progress — verified in
+    progress.py / run_progress.py / active_run.py.
+    """
+    candidates = (
+        current_task_path(data_dir),
+        data_dir / "run_progress.json",
+        data_dir / "active_run.lock",
+    )
+    mtimes: list[float] = []
+    for path in candidates:
+        try:
+            if path.is_file():
+                mtimes.append(path.stat().st_mtime)
+        except OSError:
+            continue
+    if not mtimes:
+        return None
+    import time
+
+    now = time.time() if now_epoch is None else float(now_epoch)
+    return max(0, int(now - max(mtimes)))
+
+
 def collect_active_runs(skills_root: Path | None = None) -> list[dict[str, Any]]:
     root = skills_root or SKILLS_ROOT
     runs: list[dict[str, Any]] = []
