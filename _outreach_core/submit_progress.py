@@ -726,8 +726,17 @@ def _normalize_options(options: list[Any]) -> list[dict[str, Any]]:
             continue
         if not isinstance(opt, dict):
             continue
-        label = str(opt.get("label") or opt.get("text") or opt.get("value") or "").strip()
-        value = str(opt.get("value") or opt.get("label") or opt.get("text") or "").strip()
+        # v31 §WS3a — the enrich extractor now emits compact {t, v} dicts
+        # (text + submitted value); older jsonl rows carry plain strings or
+        # {label/text/value} shapes, all of which must keep working.
+        label = str(
+            opt.get("label") or opt.get("text") or opt.get("t")
+            or opt.get("value") or opt.get("v") or ""
+        ).strip()
+        value = str(
+            opt.get("value") or opt.get("v") or opt.get("label")
+            or opt.get("text") or opt.get("t") or ""
+        ).strip()
         out.append(
             {
                 "label": label,

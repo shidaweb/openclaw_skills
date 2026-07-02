@@ -142,6 +142,7 @@ _REASON_LABEL = {
     "submit_gate_unsatisfied": "送信ゲート（同意・必須選択）が未充足のまま送信ボタンに到達できません",
     "wizard_too_deep": "多段フォームのステップ数が上限を超えました",
     "cloudflare_challenge": "Cloudflare bot検知（Turnstile/managed challenge）をブロッキングで検出。突破不可のため手動通過が必要",
+    "broken_form_structure": "フォーム実装が壊れており送信不能（[object ...] 型のname属性）",
 }
 
 

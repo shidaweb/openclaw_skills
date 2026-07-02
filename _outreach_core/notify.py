@@ -51,6 +51,7 @@ _REASON_LABELS = {
     "non_contact_form": "問い合わせフォームではないページを検出しました",
     "unknown_no_textarea": "問い合わせ本文欄を確認できません",
     "email_verification_code": "メール確認コード方式のため自動送信できません",
+    "broken_form_structure": "フォーム実装が壊れており送信できません（name属性破損）",
     "open_failed_stale_page": "ページを開けず、前のページが残っています",
     "empty_render": "ページにフォーム要素が表示されていません",
     "captcha_blocking": "CAPTCHAが送信をブロックしています",

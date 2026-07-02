@@ -39,6 +39,25 @@ class TestVerify(unittest.TestCase):
         self.assertEqual(result["status"], "needs_attention")
         self.assertTrue(result.get("unresolved_fields"))
 
+    def test_invisible_required_field_needs_no_plan(self) -> None:
+        # v31 §WS3b — a CSS-invisible required field is a honeypot or an
+        # inactive wizard step; the planner is told to skip it (rule 27), so
+        # verify must not escalate its absence from the plan.
+        target = {
+            "id": "t2v",
+            "name": "Honeypot Co",
+            "form_fields": {
+                "inputs": [
+                    {"name": "website_hp", "required": True,
+                     "label": "website", "visible": False},
+                ],
+            },
+        }
+        plan = {"fields": [{"name": "email", "action": "set_text"}]}
+        result = verify_send_completed(target, "jp_form", snapshot="", plan=plan)
+        self.assertNotEqual(result["status"], "needs_attention")
+        self.assertFalse(result.get("unresolved_fields"))
+
     def test_uncertain_writes_needs_attention_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data = Path(tmp)

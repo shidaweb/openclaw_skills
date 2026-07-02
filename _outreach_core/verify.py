@@ -568,6 +568,11 @@ def _required_not_in_plan(target: dict[str, Any], plan: dict[str, Any] | None) -
                 continue
             if not item.get("required"):
                 continue
+            # v31 §WS3b — a CSS-invisible required field (honeypot / inactive
+            # wizard step) must not demand a plan entry; the planner is now
+            # explicitly told to skip such fields (rule 27).
+            if item.get("visible") is False:
+                continue
             name = item.get("name") or item.get("id") or ""
             if name and name not in planned:
                 unresolved.append(

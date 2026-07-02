@@ -269,6 +269,39 @@ class TestSubmitProgress(unittest.TestCase):
 # v30 §WS-A — B2B scoring is now externally tunable per brief / persona.
 
 
+class TestNormalizeOptionsV31(unittest.TestCase):
+    """v31 §WS3a — compact {t, v} option dicts from the enrich extractor."""
+
+    def test_tv_dicts_normalize(self) -> None:
+        out = sp._normalize_options([
+            {"t": "法人のお客様", "v": "corp"},
+            {"t": "選択してください", "v": ""},
+        ])
+        self.assertEqual(out[0]["label"], "法人のお客様")
+        self.assertEqual(out[0]["value"], "corp")
+        # empty value falls back to the display text
+        self.assertEqual(out[1]["value"], "選択してください")
+
+    def test_legacy_shapes_still_work(self) -> None:
+        out = sp._normalize_options([
+            "その他",
+            {"label": "A", "value": "a", "selected": True},
+            {"text": "B"},
+        ])
+        self.assertEqual(out[0], {"label": "その他", "value": "その他",
+                                  "selected": False, "disabled": False})
+        self.assertTrue(out[1]["selected"])
+        self.assertEqual(out[2]["label"], "B")
+
+    def test_choose_b2b_option_accepts_tv_dicts(self) -> None:
+        picked = sp.choose_b2b_option([
+            {"t": "個人のお客様", "v": "personal"},
+            {"t": "法人のお客様", "v": "corporate"},
+        ])
+        self.assertIsNotNone(picked)
+        self.assertEqual(picked["value"], "法人のお客様")
+
+
 class TestB2BScoringOverlay(unittest.TestCase):
     """The hard-coded +6/+3/-8/-4/+1 weights are now defaults that a brief or
     persona yaml can override via ``b2b_scoring`` (or ``send.b2b_scoring``).

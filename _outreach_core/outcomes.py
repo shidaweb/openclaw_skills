@@ -16,6 +16,7 @@ SENT_UNVERIFIED = "sent_unverified"
 VALIDATION_STUCK = "validation_stuck"
 SUBMIT_INEFFECTIVE = "submit_ineffective"
 NO_FORM = "no_form"
+BROKEN_FORM = "broken_form_structure"
 RECRUIT_MISCLASS = "recruit_misclass"
 LOGIN_REQUIRED = "login_required"
 CAPTCHA_BLOCKED = "captcha_blocked"
@@ -32,6 +33,7 @@ OUTCOMES = (
     VALIDATION_STUCK,
     SUBMIT_INEFFECTIVE,
     NO_FORM,
+    BROKEN_FORM,
     RECRUIT_MISCLASS,
     LOGIN_REQUIRED,
     CAPTCHA_BLOCKED,
@@ -49,6 +51,7 @@ BUCKET = {
     VALIDATION_STUCK: "fill",
     SUBMIT_INEFFECTIVE: "submit",
     NO_FORM: "list",
+    BROKEN_FORM: "list",
     RECRUIT_MISCLASS: "list",
     LOGIN_REQUIRED: "list",
     CAPTCHA_BLOCKED: "submit",
@@ -66,6 +69,7 @@ _LABEL_JA = {
     VALIDATION_STUCK: "必須/バリデーション停止",
     SUBMIT_INEFFECTIVE: "送信クリック無効",
     NO_FORM: "問い合わせフォーム不在",
+    BROKEN_FORM: "フォーム実装破損（name属性）",
     RECRUIT_MISCLASS: "採用/非問い合わせ誤分類",
     LOGIN_REQUIRED: "ログイン必須",
     CAPTCHA_BLOCKED: "CAPTCHA/Cloudflare停止",
@@ -118,6 +122,8 @@ def _outcome_from_text(text: str) -> str | None:
         return VALIDATION_STUCK
     if any(x in t for x in ("ineffective", "遷移しません", "click_failed", "submit button not found", "送信ボタン")):
         return SUBMIT_INEFFECTIVE
+    if "broken_form_structure" in t:
+        return BROKEN_FORM
     if any(x in t for x in ("no_form", "page_has_no_form", "フォーム要素がページに存在しません", "textarea 無し")):
         return NO_FORM
     if any(x in t for x in ("shadow", "shadow_dom")):

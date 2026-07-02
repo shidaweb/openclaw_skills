@@ -37,6 +37,7 @@ from _outreach_core import avoidance as core_avoidance
 from _outreach_core import captcha as core_captcha
 from _outreach_core import content_guard as core_content_guard
 from _outreach_core import contact_url as core_contact_url
+from _outreach_core import form_validation as fv
 from _outreach_core import outcomes as core_outcomes
 from _outreach_core import resolve_queue as core_resolve_queue
 from _outreach_core import run_progress as core_progress
@@ -585,6 +586,17 @@ _FORM_FIELDS_JS = r"""
     return null;
   };
 
+  // v31 §WS3b — same visibility predicate as verify's FORM_VISIBILITY_JS.
+  // CSS-invisible controls (inactive wizard steps, honeypot spam traps) are
+  // still captured but flagged visible:false so the fill planner can skip
+  // them instead of tripping the trap / stuffing a hidden step.
+  const isVisible = (el) => {
+    if (!el) return false;
+    if (el.offsetParent === null && getComputedStyle(el).position !== 'fixed') return false;
+    const st = getComputedStyle(el);
+    return st.display !== 'none' && st.visibility !== 'hidden';
+  };
+
   for (const el of root.querySelectorAll('input,textarea,select')) {
     const tag = el.tagName.toLowerCase();
     const type = (el.type || '').toLowerCase();
@@ -596,6 +608,13 @@ _FORM_FIELDS_JS = r"""
     const required = el.required || el.getAttribute('aria-required') === 'true';
     const maxLength = el.maxLength > 0 ? el.maxLength : null;
     const label = labelFor(el);
+    const visible = isVisible(el);
+    // v31 §WS3c — client-side format constraints for the fill planner.
+    // Omitted when absent to keep prompt tokens down.
+    const fmt = {};
+    if (el.getAttribute && el.getAttribute('pattern')) fmt.pattern = el.getAttribute('pattern');
+    if (el.getAttribute && el.getAttribute('inputmode')) fmt.inputmode = el.getAttribute('inputmode');
+    if (el.getAttribute && el.getAttribute('autocomplete')) fmt.autocomplete = el.getAttribute('autocomplete');
 
     if (type === 'radio') {
       const group = name || 'unnamed';
@@ -606,36 +625,44 @@ _FORM_FIELDS_JS = r"""
         label: label,
         checked: el.checked,
         required: required,
-        disabled: !!el.disabled
+        disabled: !!el.disabled,
+        visible: visible
       });
       continue;
     }
     if (type === 'checkbox') {
       result.checkboxes.push({
         name: name, selector: selector, label: label, value: el.value,
-        checked: el.checked, required: required, disabled: !!el.disabled
+        checked: el.checked, required: required, disabled: !!el.disabled,
+        visible: visible
       });
       continue;
     }
     if (tag === 'select') {
+      // v31 §WS3a — capture option VALUES alongside text (visible text ≠
+      // submitted value on many forms) and raise the 60-option cap that
+      // truncated long 都道府県/業種 lists.
       result.selects.push({
         name: name, selector: selector, label: label, required: required,
-        options: Array.from(el.options).map(o => o.text).slice(0, 60)
+        visible: visible,
+        options: Array.from(el.options)
+          .map(o => ({ t: (o.text || '').trim().slice(0, 40), v: o.value }))
+          .slice(0, 100)
       });
       continue;
     }
     if (tag === 'textarea') {
       result.textareas.push({
         name: name, selector: selector, label: label, required: required,
-        max_length: maxLength, placeholder: placeholder
+        max_length: maxLength, placeholder: placeholder, visible: visible
       });
       continue;
     }
     // Standard input
-    result.inputs.push({
+    result.inputs.push(Object.assign({
       name: name, selector: selector, label: label, required: required, type: type,
-      max_length: maxLength, placeholder: placeholder
-    });
+      max_length: maxLength, placeholder: placeholder, visible: visible
+    }, fmt));
   }
 
   // reCAPTCHA detection
@@ -1230,6 +1257,39 @@ def _enrich_one_target(
         )
         return {"outcome": "skipped"}
 
+    # v31 §WS3d: 壊れたフォーム構造の早期スキップ — name属性に
+    # "[object HTMLInputElement]" が混入するJS実装のフォームは、サイト側の
+    # submit ハンドラ自体がフィールドを参照できず送信不能（2026-06-30 テンダで
+    # 300秒タイムアウトを消費して確認）。send で燃やす前に enrich で確定させる。
+    if fv.form_has_broken_structure(fields):
+        reason = "broken_form_structure: [object ...] stringified field names"
+        print(
+            f"[enrich] ({i}/{total}) {t_work.get('name')}: "
+            f"壊れたフォーム構造を検出 — 送信不能のため skip ({reason})"
+        )
+        append_skip_history([
+            {
+                "id": t_work.get("id"),
+                "name": t_work.get("name"),
+                "industry": t_work.get("industry"),
+                "draft": {"body": reason},
+            }
+        ])
+        enriched.append(
+            {
+                **t_work,
+                "_enrich_skipped": "broken_form_structure",
+                "_enrich_skip_reason": reason,
+            }
+        )
+        _emit_event(
+            "enrich.broken_form_structure",
+            stage="enrich",
+            target_id=str(t_work.get("id") or ""),
+            payload={"url": str(t_work.get("form_url") or "")[:200]},
+        )
+        return {"outcome": "skipped"}
+
     # v25: メール確認コード(OTP)ゲート検出 — フェリシモ型の「確認コード(6桁)を
     # 送信→入力」フローはパイプラインでメールを受信できないため自動送信不可。
     # 送信ステージで「フォーム消失」として失敗する前に、enrich 段階で manual 化。
@@ -1423,7 +1483,12 @@ def _form_constraints_block(target: dict[str, Any]) -> str:
             continue
         label = str(sel.get("label") or sel.get("name") or "")
         if _INQUIRY_LABEL_RE.search(label):
-            opts = [str(o) for o in (sel.get("options") or [])[:15]]
+            # v31 §WS3a — options may be {t, v} dicts (new) or strings (legacy).
+            opts = [
+                _option_label_value(o)[0]
+                for o in (sel.get("options") or [])[:15]
+            ]
+            opts = [o for o in opts if o]
             if opts:
                 lines.append(f"- お問い合わせ種別の選択肢（{label}）: {' / '.join(opts)}")
     radios = ff.get("radios") or {}
@@ -4800,6 +4865,12 @@ The draft body will be ≤ {body_max_chars} characters. Use placeholder `__BODY_
 24. For pre-form phase, emit route_choice and enable_sequence in the order needed to activate confirm/send button.
 25. If selecting route/category can change options/required fields, include RESCAN between steps.
 26. For final-confirm phase, prioritize is_submit_type && in_form candidates; if uncertain, leave text empty.
+27. Fields with visible:false are honeypot spam traps or inactive wizard steps: action="skip",
+    UNLESS one of your enable_sequence steps deliberately reveals them (then fill after RESCAN).
+    NEVER set_text on a visible:false field named like url/website/homepage — that is a honeypot.
+28. Honor pattern/inputmode/autocomplete when choosing value formats: inputmode="numeric" or
+    pattern of digits → digits only (no hyphens); autocomplete="tel-national" → no country code.
+    Select options are {{t: display text, v: submitted value}} — put the DISPLAY TEXT in `value`.
 
 Output the JSON only, no prose."""
 
@@ -5095,17 +5166,37 @@ def _check_by_label(label: str) -> dict[str, Any] | None:
     return res if isinstance(res, dict) else None
 
 
+def _option_label_value(opt: Any) -> tuple[str, str]:
+    """v31 §WS3a — (display text, submitted value) for one select option.
+
+    The enrich extractor now emits compact ``{t, v}`` dicts; legacy
+    enriched.jsonl rows carry plain strings (text only, value assumed
+    equal). Both shapes must keep working forever — old rows persist.
+    """
+    if isinstance(opt, dict):
+        label = str(opt.get("t") or opt.get("label") or opt.get("text") or "").strip()
+        value = str(opt.get("v") if opt.get("v") is not None else opt.get("value") or "").strip()
+        return label or value, value or label
+    text = str(opt or "").strip()
+    return text, text
+
+
 def _extract_inquiry_type_fields(form_fields: dict[str, Any]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for sel in form_fields.get("selects") or []:
         if not isinstance(sel, dict):
             continue
+        options = []
+        for x in sel.get("options") or []:
+            label, value = _option_label_value(x)
+            if label or value:
+                options.append({"label": label, "value": value})
         field = {
             "kind": "select_option",
             "name": str(sel.get("name") or "").strip(),
             "label": str(sel.get("label") or ""),
             "required": bool(sel.get("required")),
-            "options": [{"label": str(x), "value": str(x)} for x in (sel.get("options") or []) if str(x).strip()],
+            "options": options,
         }
         if field["name"] and core_submit_progress.is_inquiry_type_field(field):
             out.append(field)
@@ -7751,6 +7842,18 @@ def _send_one_target(
             trace=trace, autonomous=autonomous, tab_id=cur_tab_id,
         )
         return {"outcome": "queued", "reason": "page_has_no_form"}
+
+    # v31 §WS3d: 壊れたフォーム構造の send 側プリフライト。enrich が v31 より
+    # 前に走ったターゲットの form_fields を拾う安全網。回復不能（サイト側の
+    # submit ハンドラがフィールドを参照できない）ため resolver には回さず
+    # auto-skip する。
+    if fv.form_has_broken_structure(d.get("form_fields")):
+        print("  [send] ⚠ BROKEN_FORM_STRUCTURE — [object ...] 型のname属性を検出 "
+              "→ 送信不能のため skip")
+        _auto_skip_and_log(
+            d, "broken_form_structure: [object ...] stringified field names"
+        )
+        return {"outcome": "skipped", "reason": "broken_form_structure"}
 
     # 3. Fill all fields
     diagnostics = fill_form_for_target(
