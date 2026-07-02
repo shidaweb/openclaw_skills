@@ -513,3 +513,51 @@ class TestCheckboxConceptSeparation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestClassifyIneffectiveClick(unittest.TestCase):
+    """v31 §WS6 — blocker buckets for submit_click_ineffective."""
+
+    def test_all_visible_disabled(self) -> None:
+        diag = sp.classify_ineffective_click(
+            {"submit_visible": 2, "disabled": 1, "aria_disabled": 1, "covered": 0}
+        )
+        self.assertEqual(diag["blocker"], "disabled_submit")
+
+    def test_aria_disabled_alone_counts(self) -> None:
+        diag = sp.classify_ineffective_click(
+            {"submit_visible": 1, "disabled": 0, "aria_disabled": 1, "covered": 0}
+        )
+        self.assertEqual(diag["blocker"], "disabled_submit")
+
+    def test_overlay_covering_enabled_button(self) -> None:
+        diag = sp.classify_ineffective_click(
+            {"submit_visible": 1, "disabled": 0, "aria_disabled": 0, "covered": 1,
+             "samples": [{"text": "送信", "covered_by": "DIV.modal"}]}
+        )
+        self.assertEqual(diag["blocker"], "overlay")
+        self.assertEqual(diag["samples"][0]["covered_by"], "DIV.modal")
+
+    def test_no_visible_submit(self) -> None:
+        diag = sp.classify_ineffective_click(
+            {"submit_visible": 0, "disabled": 0, "aria_disabled": 0, "covered": 0}
+        )
+        self.assertEqual(diag["blocker"], "no_submit_visible")
+
+    def test_enabled_uncovered_is_unknown(self) -> None:
+        diag = sp.classify_ineffective_click(
+            {"submit_visible": 2, "disabled": 0, "aria_disabled": 0, "covered": 0}
+        )
+        self.assertEqual(diag["blocker"], "unknown")
+
+    def test_partial_disabled_with_enabled_uncovered_is_unknown(self) -> None:
+        # one disabled + one enabled-and-uncovered → the enabled one should
+        # have worked; cause remains unknown, NOT disabled_submit
+        diag = sp.classify_ineffective_click(
+            {"submit_visible": 2, "disabled": 1, "aria_disabled": 0, "covered": 0}
+        )
+        self.assertEqual(diag["blocker"], "unknown")
+
+    def test_none_probe_is_no_submit_visible(self) -> None:
+        diag = sp.classify_ineffective_click(None)
+        self.assertEqual(diag["blocker"], "no_submit_visible")

@@ -912,3 +912,49 @@ def summarize_remaining_submit_gates(
         "selects": unresolved_selects[:12],
         "total": len(unresolved_boxes) + len(unresolved_radios) + len(unresolved_selects),
     }
+
+
+# --- v31 §WS6 — ineffective-click diagnosis ----------------------------------
+#
+# "クリックは成立するがページが遷移しません" was the third-largest production
+# failure bucket (40 cases) yet carried no cause. The submission loop probes
+# the live submit controls (_SUBMIT_DIAG_JS in run.py) and this pure
+# classifier turns the probe into an actionable blocker bucket.
+
+INEFFECTIVE_BLOCKERS = (
+    "disabled_submit",   # every visible submit control is disabled/aria-disabled
+    "overlay",           # an element covers the submit control's click point
+    "no_submit_visible", # nothing submit-like is visible at all
+    "unknown",           # clicks land on an enabled control but nothing changes
+)
+
+
+def classify_ineffective_click(probe: dict[str, Any] | None) -> dict[str, Any]:
+    """Classify why a registered click produced no page transition. Pure.
+
+    ``probe`` is the _SUBMIT_DIAG_JS result: counts of visible submit-like
+    controls, how many are disabled / aria-disabled, and how many have their
+    center point covered by a foreign element (elementFromPoint).
+    """
+    p = probe if isinstance(probe, dict) else {}
+    visible = int(p.get("submit_visible") or 0)
+    disabled = int(p.get("disabled") or 0)
+    aria_disabled = int(p.get("aria_disabled") or 0)
+    covered = int(p.get("covered") or 0)
+    dead = min(visible, disabled + aria_disabled)
+    if visible <= 0:
+        blocker = "no_submit_visible"
+    elif dead >= visible:
+        blocker = "disabled_submit"
+    elif covered > 0 and covered >= visible - dead:
+        blocker = "overlay"
+    else:
+        blocker = "unknown"
+    return {
+        "blocker": blocker,
+        "submit_visible": visible,
+        "disabled": disabled,
+        "aria_disabled": aria_disabled,
+        "covered": covered,
+        "samples": list(p.get("samples") or [])[:4],
+    }

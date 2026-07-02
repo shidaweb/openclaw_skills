@@ -6388,6 +6388,12 @@ def _blocker_diagnostics(d: dict[str, Any], *, trace: Any = None) -> dict[str, A
     shot = _capture_screenshot()
     if shot:
         diag["screenshot_path"] = shot
+    # v31 §WS6 — precise ineffective-click classification (disabled submit /
+    # overlay / no visible submit), stashed by the submission loop just
+    # before it returned "ineffective". This is what turns 40 opaque
+    # submit_click_ineffective rows into actionable buckets.
+    if isinstance(d.get("_ineffective_diag"), dict):
+        diag["ineffective"] = d["_ineffective_diag"]
     return diag
 
 
@@ -6992,6 +6998,137 @@ def _read_dialog_log() -> list[dict[str, Any]]:
         return []
 
 
+# v31 §WS6 — probe the live submit controls at the moment a click is judged
+# ineffective: disabled? aria-disabled? covered by an overlay at the click
+# point? The pure classifier (submit_progress.classify_ineffective_click)
+# turns the counts into a blocker bucket.
+_SUBMIT_DIAG_JS = r"""
+(() => {
+  const visible = (el) => {
+    if (!el) return false;
+    if (el.offsetParent === null && getComputedStyle(el).position !== 'fixed') return false;
+    const st = getComputedStyle(el);
+    return st.display !== 'none' && st.visibility !== 'hidden';
+  };
+  const submitRe = /送信|確認|submit|\bsend\b|確定|次へ|進む/i;
+  const out = { submit_total: 0, submit_visible: 0, disabled: 0,
+                aria_disabled: 0, covered: 0, samples: [] };
+  for (const el of document.querySelectorAll(
+    'button, input[type="submit"], input[type="button"], input[type="image"], [role="button"]'
+  )) {
+    const txt = String(el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
+    if (!submitRe.test(txt) && (el.type || '').toLowerCase() !== 'submit') continue;
+    out.submit_total += 1;
+    if (!visible(el)) continue;
+    out.submit_visible += 1;
+    const ariaDis = el.getAttribute('aria-disabled') === 'true'
+      || (el.classList && el.classList.contains('disabled'));
+    if (el.disabled) out.disabled += 1;
+    else if (ariaDis) out.aria_disabled += 1;
+    let coveredBy = '';
+    try {
+      const r = el.getBoundingClientRect();
+      const cx = Math.max(0, Math.min(window.innerWidth - 1, r.left + r.width / 2));
+      const cy = Math.max(0, Math.min(window.innerHeight - 1, r.top + r.height / 2));
+      const top = document.elementFromPoint(cx, cy);
+      if (top && top !== el && !el.contains(top) && !top.contains(el)) {
+        out.covered += 1;
+        coveredBy = `${top.tagName || ''}.${String(top.className || '').slice(0, 40)}`;
+      }
+    } catch (e) {}
+    if (out.samples.length < 4) {
+      out.samples.push({
+        text: txt.slice(0, 30),
+        disabled: !!el.disabled,
+        aria_disabled: !!ariaDis,
+        covered_by: coveredBy,
+      });
+    }
+  }
+  return out;
+})()
+"""
+
+
+def _diagnose_ineffective_click(tid: str, trace: Any = None) -> dict[str, Any]:
+    """v31 §WS6 — probe + classify why a click produced no transition. Never raises."""
+    try:
+        probe = _evaluate(_SUBMIT_DIAG_JS)
+        diag = core_submit_progress.classify_ineffective_click(
+            probe if isinstance(probe, dict) else None
+        )
+        _emit_event(
+            "send.ineffective.diagnosed", stage="send", target_id=tid,
+            payload={
+                "blocker": diag.get("blocker"),
+                "submit_visible": diag.get("submit_visible"),
+                "disabled": diag.get("disabled"),
+                "aria_disabled": diag.get("aria_disabled"),
+                "covered": diag.get("covered"),
+                "samples": diag.get("samples"),
+            },
+            trace_dir=trace,
+        )
+        return diag
+    except Exception:  # noqa: BLE001 — diagnostics must not abort the loop
+        return {"blocker": "unknown"}
+
+
+def _reapply_enable_gate_steps(
+    target: dict[str, Any],
+    plan: dict[str, Any],
+    body: str,
+    trace: Any = None,
+) -> int:
+    """v31 §WS6 — re-apply the plan's NON-CLICK enable steps once.
+
+    Used only for the strictly-gated disabled-submit retry: the journal has
+    already recorded a submit attempt, so re-driving ``click``-type steps
+    could navigate or double-fire. Radio/select/text/check steps (plus a
+    RESCAN) are state-idempotent and safe. Returns the number of applied
+    changes. Never raises.
+    """
+    changed = 0
+    try:
+        for step_item in list(plan.get("enable_sequence") or []):
+            if not isinstance(step_item, dict):
+                continue
+            action = str(step_item.get("action") or "").strip()
+            name = str(step_item.get("name") or "").strip()
+            value = str(step_item.get("value") or "").strip()
+            label = str(step_item.get("label") or "").strip()
+            if action == "RESCAN":
+                _rescan_form_fields(target)
+                continue
+            if action == "click":  # deliberately skipped — see docstring
+                continue
+            if action in ("select_radio", "select_option", "set_text") and name:
+                v = body if value == "__BODY__" else value
+                out = _apply_field_action(
+                    name, action, v,
+                    selector=name[len("selector:"):] if name.startswith("selector:") else None,
+                )
+                if out and out.get("ok"):
+                    changed += 1
+            elif action == "check" and (name or label):
+                out = _check_by_name(name) if name else None
+                if not (out and out.get("ok")) and label:
+                    out = _check_by_label(label)
+                if out and out.get("ok"):
+                    changed += 1
+        live = _auto_fill_live_gates(
+            phase="ineffective_retry",
+            aggressive_radios=True,
+            aggressive_selects=True,
+            trace_dir=trace,
+            target_id=str(target.get("id") or target.get("name") or ""),
+        )
+        changed += int(live.get("changed") or 0)
+    except Exception:  # noqa: BLE001 — recovery must not abort the loop
+        pass
+    return changed
+
+
 def _observe_send_state(
     sender: dict[str, Any], body: str, *, include_raw: bool = False
 ) -> dict[str, Any]:
@@ -7285,9 +7422,14 @@ def _submission_loop(
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # v31 §WS6 — diagnostics-only here (no retry: the wizard-stuck
+            # gate already proved repeated clicks land on the same button).
+            diag = _diagnose_ineffective_click(tid, trace)
+            d["_ineffective_diag"] = diag
             return _result(
                 "ineffective", obs, phase=phase,
                 wizard_stuck=wizard_stuck.as_payload(),
+                diagnostics=diag,
             )
 
         if state == "done":
@@ -7362,7 +7504,33 @@ def _submission_loop(
                         errors=exact_errors[:12],
                         native_validation=native,
                     )
-                return _result("ineffective", obs, phase=phase)
+                # v31 §WS6 — diagnose WHY the click did nothing before giving
+                # up. Diagnostics run unconditionally (they turn the opaque
+                # submit_click_ineffective bucket into actionable causes).
+                diag = _diagnose_ineffective_click(tid, trace)
+                d["_ineffective_diag"] = diag
+                # Recovery is strictly gated: only a disabled submit — where
+                # re-satisfying the plan's enable gates can plausibly arm the
+                # button — and only ONCE per target. click/RESCAN-driven
+                # steps are skipped inside (journal already says attempted).
+                if (
+                    diag.get("blocker") == "disabled_submit"
+                    and (plan.get("enable_sequence"))
+                    and not d.get("_enable_retry_done")
+                ):
+                    d["_enable_retry_done"] = True
+                    changed = _reapply_enable_gate_steps(d, plan, send_body, trace)
+                    if changed:
+                        print(f"  [send] disabled-submit retry: re-applied "
+                              f"{changed} enable step(s) → one more round")
+                        core_timeline.add(
+                            timeline, "enable_retry", True, changed=changed,
+                        )
+                        no_progress = 0
+                        last_fp = None
+                        time.sleep(1.0)
+                        continue
+                return _result("ineffective", obs, phase=phase, diagnostics=diag)
         else:
             no_progress = 0
         last_fp = fp
@@ -8130,12 +8298,26 @@ def _send_one_target(
                 "; dialogs=" + json.dumps(dialogs[:3], ensure_ascii=False)
                 if dialogs else ""
             )
-            print("  [send] ⚠ clicks register but the page never changes — escalating")
+            # v31 §WS6 — surface the diagnosed blocker in the resolver reason
+            # so the operator/resolver sees the CAUSE, not just the symptom.
+            # The full probe rides into needs_attention via
+            # _blocker_diagnostics (d["_ineffective_diag"]).
+            diag = subres.get("diagnostics") or d.get("_ineffective_diag") or {}
+            blocker = str(diag.get("blocker") or "unknown")
+            blocker_ja = {
+                "disabled_submit": "送信ボタンが無効化されたまま",
+                "overlay": "送信ボタンが別要素に覆われている",
+                "no_submit_visible": "可視の送信ボタンが存在しない",
+                "unknown": "原因未特定",
+            }.get(blocker, blocker)
+            print(f"  [send] ⚠ clicks register but the page never changes "
+                  f"({blocker}) — escalating")
             core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SUBMIT_NOT_FOUND)
             _queue_for_resolver(
                 d, "submit_click_ineffective",
                 (
-                    f"クリックは成立するがページが遷移しません (observed_state={sub_state})"
+                    f"クリックは成立するがページが遷移しません "
+                    f"(observed_state={sub_state}, blocker={blocker}: {blocker_ja})"
                     f"{dlg_note}"
                 ),
                 trace=trace, autonomous=autonomous, tab_id=cur_tab_id,

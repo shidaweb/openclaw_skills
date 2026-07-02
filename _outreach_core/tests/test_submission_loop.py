@@ -393,3 +393,111 @@ def test_target_state_cleared_on_terminal_skipped(monkeypatch, tmp_path):
     run._auto_skip_and_log(target, "captcha_human_required: v2")
     # Snapshot must be gone now.
     assert ts_mod.read_state(tmp_path, "t-skip") is None
+
+
+# --- v31 §WS6 — ineffective-click diagnosis + gated disabled-submit retry ----
+
+DIAG_DISABLED = {
+    "submit_total": 1, "submit_visible": 1, "disabled": 1,
+    "aria_disabled": 0, "covered": 0,
+    "samples": [{"text": "送信する", "disabled": True,
+                 "aria_disabled": False, "covered_by": ""}],
+}
+DIAG_OVERLAY = {
+    "submit_total": 1, "submit_visible": 1, "disabled": 0,
+    "aria_disabled": 0, "covered": 1,
+    "samples": [{"text": "送信する", "disabled": False,
+                 "aria_disabled": False, "covered_by": "DIV.cookie-banner"}],
+}
+
+
+class DiagFakeBrowser(FakeBrowser):
+    """FakeBrowser that also answers the _SUBMIT_DIAG_JS probe."""
+
+    def __init__(self, pages, click_advances=True, diag=None):
+        super().__init__(pages, click_advances)
+        self.diag = diag or DIAG_DISABLED
+
+    def evaluate(self, js: str):
+        if "elementFromPoint" in js:  # _SUBMIT_DIAG_JS
+            return dict(self.diag)
+        return super().evaluate(js)
+
+
+def test_ineffective_result_carries_diagnostics(monkeypatch):
+    fake = DiagFakeBrowser([INPUT_PAGE], click_advances=False, diag=DIAG_OVERLAY)
+    _wire(monkeypatch, fake)
+    res = run._submission_loop(
+        _target(), CONFIG, "はじめまして。",
+        flow="single", mode="auto", trace=None, tid="t1", timeline=[],
+    )
+    assert res["status"] == "ineffective"
+    assert res["diagnostics"]["blocker"] == "overlay"
+    assert res["diagnostics"]["samples"][0]["covered_by"] == "DIV.cookie-banner"
+
+
+def test_disabled_submit_retry_reapplies_enable_steps_then_succeeds(monkeypatch):
+    # click does nothing while the submit stays disabled; re-applying the
+    # plan's enable gates "arms" the button and the next round completes.
+    fake = DiagFakeBrowser([INPUT_PAGE, DONE_PAGE], click_advances=False,
+                           diag=DIAG_DISABLED)
+    _wire(monkeypatch, fake)
+    applied: list = []
+
+    def _apply(name, action, value, selector=None):
+        applied.append((name, action, value))
+        fake.click_advances = True  # gates satisfied → button armed
+        return {"ok": True}
+
+    monkeypatch.setattr(run, "_apply_field_action", _apply)
+    monkeypatch.setattr(run, "_rescan_form_fields", lambda *a, **k: None)
+    monkeypatch.setattr(run, "_auto_fill_live_gates", lambda **k: {"changed": 0})
+
+    target = _target()
+    target["_llm_plan"] = {
+        "next_step": "single",
+        "enable_sequence": [
+            {"action": "select_radio", "name": "route", "value": "法人のお客様"},
+            {"action": "click", "value": "送信"},  # must be SKIPPED in retry
+        ],
+    }
+    res = run._submission_loop(
+        target, CONFIG, "はじめまして。",
+        flow="single", mode="auto", trace=None, tid="t1", timeline=[],
+    )
+    assert res["status"] == "done"
+    assert target["_enable_retry_done"] is True
+    # only the radio step was re-applied; the click step was skipped
+    assert applied == [("route", "select_radio", "法人のお客様")]
+
+
+def test_disabled_submit_retry_fires_only_once(monkeypatch):
+    # gates re-apply but the button never arms → terminal ineffective, and
+    # the retry flag prevents a second attempt.
+    fake = DiagFakeBrowser([INPUT_PAGE], click_advances=False, diag=DIAG_DISABLED)
+    _wire(monkeypatch, fake)
+    apply_calls: list = []
+    monkeypatch.setattr(
+        run, "_apply_field_action",
+        lambda name, action, value, selector=None:
+            apply_calls.append(name) or {"ok": True},
+    )
+    monkeypatch.setattr(run, "_rescan_form_fields", lambda *a, **k: None)
+    monkeypatch.setattr(run, "_auto_fill_live_gates", lambda **k: {"changed": 0})
+
+    target = _target()
+    target["_llm_plan"] = {
+        "next_step": "single",
+        "enable_sequence": [
+            {"action": "select_radio", "name": "route", "value": "法人のお客様"},
+        ],
+    }
+    res = run._submission_loop(
+        target, CONFIG, "はじめまして。",
+        flow="single", mode="auto", trace=None, tid="t1", timeline=[],
+    )
+    assert res["status"] == "ineffective"
+    assert res["diagnostics"]["blocker"] == "disabled_submit"
+    assert target["_enable_retry_done"] is True
+    # the enable step re-applied exactly once across the whole loop
+    assert apply_calls.count("route") == 1
