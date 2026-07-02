@@ -47,17 +47,25 @@ _DESIRED_PATH_KW = (
     "/business",
     "/form",
 )
-_AVOID_PATH_KW = (
+# v31 §WS2c — the avoid list is split in two. Hard-avoid paths (recruit/IR/
+# reservation) are never contact forms even when the path also says contact
+# (/recruit/contact is an applicant form). Soft-avoid paths ARE legitimately
+# where many JP sites put the B2B inquiry (/support/contact, /support/inquiry),
+# so a desired keyword in the path overrides them.
+_HARD_AVOID_PATH_KW = (
     "/recruit",
     "/career",
     "/saiyo",
     "/entry",
     "/ir",
-    "/support",
-    "/faq",
     "/reserve",
     "/yoyaku",
 )
+_SOFT_AVOID_PATH_KW = (
+    "/support",
+    "/faq",
+)
+_AVOID_PATH_KW = _HARD_AVOID_PATH_KW + _SOFT_AVOID_PATH_KW
 
 _NON_CONTACT_HEADING_KW = {
     "register": ("会員登録", "新規登録", "アカウント作成", "アカウント登録", "ユーザー登録"),
@@ -84,7 +92,6 @@ _PRE_FORM_GATE_KW = (
     "同意してお問い合わせ",
 )
 _ERROR_PAGE_KW = (
-    "404",
     "not found",
     "page not found",
     "ページが見つかりません",
@@ -93,10 +100,15 @@ _ERROR_PAGE_KW = (
     "forbidden",
     "アクセスできません",
     "アクセスが禁止",
-    "500",
-    "503",
     "server error",
 )
+# v31 §WS2d — bare status codes moved out of the substring keywords: 「従業員
+# 500名」「1500円」 in body copy used to flag a healthy page as an error.
+# \b keeps 500名/1500円 unmatched (kanji are \w so no boundary forms), and the
+# match is restricted to the snapshot head where aria snapshots put the
+# title/heading of a real error page.
+_ERROR_CODE_RE = re.compile(r"\b(?:404|500|503)\b")
+_ERROR_CODE_HEAD_CHARS = 400
 
 # v25: email-verification-code (OTP) gate detection. Forms like フェリシモ
 # require "メールに確認コード(6桁)を送信→入力" before the message can be
@@ -170,10 +182,17 @@ def contact_link_candidates(page_links: list[dict[str, str]], base_url: str) -> 
             continue
         if not same_registrable_domain(abs_url, base_url):
             continue
-        blob = f"{txt} {abs_url}".lower()
-        if any(kw.lower() in blob for kw in _EXCLUDE_TEXT_KW):
+        # v31 §WS2c — when the path itself says contact/inquiry, judge the
+        # exclude keywords on the link TEXT only: the URL half of the blob
+        # otherwise re-drops /support/contact via the "support" keyword that
+        # _path_should_avoid just deliberately overrode. Hard-avoid paths
+        # (/recruit/contact …) are still rejected below regardless.
+        low_url = abs_url.lower()
+        has_desired = any(kw in low_url for kw in _DESIRED_PATH_KW)
+        excl_blob = txt.lower() if has_desired else f"{txt} {abs_url}".lower()
+        if any(kw.lower() in excl_blob for kw in _EXCLUDE_TEXT_KW):
             continue
-        if any(kw in abs_url.lower() for kw in _AVOID_PATH_KW):
+        if _path_should_avoid(abs_url):
             continue
 
         score = 0
@@ -186,6 +205,22 @@ def contact_link_candidates(page_links: list[dict[str, str]], base_url: str) -> 
         scored.append((score, abs_url))
     scored.sort(key=lambda x: (-x[0], x[1]))
     return _dedupe_urls([u for _s, u in scored])
+
+
+def _path_should_avoid(url: str) -> bool:
+    """v31 §WS2c — avoid-list check with soft-avoid override.
+
+    Hard-avoid paths (recruit/IR/…) always disqualify — /recruit/contact is
+    an applicant form no matter what the path also says. Soft-avoid paths
+    (support/faq) are overridden by a desired keyword because many JP sites
+    put the B2B inquiry under /support/contact or /support/inquiry.
+    """
+    low = (url or "").lower()
+    if any(kw in low for kw in _HARD_AVOID_PATH_KW):
+        return True
+    if not any(kw in low for kw in _SOFT_AVOID_PATH_KW):
+        return False
+    return not any(kw in low for kw in _DESIRED_PATH_KW)
 
 
 def common_contact_paths(base_url: str) -> list[str]:
@@ -212,13 +247,27 @@ def common_contact_paths(base_url: str) -> list[str]:
         "/support/inquiry",
         "/お問い合わせ",
         "/%E3%81%8A%E5%95%8F%E3%81%84%E5%90%88%E3%82%8F%E3%81%9B",
+        # v31 §WS2a expansion — common JP patterns observed missing in
+        # production (bare "/mail" deliberately excluded: webmail false hits).
+        "/contactform",
+        "/contact.html",
+        "/inquiry.html",
+        "/otoiawase.html",
+        "/support/contact",
+        "/ja/contact",
+        "/mailform",
     )
     return _dedupe_urls([f"{root}{x}" for x in paths])
 
 
 # --- v15 §F2: sitemap.xml mining -------------------------------------------
 _SITEMAP_LOC_RE = re.compile(r"<loc>\s*([^<]+?)\s*</loc>", re.IGNORECASE)
-_SITEMAP_CONTACT_RE = re.compile(r"contact|inquiry|toiawase|otoiawase", re.IGNORECASE)
+# v31 §WS2a — ``mailform`` and slash-anchored ``/form`` added. The anchor
+# matters: a bare ``form`` alternative would match /reform and /information.
+_SITEMAP_CONTACT_RE = re.compile(
+    r"contact|inquiry|toiawase|otoiawase|mailform|/form(?:[/.?]|$)",
+    re.IGNORECASE,
+)
 
 
 def extract_contact_urls_from_sitemap(xml_text: str | None) -> list[str]:
@@ -234,8 +283,7 @@ def extract_contact_urls_from_sitemap(xml_text: str | None) -> list[str]:
         url = (m.group(1) or "").strip()
         if not url or not _SITEMAP_CONTACT_RE.search(url):
             continue
-        low = url.lower()
-        if any(kw in low for kw in _AVOID_PATH_KW):
+        if _path_should_avoid(url):
             continue
         out.append(url)
     return _dedupe_urls(out)
@@ -265,7 +313,25 @@ KNOWN_FORM_SERVICE_HOSTS = (
     "legalforce-cloud.com",
     "mktoweb.com",
     "pardot.com",
+    # v31 §WS2b — Google Forms short links. Full docs.google.com embeds are
+    # accepted only when the src path contains /forms (see is_form_service_url
+    # / iframe_form_src) so an arbitrary Google Docs embed doesn't qualify.
+    "forms.gle",
 )
+
+
+def is_form_service_url(url: str) -> bool:
+    """v31 §WS2b — does ``url`` live on a hosted-form service?
+
+    Shared by iframe takeover and bootstrap dedup (different companies'
+    forms on the same service must not collapse to one registrable domain).
+    """
+    host = _host_only(url)
+    if not host:
+        return False
+    if any(svc in host for svc in KNOWN_FORM_SERVICE_HOSTS):
+        return True
+    return "docs.google.com" in host and "/forms" in urlparse(url).path.lower()
 
 
 def iframe_form_src(
@@ -283,7 +349,7 @@ def iframe_form_src(
         host = _host_only(src)
         if not host:
             continue
-        if any(svc in host for svc in KNOWN_FORM_SERVICE_HOSTS):
+        if is_form_service_url(src):
             return src
         if base_url and same_registrable_domain(src, base_url):
             return src
@@ -587,6 +653,10 @@ def is_error_page(snapshot: str | None, url: str | None = None, http_status: int
         return True
     snap = (snapshot or "").lower()
     if any(k in snap for k in _ERROR_PAGE_KW):
+        return True
+    # v31 §WS2d — bare 404/500/503 only count near the top of the snapshot
+    # (error pages lead with their code; body copy mentions of 500 don't).
+    if _ERROR_CODE_RE.search(snap[:_ERROR_CODE_HEAD_CHARS]):
         return True
     u = (url or "").lower()
     if any(x in u for x in ("/404", "error", "notfound")):

@@ -85,6 +85,84 @@ class TestContactUrl(unittest.TestCase):
         self.assertTrue(cu.is_error_page("normal", http_status=404))
         self.assertFalse(cu.is_error_page("お問い合わせフォーム", url="https://example.co.jp/inquiry"))
 
+    def test_is_error_page_ignores_numbers_in_body_copy(self) -> None:
+        # v31 §WS2d — 「従業員500名」「1500円」 must not flag an error page.
+        self.assertFalse(cu.is_error_page("会社概要 従業員500名 資本金1500万円 お問い合わせ"))
+        self.assertFalse(cu.is_error_page("送料 500円（税込） 5030コース"))
+        # A real error page leads with the code near the top.
+        self.assertTrue(cu.is_error_page("Error 500 - Internal Server Error"))
+        self.assertTrue(cu.is_error_page("404 Not Found"))
+        # The code buried deep in a long healthy page does not count.
+        long_page = "お問い合わせフォーム " + ("会社案内 " * 100) + " エラー 500 "
+        self.assertFalse(cu.is_error_page(long_page))
+
+    def test_support_contact_survives_avoid_list(self) -> None:
+        # v31 §WS2c — /support/* is avoided EXCEPT when a desired keyword
+        # (contact/inquiry) also appears in the path.
+        base = "https://example.co.jp/"
+        links = [
+            {"href": "/support/contact", "text": "お問い合わせ"},
+            {"href": "/support/inquiry", "text": "法人お問い合わせ"},
+            {"href": "/support/faq-top", "text": "お問い合わせ"},
+        ]
+        out = cu.contact_link_candidates(links, base)
+        self.assertIn("https://example.co.jp/support/contact", out)
+        self.assertIn("https://example.co.jp/support/inquiry", out)
+        self.assertNotIn("https://example.co.jp/support/faq-top", out)
+
+    def test_common_contact_paths_v31_expansion(self) -> None:
+        out = cu.common_contact_paths("https://example.co.jp/")
+        for path in ("/contactform", "/contact.html", "/inquiry.html",
+                     "/otoiawase.html", "/support/contact", "/ja/contact",
+                     "/mailform"):
+            self.assertIn(f"https://example.co.jp{path}", out)
+        # bare /mail deliberately excluded (webmail false hits)
+        self.assertNotIn("https://example.co.jp/mail", out)
+
+    def test_sitemap_mailform_and_anchored_form(self) -> None:
+        xml = """
+        <urlset>
+          <loc>https://example.co.jp/mailform/</loc>
+          <loc>https://example.co.jp/form</loc>
+          <loc>https://example.co.jp/form.html</loc>
+          <loc>https://example.co.jp/reform/</loc>
+          <loc>https://example.co.jp/information/</loc>
+          <loc>https://example.co.jp/support/contact/</loc>
+        </urlset>
+        """
+        out = cu.extract_contact_urls_from_sitemap(xml)
+        self.assertIn("https://example.co.jp/mailform/", out)
+        self.assertIn("https://example.co.jp/form", out)
+        self.assertIn("https://example.co.jp/form.html", out)
+        self.assertIn("https://example.co.jp/support/contact/", out)
+        self.assertNotIn("https://example.co.jp/reform/", out)
+        self.assertNotIn("https://example.co.jp/information/", out)
+
+    def test_google_forms_service_urls(self) -> None:
+        # v31 §WS2b
+        self.assertTrue(cu.is_form_service_url("https://forms.gle/AbCd123"))
+        self.assertTrue(cu.is_form_service_url(
+            "https://docs.google.com/forms/d/e/1FAIpQLSe/viewform?embedded=true"
+        ))
+        # An arbitrary Google Docs embed is NOT a form service.
+        self.assertFalse(cu.is_form_service_url(
+            "https://docs.google.com/document/d/abc/pub?embedded=true"
+        ))
+        self.assertFalse(cu.is_form_service_url("https://example.co.jp/contact"))
+
+    def test_iframe_takeover_accepts_google_forms(self) -> None:
+        iframes = [
+            {"src": "https://docs.google.com/forms/d/e/1FAIpQLSe/viewform?embedded=true"},
+        ]
+        src = cu.iframe_form_src(iframes, "https://example.co.jp/contact/")
+        self.assertIsNotNone(src)
+        self.assertIn("docs.google.com/forms", src)
+        # non-form Google embed rejected
+        self.assertIsNone(cu.iframe_form_src(
+            [{"src": "https://docs.google.com/presentation/d/x/embed"}],
+            "https://example.co.jp/contact/",
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()
