@@ -5,11 +5,13 @@ import unittest
 
 from _outreach_core.helpers.report import (
     inquiry_type_summary,
+    _dedup_verify_events,
     _skip_reason_bucket,
     autonomous_summary,
     period_bounds,
     research_quality_summary,
     send_period_summary,
+    summarize_slack_health,
 )
 
 
@@ -204,6 +206,97 @@ class TestSendPeriodSummary(unittest.TestCase):
         self.assertEqual(summary["successes"], 1)
         self.assertEqual(summary["failures"], 0)
         self.assertEqual(summary["failed_companies"], [])
+
+
+class TestVerifyEventDedupAndTimeouts(unittest.TestCase):
+    """v31 §WS8f — retried targets & timeout/crash attempts in the funnel."""
+
+    def test_dedup_keeps_last_verify_event_per_target(self):
+        events = [
+            {"kind": "send.verify.completed", "ts": "t1", "target_id": "a",
+             "payload": {"status": "uncertain"}},
+            {"kind": "send.auto_skipped", "ts": "t2", "target_id": "b",
+             "payload": {"reason": "captcha"}},
+            {"kind": "send.verify.completed", "ts": "t3", "target_id": "a",
+             "payload": {"status": "ok"}},
+        ]
+        out = _dedup_verify_events(events)
+        self.assertEqual(len(out), 2)
+        verify = [e for e in out if e["kind"] == "send.verify.completed"]
+        self.assertEqual(len(verify), 1)
+        self.assertEqual(verify[0]["payload"]["status"], "ok")
+        # non-verify events pass through untouched
+        self.assertEqual(out[0]["kind"], "send.auto_skipped")
+
+    def test_retried_target_counts_once_in_summary(self):
+        # 2 failed passes + 1 ok pass for the same target = 1 attempt, 1 success.
+        events = [
+            {"kind": "send.verify.completed", "ts": "2026-06-10T01:00:00Z",
+             "target_id": "r1", "payload": {"status": "uncertain", "name": "リトライ社"}},
+            {"kind": "send.verify.completed", "ts": "2026-06-10T01:05:00Z",
+             "target_id": "r1", "payload": {"status": "uncertain", "name": "リトライ社"}},
+            {"kind": "send.verify.completed", "ts": "2026-06-10T01:10:00Z",
+             "target_id": "r1", "payload": {"status": "ok", "name": "リトライ社"}},
+        ]
+        now = datetime(2026, 6, 15, 0, 0, tzinfo=timezone.utc)
+        summary = send_period_summary([], [], events, period="this_month", now=now)
+        self.assertEqual(summary["attempts"], 1)
+        self.assertEqual(summary["successes"], 1)
+        self.assertEqual(summary["failures"], 0)
+
+    def test_timeout_and_crash_count_as_failed_attempts(self):
+        events = [
+            {"kind": "send.lead_timed_out", "ts": "2026-06-10T01:00:00Z",
+             "target_id": "t1", "payload": {"timeout_sec": 300}},
+            {"kind": "send.lead_crashed", "ts": "2026-06-10T02:00:00Z",
+             "target_id": "c1", "payload": {"error": "TabCrashed"}},
+        ]
+        now = datetime(2026, 6, 15, 0, 0, tzinfo=timezone.utc)
+        summary = send_period_summary([], [], events, period="this_month", now=now)
+        self.assertEqual(summary["attempts"], 2)
+        self.assertEqual(summary["successes"], 0)
+        self.assertEqual(summary["failures"], 2)
+        self.assertIn("target_timeout", summary["failure_reasons"])
+        self.assertTrue(
+            any(r.startswith("lead_crashed") for r in summary["failure_reasons"])
+        )
+
+
+class TestSlackHealthSummary(unittest.TestCase):
+    """v31 §WS8g — slack.* delivery events finally get a report."""
+
+    def test_counts_by_kind_route_and_error(self):
+        events = [
+            {"kind": "slack.notified",
+             "payload": {"ok": True, "route": "bot_thread", "level": "info"}},
+            {"kind": "slack.notified",
+             "payload": {"ok": False, "route": "webhook_fallback",
+                         "error": "timeout", "level": "info"}},
+            {"kind": "slack.problem_notified",
+             "payload": {"ok": True, "route": "bot_thread", "kind": "needs_attention"}},
+            {"kind": "slack.problem_deduped",
+             "payload": {"kind": "needs_attention"}},
+            {"kind": "send.verify.completed", "payload": {"status": "ok"}},
+        ]
+        summary = summarize_slack_health(events)
+        notified = summary["slack.notified"]
+        self.assertEqual(notified["total"], 2)
+        self.assertEqual(notified["ok"], 1)
+        self.assertEqual(notified["failed"], 1)
+        self.assertEqual(notified["routes"]["bot_thread"], 1)
+        self.assertEqual(notified["routes"]["webhook_fallback"], 1)
+        self.assertEqual(notified["errors"]["timeout"], 1)
+        self.assertEqual(summary["slack.problem_notified"]["ok"], 1)
+        self.assertEqual(summary["slack.problem_deduped"]["total"], 1)
+        self.assertEqual(
+            summary["slack.problem_deduped"]["by_kind"]["needs_attention"], 1
+        )
+
+    def test_empty_events_yield_zeroes(self):
+        summary = summarize_slack_health([])
+        self.assertEqual(summary["slack.notified"]["total"], 0)
+        self.assertEqual(summary["slack.problem_notified"]["total"], 0)
+        self.assertEqual(summary["slack.problem_deduped"]["total"], 0)
 
 
 class TestResearchQualitySummary(unittest.TestCase):

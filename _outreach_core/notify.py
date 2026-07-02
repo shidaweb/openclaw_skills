@@ -224,6 +224,17 @@ def _target_value(target: Mapping[str, Any] | None, *keys: str) -> str:
     return ""
 
 
+def _target_int(target: Mapping[str, Any] | None, key: str) -> int | None:
+    """Positive-int reader for target bookkeeping keys (v31 §WS8e)."""
+    if not isinstance(target, Mapping):
+        return None
+    try:
+        value = int(target.get(key))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 def _problem_key(kind: str, target: Mapping[str, Any] | None) -> str:
     tid = _target_value(target, "target_id", "id")
     if not tid:
@@ -619,6 +630,15 @@ def post_target_event(
         or _target_value(target, "name", "company", "target_id", "id")
         or "unknown"
     )
+    # v31 §WS8e — [i/N] fallback. Callers rarely thread idx/total explicitly
+    # (production passed total=None everywhere, so the prefix never rendered).
+    # stage_send stamps _batch_idx/_batch_total on each target instead; use
+    # them only as a PAIR so a stray idx never renders against a wrong total.
+    if idx is None and total is None:
+        batch_idx = _target_int(target, "_batch_idx")
+        batch_total = _target_int(target, "_batch_total")
+        if batch_idx and batch_total:
+            idx, total = batch_idx, batch_total
     text = format_target_event(
         stage=stage, status=status, name=display_name,
         idx=idx, total=total, detail=detail,

@@ -942,6 +942,24 @@ def scan_new_required_after_fill(
     return newly
 
 
+def classify_verify_reason(result: dict[str, Any]) -> str:
+    """v31 §WS8d — bucket a non-ok verify result for needs_attention rows.
+
+    Pure so the taxonomy is unit-testable. Buckets mirror how an operator
+    actually triages: an error banner needs a page look, unresolved fields
+    need a field-map fix, everything else is "did it actually send?".
+    """
+    status = str(result.get("status") or "")
+    evidence = result.get("evidence") or {}
+    if result.get("unresolved_fields"):
+        return "verify_unresolved_fields"
+    if status == "needs_attention":
+        if evidence.get("has_error_keyword"):
+            return "verify_error_banner"
+        return "verify_needs_attention"
+    return "verify_uncertain"
+
+
 def handle_verify_result(
     target: dict[str, Any],
     result: dict[str, Any],
@@ -954,13 +972,13 @@ def handle_verify_result(
     Persist needs_attention + notify unless record_attention is false.
     Returns outcome: sent_ok | needs_attention | uncertain.
     """
-    from _outreach_core.notify import post as notify_post
-
     name = target.get("name") or target.get("id", "?")
     status = result.get("status")
 
     if status == "ok":
-        notify_post(f"{name} 送信完了", level="info")
+        # v31 §WS8a — no direct Slack post here. The per-target ✅ line is owned
+        # by the caller's post_target_event so a retried target reports its
+        # verdict exactly once (this used to double/triple-post 送信完了).
         _emit_send_event(target, result, channel, "sent_ok")
         return "sent_ok"
 
@@ -970,6 +988,13 @@ def handle_verify_result(
             "name": name,
             "channel": channel,
             "reason": result.get("reason"),
+            # v31 §WS8d — classify at write time. 63% of the needs_attention
+            # backlog had no reason_class because this code path (unlike the
+            # timeout / resolver-queue writers) omitted it, which made the
+            # report layer unable to bucket the majority of open items.
+            "reason_class": classify_verify_reason(result),
+            "action_needed": "manual_verify",
+            "form_url": target.get("form_url") or target.get("url"),
             "unresolved_fields": result.get("unresolved_fields"),
             "snapshot_path": result.get("snapshot_path"),
             "evidence": result.get("evidence"),

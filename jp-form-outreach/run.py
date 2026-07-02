@@ -1927,6 +1927,22 @@ def stage_resolve_queue(config: dict[str, Any] | None = None) -> None:
             core_avoidance.record_outcome(DATA_DIR, form_url, core_avoidance.OUTCOME_SENT)
             core_resolve_queue.mark(DATA_DIR, tid, "resolved", note="deep resolver sent")
             print(f"  [resolver] ✅ {name} 送信成功")
+            # v31 §WS8a — handle_verify_result no longer posts 送信完了 itself
+            # (it used to double-post with _send_one_target's ✅ line), so the
+            # resolver path owns its own concise per-target success line.
+            try:
+                from _outreach_core import notify as _notify
+                _notify.post_target_event(
+                    stage="resolve",
+                    status="sent",
+                    target=d,
+                    detail={
+                        "verify_status": (vres or {}).get("status"),
+                        "form_url": form_url,
+                    },
+                )
+            except Exception:  # noqa: BLE001 - Slack must never abort the loop
+                pass
             resolved.append(name)
             progress_outcome = "sent"
         else:
@@ -7356,6 +7372,23 @@ def _submission_loop(
     return _result("done", final_obs, capped=True)
 
 
+def _refresh_last_verify(d: dict[str, Any], vresult: dict[str, Any] | None) -> None:
+    """v31 §WS8b — cache the LATEST verify verdict/status on the target.
+
+    The per-target Slack ✅ line and _send_one_target's return payload read
+    ``_last_verify_*``; before this helper only the first verify pass wrote
+    them, so a URL-fallback / analyzer-escalation retry that succeeded still
+    reported the first pass's failed status.
+    """
+    if not vresult:
+        return
+    verify_evidence = vresult.get("evidence") or {}
+    d["_last_verify_verdict"] = (
+        verify_evidence.get("send_verdict") or vresult.get("status")
+    )
+    d["_last_verify_status"] = vresult.get("status")
+
+
 def _send_one_target(
     d: dict[str, Any],
     *,
@@ -7992,11 +8025,7 @@ def _send_one_target(
             infer_fn=lambda p, m: oc_infer(p, m or core_infer.DEFAULT_MODEL),
             tiebreak_model=_verify_model(config),
         )
-        verify_evidence = vresult.get("evidence") or {}
-        d["_last_verify_verdict"] = (
-            verify_evidence.get("send_verdict") or vresult.get("status")
-        )
-        d["_last_verify_status"] = vresult.get("status")
+        _refresh_last_verify(d, vresult)
         ev.dump_trace(trace, "verify_evidence.json", vresult.get("evidence") or {})
         outcome = handle_verify_result(d, vresult, DATA_DIR, channel="jp_form")
         core_timeline.add(
@@ -8038,6 +8067,10 @@ def _send_one_target(
                     d, sanitized, config, trace=trace, flow=flow,
                     verify_strict=verify_strict, iterative_fill=iterative_fill,
                 )
+                # v31 §WS8b — refresh the cached verdict from the retry so the
+                # per-target ✅ line / return payload reflect the attempt that
+                # actually settled the target, not the first failed pass.
+                _refresh_last_verify(d, retry.get("vresult"))
                 outcome2 = (
                     handle_verify_result(d, retry["vresult"], DATA_DIR, channel="jp_form")
                     if retry.get("vresult") else "failed"
@@ -8085,6 +8118,9 @@ def _send_one_target(
                             d, send_body, esc_cfg, trace=trace, flow=flow,
                             verify_strict=verify_strict, iterative_fill=True,
                         )
+                        # v31 §WS8b — same stale-verdict fix as the URL-fallback
+                        # retry above.
+                        _refresh_last_verify(d, retry.get("vresult"))
                         outcome2 = (
                             handle_verify_result(d, retry["vresult"], DATA_DIR, channel="jp_form")
                             if retry.get("vresult") else "failed"
@@ -8139,12 +8175,13 @@ def _send_one_target(
     was_sent = any(x is d for x in sent)
     try:
         from _outreach_core import notify as _notify
+        # v31 §WS8e — idx/total come from the target's _batch_idx/_batch_total
+        # fallback inside post_target_event so [i/N] finally renders in
+        # production (the old idx=sendable-index / total=None pair never did).
         _notify.post_target_event(
             stage="send",
             status="sent" if was_sent else "filled_only",
             target=d,
-            idx=idx,
-            total=None,
             detail={
                 "verify_status": d.get("_last_verify_status"),
                 "verify_reason": (
@@ -8392,6 +8429,14 @@ def stage_send(
                 break
             idx = sendable.index(d) + 1
             tid = str(d.get("id") or d.get("name", "?"))
+            # v31 §WS8e — batch position for the Slack [i/N] prefix. The
+            # journal keeps the sendable-wide ``idx`` above; the Slack feed
+            # wants "position within THIS batch", which is di/len(targets).
+            # post_target_event falls back to these keys when its idx/total
+            # args are None, so every call site (sent/skip/timeout) renders
+            # a consistent [i/N] without threading two more parameters.
+            d["_batch_idx"] = di + 1
+            d["_batch_total"] = len(targets)
             target_started_at = time.time()
             _hb_stage(f"send {di + 1}/{len(targets)} {d.get('name', tid)}")
             print(
@@ -8465,7 +8510,7 @@ def stage_send(
                     from _outreach_core import notify as _notify
                     _notify.post_target_event(
                         stage="send", status="timeout",
-                        target=d, idx=idx,
+                        target=d,
                         detail={
                             "reason_class": "target_timeout",
                             "elapsed_sec": int(max(0, time.time() - target_started_at)),
@@ -8777,6 +8822,21 @@ def stage_resolve_proceed(
             payload={"previous_status": "awaiting_user_proceed", "new_status": "ok"},
         )
         print(f"[resolve] ✅ {vresult.get('reason')}")
+        # v31 §WS8a — handle_verify_result no longer posts 送信完了; this
+        # proceed path owns its own per-target success line.
+        try:
+            from _outreach_core import notify as _notify
+            _notify.post_target_event(
+                stage="resolve",
+                status="sent",
+                target=d,
+                detail={
+                    "verify_status": vresult.get("status"),
+                    "form_url": d.get("form_url") or d.get("url"),
+                },
+            )
+        except Exception:  # noqa: BLE001 - Slack must never abort the flow
+            pass
     else:
         print(f"[resolve] ⚠ verify: {vresult.get('status')} — {vresult.get('reason')}")
 

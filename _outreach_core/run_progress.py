@@ -36,9 +36,13 @@ _STAGE_LABEL = {
 }
 
 # outcome (from _send_one_target) → counter bucket
+# v31 §WS8c: "done" is returned exactly by the filled_only path (send
+# attempted, verify not certified). Counting it as "skipped" both inflated
+# the スキップ card and hid the ambiguous-verify targets the operator most
+# needs to review, so it gets its own bucket.
 _OUTCOME_BUCKET = {
     "sent": "sent",
-    "done": "skipped",
+    "done": "filled_only",
     "skipped": "skipped",
     "queued": "needs_attention",
     "crashed": "needs_attention",
@@ -90,6 +94,7 @@ def start(data_dir: Path | str, stage: str, total: int, *, brief: str | None = N
             "total": int(total or 0),
             "processed": 0,
             "sent": 0,
+            "filled_only": 0,
             "skipped": 0,
             "needs_attention": 0,
             "current": None,
@@ -124,6 +129,7 @@ def transition(
                 "total": int(previous.get("total", 0)),
                 "processed": int(previous.get("processed", 0)),
                 "sent": int(previous.get("sent", 0)),
+                "filled_only": int(previous.get("filled_only", 0)),
                 "skipped": int(previous.get("skipped", 0)),
                 "needs_attention": int(previous.get("needs_attention", 0)),
                 "status": previous.get("status"),
@@ -137,6 +143,7 @@ def transition(
             "total": int(total or 0),
             "processed": 0,
             "sent": 0,
+            "filled_only": 0,
             "skipped": 0,
             "needs_attention": 0,
             "current": None,
@@ -245,6 +252,7 @@ def format_summary(snap: dict[str, Any] | None, *, now: datetime | None = None) 
     total = int(snap.get("total", 0))
     processed = int(snap.get("processed", 0))
     sent = int(snap.get("sent", 0))
+    filled_only = int(snap.get("filled_only", 0))
     skipped = int(snap.get("skipped", 0))
     na = int(snap.get("needs_attention", 0))
     status = snap.get("status", "?")
@@ -254,6 +262,10 @@ def format_summary(snap: dict[str, Any] | None, *, now: datetime | None = None) 
         f"スキップ {skipped}",
         f"要対応 {na}",
     ]
+    # v31 §WS8c — surface only when present so pre-v31 snapshots and stages
+    # without a send loop keep their familiar 4-part summary.
+    if filled_only:
+        parts.insert(2, f"入力のみ {filled_only}")
     started = _parse(snap.get("started_at"))
     if started:
         end = _parse(snap.get("finished_at")) or (now or datetime.now(timezone.utc))
@@ -294,6 +306,7 @@ def render_html(snap: dict[str, Any] | None, *, now: datetime | None = None) -> 
     total = int(snap.get("total", 0))
     processed = int(snap.get("processed", 0))
     sent = int(snap.get("sent", 0))
+    filled_only = int(snap.get("filled_only", 0))
     skipped = int(snap.get("skipped", 0))
     na = int(snap.get("needs_attention", 0))
     stage = _esc(snap.get("stage", "?"))
@@ -332,11 +345,11 @@ def render_html(snap: dict[str, Any] | None, *, now: datetime | None = None) -> 
   .fill {{ height:100%; width:{pct}%; background:linear-gradient(90deg,#2563eb,#22d3ee);
            transition: width .4s ease; }}
   .pct {{ font-variant-numeric: tabular-nums; color:#9ca3af; font-size:13px; }}
-  .cards {{ display:grid; grid-template-columns: repeat(3,1fr); gap:12px; margin:20px 0; }}
+  .cards {{ display:grid; grid-template-columns: repeat(4,1fr); gap:12px; margin:20px 0; }}
   .card {{ background:#111827; border:1px solid #1f2937; border-radius:14px; padding:14px; }}
   .card .n {{ font-size:30px; font-weight:800; font-variant-numeric:tabular-nums; }}
   .card .l {{ font-size:12px; color:#9ca3af; margin-top:2px; }}
-  .sent .n {{ color:#34d399; }} .skip .n {{ color:#9ca3af; }} .na .n {{ color:#fbbf24; }}
+  .sent .n {{ color:#34d399; }} .fo .n {{ color:#60a5fa; }} .skip .n {{ color:#9ca3af; }} .na .n {{ color:#fbbf24; }}
   .meta {{ display:grid; grid-template-columns: auto 1fr; gap:6px 16px; font-size:14px;
            color:#cbd5e1; margin-top:8px; }}
   .meta dt {{ color:#94a3b8; }}
@@ -351,6 +364,7 @@ def render_html(snap: dict[str, Any] | None, *, now: datetime | None = None) -> 
   <div class="pct">{processed} / {total} 件処理（{pct}%）・送信成功率 {rate}%</div>
   <div class="cards">
     <div class="card sent"><div class="n">{sent}</div><div class="l">送信</div></div>
+    <div class="card fo"><div class="n">{filled_only}</div><div class="l">入力のみ（検証未確定）</div></div>
     <div class="card skip"><div class="n">{skipped}</div><div class="l">スキップ</div></div>
     <div class="card na"><div class="n">{na}</div><div class="l">要対応</div></div>
   </div>

@@ -79,6 +79,72 @@ class TestVerify(unittest.TestCase):
             self.assertFalse((data / "needs_attention.jsonl").exists())
             post_problem.assert_not_called()
 
+    def test_handle_verify_result_ok_does_not_post_slack(self) -> None:
+        # v31 §WS8a — the per-target ✅ line is owned by the caller's
+        # post_target_event; handle_verify_result posting its own 送信完了
+        # double/triple-posted successes (retried targets posted 3×).
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            target = {"id": "t5", "name": "重複投稿確認株式会社"}
+            result = {"status": "ok", "reason": "explicit_sent_status"}
+            from _outreach_core.verify import handle_verify_result
+
+            with mock.patch("_outreach_core.notify.post", return_value=True) as post:
+                outcome = handle_verify_result(target, result, data, channel="jp_form")
+            self.assertEqual(outcome, "sent_ok")
+            post.assert_not_called()
+
+    def test_needs_attention_entry_carries_reason_class(self) -> None:
+        # v31 §WS8d — this writer used to omit reason_class/action_needed,
+        # leaving 63% of one production brief's backlog unclassifiable.
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            target = {
+                "id": "t6",
+                "name": "分類確認株式会社",
+                "form_url": "https://example.co.jp/contact/",
+            }
+            result = {
+                "status": "uncertain",
+                "reason": "送信完了画面が確認できません",
+            }
+            from _outreach_core.verify import handle_verify_result
+
+            with mock.patch("_outreach_core.notify.post", return_value=True), \
+                    mock.patch("_outreach_core.notify.post_problem", return_value=True):
+                handle_verify_result(target, result, data, channel="jp_form")
+            row = json.loads(
+                (data / "needs_attention.jsonl").read_text().strip().splitlines()[-1]
+            )
+            self.assertEqual(row["reason_class"], "verify_uncertain")
+            self.assertEqual(row["action_needed"], "manual_verify")
+            self.assertEqual(row["form_url"], "https://example.co.jp/contact/")
+
+    def test_classify_verify_reason_buckets(self) -> None:
+        from _outreach_core.verify import classify_verify_reason
+
+        self.assertEqual(
+            classify_verify_reason({"status": "uncertain"}), "verify_uncertain"
+        )
+        self.assertEqual(
+            classify_verify_reason(
+                {"status": "needs_attention",
+                 "evidence": {"has_error_keyword": True}}
+            ),
+            "verify_error_banner",
+        )
+        self.assertEqual(
+            classify_verify_reason({"status": "needs_attention", "evidence": {}}),
+            "verify_needs_attention",
+        )
+        self.assertEqual(
+            classify_verify_reason(
+                {"status": "needs_attention",
+                 "unresolved_fields": [{"name": "industry"}]}
+            ),
+            "verify_unresolved_fields",
+        )
+
     def test_linkedin_success_keyword_in_snapshot(self) -> None:
         target = {"id": "li1", "name": "Ada Lovelace"}
         snap = 'button "Close" [ref=e1]\nMessage sent to Ada'

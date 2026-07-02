@@ -112,7 +112,39 @@ def _failure_reason_from_event(ev: dict[str, Any]) -> str:
         return str(payload.get("reason") or "auto_skipped")
     if kind == "send.queued_for_resolver":
         return str(payload.get("reason_class") or "queued_for_resolver")
+    # v31 §WS8f — timeouts/crashes only reach needs_attention.jsonl, so
+    # without these kinds in the attempt set the funnel under-counted real
+    # failures (20 timeouts in one production brief were invisible).
+    if kind == "send.lead_timed_out":
+        return "target_timeout"
+    if kind == "send.lead_crashed":
+        return f"lead_crashed: {str(payload.get('error') or '')[:80]}".rstrip(": ")
     return kind
+
+
+def _dedup_verify_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """v31 §WS8f — keep only the LAST ``send.verify.completed`` per target.
+
+    A retried target (URL fallback / analyzer escalation) emits up to three
+    verify events; counting them all inflated ok/uncertain/na and duplicated
+    failure rows. Events without a target_id and non-verify kinds pass
+    through untouched, preserving order.
+    """
+    last_by_tid: dict[str, int] = {}
+    for i, e in enumerate(events):
+        if str(e.get("kind") or "") != "send.verify.completed":
+            continue
+        tid = str(e.get("target_id") or "")
+        if tid:
+            last_by_tid[tid] = i
+    out: list[dict[str, Any]] = []
+    for i, e in enumerate(events):
+        if str(e.get("kind") or "") == "send.verify.completed":
+            tid = str(e.get("target_id") or "")
+            if tid and last_by_tid.get(tid) != i:
+                continue
+        out.append(e)
+    return out
 
 
 def send_period_summary(
@@ -129,7 +161,16 @@ def send_period_summary(
     sent_in = [r for r in sent_rows if _in_period(_parse_ts(r.get("sent_at")), start, end)]
     skip_in = [r for r in skip_rows if _in_period(_parse_ts(r.get("skipped_at")), start, end)]
 
-    attempt_kinds = {"send.verify.completed", "send.first_button_missing", "send.auto_skipped", "send.queued_for_resolver"}
+    attempt_kinds = {
+        "send.verify.completed",
+        "send.first_button_missing",
+        "send.auto_skipped",
+        "send.queued_for_resolver",
+        # v31 §WS8f — a timed-out / crashed lead IS an attempt; it previously
+        # appeared in neither attempts nor failures.
+        "send.lead_timed_out",
+        "send.lead_crashed",
+    }
     attempt_events = []
     for e in events:
         ts = _parse_ts(e.get("ts"))
@@ -137,6 +178,7 @@ def send_period_summary(
             continue
         if str(e.get("kind") or "") in attempt_kinds:
             attempt_events.append(e)
+    attempt_events = _dedup_verify_events(attempt_events)
 
     # map id -> best-known company display name
     name_by_id: dict[str, str] = {}
@@ -508,6 +550,78 @@ def _write_send_funnel_snapshot(data_dir: Path, summary: dict[str, Any]) -> None
         pass
 
 
+def summarize_slack_health(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """v31 §WS8g — aggregate slack.* delivery events.
+
+    The notify layer has always emitted ``slack.notified`` /
+    ``slack.problem_notified`` / ``slack.problem_deduped`` with ok/route/error
+    payloads, but nothing surfaced them — the pipeline could not answer "did
+    the operator actually receive the alerts?". Pure function so the shape is
+    locked by tests.
+    """
+    kinds = ("slack.notified", "slack.problem_notified", "slack.problem_deduped")
+    summary: dict[str, Any] = {k: {"total": 0} for k in kinds}
+    for k in ("slack.notified", "slack.problem_notified"):
+        summary[k].update({"ok": 0, "failed": 0, "routes": Counter(), "errors": Counter()})
+    summary["slack.problem_deduped"]["by_kind"] = Counter()
+    for e in events:
+        kind = str(e.get("kind") or "")
+        if kind not in summary:
+            continue
+        payload = e.get("payload") or {}
+        bucket = summary[kind]
+        bucket["total"] += 1
+        if kind == "slack.problem_deduped":
+            bucket["by_kind"][str(payload.get("kind") or "unknown")] += 1
+            continue
+        if payload.get("ok"):
+            bucket["ok"] += 1
+        else:
+            bucket["failed"] += 1
+            err = str(payload.get("error") or "unknown")
+            bucket["errors"][err[:80]] += 1
+        bucket["routes"][str(payload.get("route") or "none")] += 1
+    for k in kinds:
+        for field in ("routes", "errors", "by_kind"):
+            if field in summary[k]:
+                summary[k][field] = dict(summary[k][field].most_common(10))
+    return summary
+
+
+def cmd_slack_health(args: argparse.Namespace) -> int:
+    data_dir = _skill_data_dir(args.skill, getattr(args, "brief", None))
+    since = parse_since(args.since)
+    events = load_events(data_dir, since=since, skill=args.skill)
+    summary = summarize_slack_health(events)
+    if getattr(args, "json", False):
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0
+    lines = [f"# Slack Health — since {args.since}", "", f"skill: {args.skill}", ""]
+    labels = {
+        "slack.notified": "status lines (post)",
+        "slack.problem_notified": "problem reports (post_problem)",
+        "slack.problem_deduped": "problem dedup drops",
+    }
+    for kind, label in labels.items():
+        b = summary[kind]
+        lines.append(f"## {label}")
+        lines.append(f"- total: {b['total']}")
+        if "ok" in b:
+            lines.append(f"- delivered: {b['ok']} / failed: {b['failed']}")
+            if b["routes"]:
+                routes = ", ".join(f"{r}={n}" for r, n in b["routes"].items())
+                lines.append(f"- routes: {routes}")
+            if b["errors"]:
+                errs = ", ".join(f"{e}={n}" for e, n in b["errors"].items())
+                lines.append(f"- errors: {errs}")
+        elif b.get("by_kind"):
+            dropped = ", ".join(f"{k}={n}" for k, n in b["by_kind"].items())
+            lines.append(f"- by kind: {dropped}")
+        lines.append("")
+    print("\n".join(lines))
+    return 0
+
+
 def cmd_send_funnel(args: argparse.Namespace) -> int:
     data_dir = _skill_data_dir(args.skill, getattr(args, "brief", None))
     since = parse_since(args.since)
@@ -517,7 +631,11 @@ def cmd_send_funnel(args: argparse.Namespace) -> int:
     prev_outcome_summary = _read_send_funnel_snapshot(data_dir)
     outcome_diff = diff_against_snapshot(outcome_summary, prev_outcome_summary)
 
-    verify = [e for e in events if e.get("kind") == "send.verify.completed"]
+    # v31 §WS8f — dedup by target_id (last event wins) so retried targets
+    # don't inflate the verify counters.
+    verify = _dedup_verify_events(
+        [e for e in events if e.get("kind") == "send.verify.completed"]
+    )
     ok = sum(1 for e in verify if (e.get("payload") or {}).get("status") == "ok")
     uncertain = sum(1 for e in verify if (e.get("payload") or {}).get("status") == "uncertain")
     na = sum(1 for e in verify if (e.get("payload") or {}).get("status") == "needs_attention")
@@ -960,6 +1078,15 @@ def main() -> None:
     _add_brief_arg(p)
     p.add_argument("--skill", default="jp-form-outreach")
 
+    p = sub.add_parser(
+        "slack-health",
+        help="Slack delivery health: notified/problem/dedup counts by route+error",
+    )
+    _add_brief_arg(p)
+    p.add_argument("--since", default="7d")
+    p.add_argument("--skill", default="jp-form-outreach")
+    p.add_argument("--json", action="store_true")
+
     p = sub.add_parser("inspect")
     _add_brief_arg(p)
     p.add_argument("--target-id", required=True)
@@ -997,6 +1124,8 @@ def main() -> None:
         sys.exit(cmd_send_summary(args))
     if args.cmd == "needs-attention":
         sys.exit(cmd_needs_attention(args))
+    if args.cmd == "slack-health":
+        sys.exit(cmd_slack_health(args))
     if args.cmd == "inspect":
         sys.exit(cmd_inspect(args))
     if args.cmd == "prune":

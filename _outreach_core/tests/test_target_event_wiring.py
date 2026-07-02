@@ -85,6 +85,34 @@ def test_send_one_target_success_posts_sent_event(monkeypatch):
     assert ev["idx"] == 1
 
 
+def test_refresh_last_verify_updates_cached_verdict():
+    """v31 §WS8b — a retry's verify result must overwrite the cached one so
+    the ✅ Slack line / return payload don't report the first failed pass."""
+    d = {"id": "x", "_last_verify_verdict": "uncertain",
+         "_last_verify_status": "uncertain"}
+    run._refresh_last_verify(
+        d, {"status": "ok", "evidence": {"send_verdict": "sent_ok"}}
+    )
+    assert d["_last_verify_verdict"] == "sent_ok"
+    assert d["_last_verify_status"] == "ok"
+    # A None retry result (e.g. _deep_submit crashed before verify) must keep
+    # the previous verdict instead of wiping it.
+    run._refresh_last_verify(d, None)
+    assert d["_last_verify_status"] == "ok"
+
+
+def test_send_batch_position_renders_in_slack_line(monkeypatch):
+    """v31 §WS8e — stage_send stamps _batch_idx/_batch_total; the Slack line
+    renders them as [i/N] via post_target_event's fallback."""
+    posted: list[str] = []
+    monkeypatch.setattr(notify, "post", lambda text, **k: posted.append(text) or True)
+
+    target = {"id": "b1", "name": "株式会社バッチ",
+              "_batch_idx": 2, "_batch_total": 5}
+    notify.post_target_event(stage="send", status="filled_only", target=target)
+    assert posted and posted[0].split("\n", 1)[0].startswith("[2/5] ")
+
+
 def test_auto_skip_does_not_raise_when_notify_fails(monkeypatch):
     """post_target_event must never abort the skip path. Slack outages should
     not turn a graceful skip into a crash."""

@@ -39,8 +39,29 @@ class TestSnapshotIO(unittest.TestCase):
         self.assertEqual(snap["processed"], 6)
         self.assertEqual(snap["sent"], 1)
         self.assertEqual(snap["needs_attention"], 3)   # queued + crashed + timed_out
-        self.assertEqual(snap["skipped"], 2)           # skipped + done
+        self.assertEqual(snap["skipped"], 1)           # skipped only
+        # v31 §WS8c — "done" (= send attempted, verify not certified) gets its
+        # own bucket instead of inflating the skipped card.
+        self.assertEqual(snap["filled_only"], 1)       # done
         self.assertEqual(snap["current"], "F")
+
+    def test_filled_only_summary_and_html(self):
+        # v31 §WS8c — surfaced in the text summary and the dashboard cards.
+        snap = {
+            "stage": "send", "total": 10, "processed": 5, "sent": 3,
+            "filled_only": 2, "skipped": 0, "needs_attention": 0,
+            "status": "running",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        out = rp.format_summary(snap)
+        self.assertIn("入力のみ 2", out)
+        html = rp.render_html(snap)
+        self.assertIn("入力のみ（検証未確定）", html)
+        # pre-v31 snapshots (no filled_only key) keep the 4-part summary
+        legacy = dict(snap)
+        legacy.pop("filled_only")
+        self.assertNotIn("入力のみ", rp.format_summary(legacy))
 
     def test_finish_sets_status(self):
         rp.start(self.dir, "send", 1)

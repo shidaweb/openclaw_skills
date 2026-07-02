@@ -125,6 +125,32 @@ class TestFormatTargetEvent(unittest.TestCase):
         )
         self.assertNotIn("[", text.split("\n", 1)[0])
 
+    def test_post_target_event_falls_back_to_batch_position(self) -> None:
+        # v31 §WS8e — production call sites don't thread idx/total explicitly;
+        # stage_send stamps _batch_idx/_batch_total on the target instead and
+        # post_target_event renders [i/N] from those.
+        target = {"id": "x1", "name": "株式会社バッチ",
+                  "_batch_idx": 3, "_batch_total": 7}
+        with mock.patch.object(notify, "post", return_value=True) as post:
+            notify.post_target_event(stage="send", status="sent", target=target)
+        self.assertTrue(post.call_args.args[0].startswith("[3/7] "))
+
+    def test_post_target_event_ignores_unpaired_batch_keys(self) -> None:
+        # Only a PAIR renders — a stray idx against an unknown total would lie.
+        target = {"id": "x2", "name": "株式会社片方", "_batch_idx": 3}
+        with mock.patch.object(notify, "post", return_value=True) as post:
+            notify.post_target_event(stage="send", status="sent", target=target)
+        self.assertNotIn("[", post.call_args.args[0].split("\n", 1)[0])
+
+    def test_post_target_event_explicit_idx_wins_over_batch(self) -> None:
+        target = {"id": "x3", "name": "株式会社明示",
+                  "_batch_idx": 3, "_batch_total": 7}
+        with mock.patch.object(notify, "post", return_value=True) as post:
+            notify.post_target_event(
+                stage="send", status="sent", target=target, idx=1, total=2,
+            )
+        self.assertTrue(post.call_args.args[0].startswith("[1/2] "))
+
     def test_long_detail_truncated(self) -> None:
         long = "x" * 500
         text = notify.format_target_event(
