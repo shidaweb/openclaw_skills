@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -215,12 +217,32 @@ def build_give_up_problem(
 # Persistence
 # ---------------------------------------------------------------------------
 
-def state_path(data_dir: Path) -> Path:
+def state_key(skill: str, brief_id: str | None) -> str | None:
+    """v32 FX2 — per-brief restart-budget key, or None for briefless runs.
+
+    One host-global run_supervisor.json meant three concurrent briefs shared
+    ONE restart budget: brief C, launched after A+B logged 3 restarts within
+    the 30-min window, gave up on its very first crash. Keying the state by
+    skill+brief isolates the accounting.
+    """
+    skill_part = str(skill or "").strip()
+    brief_part = str(brief_id or "").strip()
+    if not skill_part or not brief_part:
+        return None
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", f"{skill_part}--{brief_part}")
+    return safe[:120]
+
+
+def state_path(data_dir: Path, key: str | None = None) -> Path:
+    if key:
+        return Path(data_dir) / "run_supervisor" / f"{key}.json"
+    # Legacy host-global file — kept for briefless runs so their accounting
+    # still works. No migration: the budget window is only 30 minutes.
     return Path(data_dir) / "run_supervisor.json"
 
 
-def load_state(data_dir: Path) -> dict[str, Any]:
-    path = state_path(data_dir)
+def load_state(data_dir: Path, key: str | None = None) -> dict[str, Any]:
+    path = state_path(data_dir, key)
     if not path.exists():
         return new_state()
     try:
@@ -233,10 +255,26 @@ def load_state(data_dir: Path) -> dict[str, Any]:
     return new_state()
 
 
-def save_state(data_dir: Path, state: dict[str, Any]) -> None:
-    path = state_path(data_dir)
+def save_state(data_dir: Path, state: dict[str, Any], key: str | None = None) -> None:
+    """v32 FX2 — atomic write (tempfile + os.replace).
+
+    The old bare write_text could interleave under concurrent supervisors;
+    a torn file made load_state silently reset to an EMPTY budget, flipping
+    the failure mode to unbounded restarts.
+    """
+    path = state_path(data_dir, key)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    payload = json.dumps(state, ensure_ascii=False, indent=2)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".rs_", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------

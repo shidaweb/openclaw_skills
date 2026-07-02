@@ -209,5 +209,63 @@ class TestPersistence(unittest.TestCase):
         self.assertEqual(RS.load_state(self.dir), {"restart_attempts": []})
 
 
+class TestPerBriefState(unittest.TestCase):
+    """v32 FX2 — restart budgets keyed per skill+brief, atomic writes."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_state_key_shapes(self):
+        self.assertEqual(
+            RS.state_key("jp-form-outreach", "torana-line-crm"),
+            "jp-form-outreach--torana-line-crm",
+        )
+        self.assertIsNone(RS.state_key("jp-form-outreach", None))
+        self.assertIsNone(RS.state_key("jp-form-outreach", ""))
+        self.assertIsNone(RS.state_key("", "brief"))
+        # path-hostile chars sanitized
+        self.assertNotIn("/", RS.state_key("jp-form-outreach", "a/b../c"))
+
+    def test_keyed_path_vs_legacy(self):
+        keyed = RS.state_path(self.dir, "jp-form-outreach--b1")
+        self.assertEqual(keyed.parent.name, "run_supervisor")
+        legacy = RS.state_path(self.dir, None)
+        self.assertEqual(legacy.name, "run_supervisor.json")
+        self.assertEqual(legacy.parent, self.dir)
+
+    def test_budget_isolation_between_briefs(self):
+        # 3 restarts on brief A must NOT count against brief B — the
+        # production failure was brief C giving up on its first crash
+        # because A+B had exhausted the shared budget.
+        key_a = RS.state_key("jp-form-outreach", "brief-a")
+        key_b = RS.state_key("jp-form-outreach", "brief-b")
+        state_a = RS.load_state(self.dir, key_a)
+        for _ in range(RS.MAX_RESTARTS):
+            RS.record_restart(state_a, "crash")
+        RS.save_state(self.dir, state_a, key_a)
+        self.assertFalse(RS.can_restart(RS.load_state(self.dir, key_a)))
+        self.assertTrue(RS.can_restart(RS.load_state(self.dir, key_b)))
+
+    def test_keyed_round_trip_and_atomicity(self):
+        key = RS.state_key("jp-form-outreach", "brief-x")
+        state = RS.new_state()
+        RS.record_restart(state, "stalled")
+        RS.save_state(self.dir, state, key)
+        loaded = RS.load_state(self.dir, key)
+        self.assertEqual(len(loaded["restart_attempts"]), 1)
+        # no temp litter left behind by the atomic write
+        litter = list((self.dir / "run_supervisor").glob(".rs_*"))
+        self.assertEqual(litter, [])
+
+    def test_legacy_file_untouched_by_keyed_saves(self):
+        key = RS.state_key("jp-form-outreach", "brief-y")
+        RS.save_state(self.dir, RS.new_state(), key)
+        self.assertFalse((self.dir / "run_supervisor.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

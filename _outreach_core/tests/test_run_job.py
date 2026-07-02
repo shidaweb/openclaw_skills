@@ -136,13 +136,25 @@ class TestRunJob(unittest.TestCase):
         return p
 
     def _patches(self, posts):
+        import copy
         import _outreach_core.run_supervisor as RS
+        # v32 FX2 — _supervise reloads state before EVERY decision, so the
+        # save/load mocks must be STATEFUL: an always-empty load_state would
+        # make the crash budget never fill and the give-up tests loop forever.
+        store: dict[str, dict] = {}
+
+        def _load(_dir, key=None):
+            return copy.deepcopy(store.get(str(key), RS.new_state()))
+
+        def _save(_dir, state, key=None):
+            store[str(key)] = copy.deepcopy(state)
+
         return (
             mock.patch.object(run_job, "_post",
                               side_effect=lambda t, level="info", **k: posts.append((level, t))),
             mock.patch.object(run_job, "_health_files", return_value=[]),
-            mock.patch.object(RS, "save_state", lambda *a, **k: None),
-            mock.patch.object(RS, "load_state", lambda *a, **k: RS.new_state()),
+            mock.patch.object(RS, "save_state", _save),
+            mock.patch.object(RS, "load_state", _load),
             # Neutralize the caffeinate sibling so it doesn't consume the mocked
             # subprocess.Popen side_effects used to model the child process.
             mock.patch.object(run_job, "_start_caffeinate", return_value=None),

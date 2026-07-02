@@ -511,8 +511,17 @@ def _supervise(skill: str, run_id: str, log_path: str, run_args: list[str]) -> i
     cmd = build_child_command(skill, run_args)
     cmd_label = " ".join(run_args) or "(no args)"
     state_dir = SKILLS_ROOT / "data"
-    state = RS.load_state(state_dir)
-    activity_paths = [Path(log_path)] + _health_files()
+    # v32 FX2 — restart accounting is keyed per skill+brief so concurrent
+    # briefs stop sharing (and exhausting) one budget. State is (re)loaded
+    # at each decision point below, never cached across the run.
+    brief_raw = _brief_arg(run_args)
+    brief_resolved: str | None = None
+    if brief_raw:
+        try:
+            brief_resolved = resolve_brief_id(brief_raw)
+        except Exception:  # noqa: BLE001 — unknown alias → briefless key
+            brief_resolved = brief_raw
+    state_key = RS.state_key(skill, brief_resolved)
 
     while True:
         try:
@@ -543,11 +552,13 @@ def _supervise(skill: str, run_id: str, log_path: str, run_args: list[str]) -> i
                 break  # child exited
             except subprocess.TimeoutExpired:
                 age = RS.latest_activity_age_sec([Path(log_path)] + _health_files())
+                # v32 FX2 — fresh state per decision (per-brief file).
+                state = RS.load_state(state_dir, state_key)
                 action = RS.decide(child_alive=True, exit_code=None,
                                    activity_age_sec=age, state=state)
                 if action == RS.ACTION_RESTART_STALLED:
                     RS.record_restart(state, "stalled")
-                    RS.save_state(state_dir, state)
+                    RS.save_state(state_dir, state, state_key)
                     _post(f"♻️ stall検知（{int(age or 0)}s 無進捗）→ 自動再開: {skill} "
                           f"`{cmd_label}` (run_id={run_id})。データは保全されています。",
                           level="warn", thread_ts=thread_ts, channel_id=channel_id)
@@ -632,10 +643,12 @@ def _supervise(skill: str, run_id: str, log_path: str, run_args: list[str]) -> i
             )
             return code
 
+        # v32 FX2 — fresh state per decision (per-brief file).
+        state = RS.load_state(state_dir, state_key)
         action = RS.decide(child_alive=False, exit_code=code, activity_age_sec=None, state=state)
         if action == RS.ACTION_RESTART_CRASH:
             RS.record_restart(state, "crash")
-            RS.save_state(state_dir, state)
+            RS.save_state(state_dir, state, state_key)
             _post(f"♻️ 異常終了 (exit={code}) → 自動再開: {skill} `{cmd_label}` "
                   f"(run_id={run_id})。データは保全されています。",
                   level="warn", thread_ts=thread_ts, channel_id=channel_id)
