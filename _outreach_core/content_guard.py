@@ -132,3 +132,52 @@ def sanitize_body(text: str | None, kind: str = "url") -> tuple[str, dict[str, A
     new_text, removed = strip_urls(text)
     changed = new_text != (text or "")
     return new_text, {"changed": changed, "removed_urls": removed, "kind": kind}
+
+
+# --- v31 §WS4c — deterministic tone lint for Japanese business drafts --------
+#
+# Keigo/politeness quality was previously enforced ONLY by the persona prompt;
+# no code caught a casual verb ending or an over-familiar phrase before it hit
+# a company's inquiry form. This is a small, curated blocklist — it flags
+# unambiguous casual markers, not style preferences, so a clean 敬語 body must
+# never trigger it. On a hit the draft stage forces one refine pass.
+_TONE_NG_PATTERNS = (
+    # casual sentence endings (line-final or before punctuation)
+    r"だよ(ね)?[。！!\s]",
+    r"だね[。！!\s]",
+    r"っす(ね|よ)?[。！!\s]",
+    r"じゃん[。！!\s]",
+    r"だろ[。！!\s]",
+    r"かな[。！!\s]",
+    r"せて(もらう|くれ)[。！!\s]",
+    # over-familiar / slangy phrases anywhere
+    r"ぶっちゃけ",
+    r"ですます抜きで",
+    r"タメ口",
+    r"よろしく！",
+    r"サクッと",
+    r"ガンガン",
+    r"めっちゃ",
+    r"超(おすすめ|便利|簡単)",
+    r"弊社的に",
+    r"うち(の会社)?としては",
+)
+TONE_NG_RE = re.compile("|".join(f"(?:{p})" for p in _TONE_NG_PATTERNS))
+
+
+def find_tone_violations(text: str | None) -> list[str]:
+    """Return matched casual/NG fragments in a draft body (pure, order-stable).
+
+    Empty list = clean. Matches are deduped and clipped for event payloads.
+    """
+    body = (text or "").strip()
+    if not body:
+        return []
+    # pad so line-final endings without trailing punctuation still match
+    hay = body + "\n"
+    out: list[str] = []
+    for m in TONE_NG_RE.finditer(hay):
+        frag = m.group(0).strip()
+        if frag and frag not in out:
+            out.append(frag)
+    return out[:8]

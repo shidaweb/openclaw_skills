@@ -86,3 +86,48 @@ class TestStripUrls(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestToneLint(unittest.TestCase):
+    """v31 §WS4c — deterministic casual-tone blocklist."""
+
+    def test_casual_endings_flagged(self):
+        self.assertTrue(G.find_tone_violations("これ、いいと思うんだよね。"))
+        self.assertTrue(G.find_tone_violations("御社に合ってると思うっす。"))
+        self.assertTrue(G.find_tone_violations("便利じゃん。"))
+        self.assertTrue(G.find_tone_violations("資料を送らせてもらう。"))
+
+    def test_slangy_phrases_flagged(self):
+        self.assertTrue(G.find_tone_violations("ぶっちゃけ費用は安いです。"))
+        self.assertTrue(G.find_tone_violations("めっちゃ効果があります。"))
+        self.assertTrue(G.find_tone_violations("サクッと導入できます。"))
+        self.assertTrue(G.find_tone_violations("弊社的にはおすすめです。"))
+
+    def test_line_final_without_punctuation(self):
+        self.assertTrue(G.find_tone_violations("ご検討いただければと思うんだよね"))
+
+    def test_clean_keigo_body_does_not_trigger(self):
+        clean = (
+            "はじめまして、株式会社トラーナの志田と申します。\n"
+            "貴社のサービスを拝見し、ぜひ一度お話しさせていただきたく"
+            "ご連絡いたしました。\n"
+            "以下の内容をご確認のうえ、ご返信いただけますと幸いです。\n"
+            "何卒よろしくお願い申し上げます。"
+        )
+        self.assertEqual(G.find_tone_violations(clean), [])
+
+    def test_polite_variants_do_not_trigger(self):
+        # near-misses of the blocklist that are legitimate keigo
+        self.assertEqual(G.find_tone_violations("お送りさせていただきます。"), [])
+        self.assertEqual(G.find_tone_violations("ご確認くださいませ。"), [])
+        self.assertEqual(G.find_tone_violations("超音波機器を扱っております。"), [])
+        self.assertEqual(G.find_tone_violations("よろしくお願いいたします。"), [])
+
+    def test_dedup_and_cap(self):
+        body = "ぶっちゃけ、" * 20
+        out = G.find_tone_violations(body)
+        self.assertEqual(out, ["ぶっちゃけ"])
+
+    def test_empty_is_clean(self):
+        self.assertEqual(G.find_tone_violations(""), [])
+        self.assertEqual(G.find_tone_violations(None), [])

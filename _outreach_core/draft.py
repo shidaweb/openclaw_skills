@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from _outreach_core import content_guard
 from _outreach_core import prompt as prompt_mod
 
 
@@ -55,7 +56,17 @@ def hard_truncate_draft(draft: dict[str, Any], max_chars: int) -> dict[str, Any]
     keep = max(keep, max_chars // 2)
     head_text = "\n".join(head)
     if len(head_text) > keep:
-        head_text = head_text[: keep - 1].rstrip() + "…"
+        # v31 §WS4a — cut at the last sentence boundary at or before ``keep``
+        # so the body doesn't end mid-sentence right before the CTA (an
+        # ungrammatical 「…ご提案が可能で…」 reads as broken Japanese). Fall
+        # back to the raw char cut + … only when honoring the boundary would
+        # drop more than half the budget.
+        window = head_text[:keep]
+        boundary = max(window.rfind(t) for t in "。．！？!?")
+        if boundary >= keep // 2:
+            head_text = window[: boundary + 1]
+        else:
+            head_text = window[: keep - 1].rstrip() + "…"
     new_body = head_text
     if tail:
         new_body = new_body + "\n" + "\n".join(tail)
@@ -161,6 +172,45 @@ def opening_too_similar(
                 break
             common += 1
         if common >= min_common_prefix:
+            return True
+    return False
+
+
+# --- v31 §WS4b: body-level duplication guard ---------------------------------
+def _normalize_body_for_similarity(body: str | None) -> str:
+    """Whole-body normalization for trigram comparison (pure)."""
+    return re.sub(r"[\s　、。．，,！!？?・「」（）()]", "", (body or "").strip())
+
+
+def _char_trigrams(text: str) -> set[str]:
+    if len(text) < 3:
+        return {text} if text else set()
+    return {text[i:i + 3] for i in range(len(text) - 2)}
+
+
+def body_too_similar(
+    body: str | None,
+    recent_bodies: list[str] | None,
+    *,
+    threshold: float = 0.62,
+) -> bool:
+    """True when the WHOLE body overlaps a recent send too much (pure).
+
+    v31 §WS4b — ``opening_too_similar`` checks only the first sentence, so
+    two drafts with distinct openers but identical middle/closing boilerplate
+    passed; the template smell the guard exists to kill survived below line
+    one. Char-trigram Jaccard over the normalized body catches that without
+    penalizing legitimately-shared short phrases.
+    """
+    mine = _char_trigrams(_normalize_body_for_similarity(body))
+    if not mine:
+        return False
+    for prev in recent_bodies or []:
+        theirs = _char_trigrams(_normalize_body_for_similarity(prev))
+        if not theirs:
+            continue
+        union = len(mine | theirs)
+        if union and len(mine & theirs) / union >= threshold:
             return True
     return False
 
@@ -347,27 +397,61 @@ def stage_draft(
 
         # v15 §L2: opening-duplication guard — when the opener matches a recent
         # send too closely, force ONE extra refine pass so each company gets a
-        # distinct opening (template smell kills reply rates).
-        if (
-            draft.get("subject") != "SKIP"
-            and refine_fn
-            and opening_too_similar(draft.get("body"), recent_bodies)
-        ):
-            print(f"[draft] ({label}) opening too similar to a recent send — forcing refine")
-            ev.emit(
-                "draft.opening_duplicate",
-                stage="draft",
-                target_id=target_id,
-                payload={"opening": normalize_opening(draft.get("body"))[:60]},
-                trace_dir=trace,
-            )
-            re_refined = refine_fn(lead, draft, config, max_chars)
-            if re_refined and re_refined.get("body"):
-                draft = {
-                    "subject": re_refined.get("subject") or draft.get("subject"),
-                    "body": re_refined["body"],
-                    "_dedup_refined": True,
-                }
+        # distinct opening (template smell kills reply rates). v31 §WS4b adds
+        # the whole-body trigram guard: distinct openers with an identical
+        # middle/closing boilerplate are the same template smell.
+        if draft.get("subject") != "SKIP" and refine_fn:
+            dup_reason = ""
+            if opening_too_similar(draft.get("body"), recent_bodies):
+                dup_reason = "opening"
+            elif body_too_similar(draft.get("body"), recent_bodies):
+                dup_reason = "body"
+            if dup_reason:
+                print(f"[draft] ({label}) {dup_reason} too similar to a recent send "
+                      "— forcing refine")
+                ev.emit(
+                    "draft.opening_duplicate" if dup_reason == "opening"
+                    else "draft.body_duplicate",
+                    stage="draft",
+                    target_id=target_id,
+                    payload={"opening": normalize_opening(draft.get("body"))[:60]},
+                    trace_dir=trace,
+                )
+                re_refined = refine_fn(lead, draft, config, max_chars)
+                if re_refined and re_refined.get("body"):
+                    draft = {
+                        "subject": re_refined.get("subject") or draft.get("subject"),
+                        "body": re_refined["body"],
+                        "_dedup_refined": True,
+                    }
+
+        # v31 §WS4c — deterministic tone lint. A casual verb ending / NG word
+        # in a Japanese B2B inquiry is a reply-rate killer no prompt fully
+        # prevents; on a hit, force one refine pass naming the fragments.
+        if draft.get("subject") != "SKIP" and refine_fn:
+            violations = content_guard.find_tone_violations(draft.get("body"))
+            if violations:
+                print(f"[draft] ({label}) tone lint hit: "
+                      f"{', '.join(violations[:4])} — forcing refine")
+                ev.emit(
+                    "draft.tone_lint",
+                    stage="draft",
+                    target_id=target_id,
+                    payload={"violations": violations[:6]},
+                    trace_dir=trace,
+                )
+                re_refined = refine_fn(lead, draft, config, max_chars)
+                if re_refined and re_refined.get("body"):
+                    if not content_guard.find_tone_violations(re_refined.get("body")):
+                        draft = {
+                            "subject": re_refined.get("subject") or draft.get("subject"),
+                            "body": re_refined["body"],
+                            "_tone_refined": True,
+                        }
+                    else:
+                        # refine did not clean it up — keep the original and
+                        # let the event flag it rather than looping.
+                        print(f"[draft] ({label}) tone lint still dirty after refine")
 
         if draft.get("subject") != "SKIP":
             draft = enforce_char_limit(
