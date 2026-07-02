@@ -398,6 +398,35 @@ def watchdog_liveness_line(skills_root: Path | None = None) -> str:
     )
 
 
+def watchdog_error_line(skills_root: Path | None = None) -> str | None:
+    """v32 FX5 — surface a non-empty ``data/watchdog.err`` as a warning line.
+
+    The watchdog once died on an import error and stderr silently accumulated
+    in watchdog.err for a MONTH while every ping said nothing. Any content in
+    that file means the launchd job hit stderr at least once since install —
+    worth a human glance. Returns None when the file is absent/empty.
+    """
+    root = skills_root or SKILLS_ROOT
+    path = root / "data" / "watchdog.err"
+    try:
+        if not path.is_file():
+            return None
+        size = path.stat().st_size
+        if size <= 0:
+            return None
+        tail = ""
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            lines = [ln.strip() for ln in fh.readlines() if ln.strip()]
+        if lines:
+            tail = lines[-1][:160]
+    except OSError:
+        return None
+    return (
+        f"🐶 watchdog.err: ⚠ 内容あり（{size} bytes / 最終行: {tail or '?'}）"
+        " — import失敗等の可能性。中身を確認し、解消後は truncate してください"
+    )
+
+
 def _opportunistic_watchdog_ensure(skills_root: Path | None = None) -> None:
     """Whenever a human pings, take the chance to re-ensure the watchdog is
     installed+loaded. A second, independent recovery path for a dead watchdog.
@@ -439,6 +468,9 @@ def _refresh_then_read() -> dict[str, Any] | None:
 def cmd_ping(_args: argparse.Namespace) -> int:
     print(format_ping_line(_refresh_then_read()))
     print(watchdog_liveness_line())
+    err_line = watchdog_error_line()
+    if err_line:
+        print(err_line)
     _opportunistic_watchdog_ensure()
     return 0
 
@@ -447,6 +479,9 @@ def cmd_status(_args: argparse.Namespace) -> int:
     print(format_status(_refresh_then_read()))
     print("")
     print(watchdog_liveness_line())
+    err_line = watchdog_error_line()
+    if err_line:
+        print(err_line)
     _opportunistic_watchdog_ensure()
     return 0
 
@@ -558,9 +593,14 @@ def cmd_stale(args: argparse.Namespace) -> int:
     rows = collect_host_health()
     stale = find_stale_hosts(rows, threshold_sec=threshold)
     print(format_stale_report(rows, stale, threshold_sec=threshold))
+    # v32 FX5 — this is the only cron-able healthcheck command, so a dead/
+    # erroring watchdog must surface (and exit non-zero) here too.
+    err_line = watchdog_error_line()
+    if err_line:
+        print(err_line)
     # Exit 2 (distinct from ``error``=1) when stale hosts exist so cron /
     # Slack glue can branch on it cleanly.
-    return 2 if stale else 0
+    return 2 if (stale or err_line) else 0
 
 
 def main() -> None:

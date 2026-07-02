@@ -26,4 +26,11 @@ if ! "$PY" -c "import pytest" >/dev/null 2>&1; then
   "$PY" -m pip install --quiet pytest pyyaml
 fi
 
+# v32 FX5 — syntax gate BEFORE pytest. The watchdog LaunchAgent imports
+# _outreach_core with the production interpreter; a stray tab/3.10-only
+# syntax once killed it silently for a month (data/watchdog.err TabError).
+# compileall catches that class in seconds, on the same interpreter pytest
+# uses.
+"$PY" -m compileall -q _outreach_core jp-form-outreach/run.py linkedin-outreach/run.py
+
 exec "$PY" -m pytest _outreach_core/tests "$@"

@@ -13,7 +13,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        # 3.9 first: it is the PRODUCTION interpreter (jp-form-outreach/.venv
+        # and the watchdog LaunchAgent both run 3.9 on the Mac mini). The
+        # watchdog once died silently for a month on a syntax error that only
+        # a 3.9 import would surface — CI must test what production runs.
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python ${{ matrix.python-version }}

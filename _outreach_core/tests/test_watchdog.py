@@ -577,5 +577,40 @@ class TestEnsureWatchdogInstalled(unittest.TestCase):
         self.assertNotIn("{{PATH}}", out)
 
 
+class TestPreferredWatchdogPython(unittest.TestCase):
+    """v32 FX5 — the plist must bake the venv python when present."""
+
+    def test_prefers_executable_venv_python(self) -> None:
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            venv_py = root / "jp-form-outreach" / ".venv" / "bin" / "python3"
+            venv_py.parent.mkdir(parents=True)
+            venv_py.write_text("#!/bin/sh\n")
+            os.chmod(venv_py, 0o755)
+            self.assertEqual(wd.preferred_watchdog_python(root), str(venv_py))
+
+    def test_falls_back_to_sys_executable(self) -> None:
+        import sys
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(
+                wd.preferred_watchdog_python(Path(tmp)), sys.executable
+            )
+
+    def test_non_executable_venv_python_is_skipped(self) -> None:
+        import os
+        import sys
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            venv_py = root / "jp-form-outreach" / ".venv" / "bin" / "python3"
+            venv_py.parent.mkdir(parents=True)
+            venv_py.write_text("")
+            os.chmod(venv_py, 0o644)
+            self.assertEqual(wd.preferred_watchdog_python(root), sys.executable)
+
+
 if __name__ == "__main__":
     unittest.main()

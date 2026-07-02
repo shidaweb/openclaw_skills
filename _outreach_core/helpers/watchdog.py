@@ -622,14 +622,30 @@ def watchdog_template_path(skills_root: Path | None = None) -> Path:
     return root / "scripts" / "com.doorman.watchdog.plist.template"
 
 
+def preferred_watchdog_python(skills_root: Path | None = None) -> str:
+    """v32 FX5 — the interpreter the watchdog plist should bake in.
+
+    Prefer the skill venv (stable path + the deps the test suite runs on)
+    over whatever python happened to run the ensure/install step: the old
+    ``sys.executable`` re-baked the caller's interpreter, so a self-heal from
+    a random shell could silently switch the watchdog's python.
+    """
+    root = skills_root or SKILLS_ROOT
+    venv_python = root / "jp-form-outreach" / ".venv" / "bin" / "python3"
+    if venv_python.is_file() and os.access(venv_python, os.X_OK):
+        return str(venv_python)
+    return sys.executable
+
+
 def render_watchdog_plist(skills_root: Path | None = None) -> str:
     """Render the watchdog LaunchAgent plist from the template, baking in the
-    SKILLS dir, this Python, and a PATH that can actually find ``openclaw``."""
+    SKILLS dir, the preferred Python (venv first), and a PATH that can
+    actually find ``openclaw``."""
     root = skills_root or SKILLS_ROOT
     tpl = watchdog_template_path(root).read_text(encoding="utf-8")
     return (
         tpl.replace("{{SKILLS_DIR}}", str(root))
-        .replace("{{PYTHON3}}", sys.executable)
+        .replace("{{PYTHON3}}", preferred_watchdog_python(root))
         .replace("{{PATH}}", gwcfg.augmented_path())
     )
 

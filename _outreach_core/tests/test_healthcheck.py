@@ -102,5 +102,34 @@ class TestHealthcheck(unittest.TestCase):
             self.assertTrue(health_path.is_file())
 
 
+class TestWatchdogErrorLine(unittest.TestCase):
+    """v32 FX5 — a non-empty watchdog.err must be visible (it once hid a
+    month-long watchdog outage)."""
+
+    def test_missing_file_is_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(hc.watchdog_error_line(Path(tmp)))
+
+    def test_empty_file_is_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "data").mkdir()
+            (root / "data" / "watchdog.err").write_text("")
+            self.assertIsNone(hc.watchdog_error_line(root))
+
+    def test_nonempty_file_surfaces_last_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "data").mkdir()
+            (root / "data" / "watchdog.err").write_text(
+                "Traceback (most recent call last):\n"
+                "TabError: inconsistent use of tabs and spaces in indentation\n"
+            )
+            line = hc.watchdog_error_line(root)
+            self.assertIsNotNone(line)
+            self.assertIn("watchdog.err", line)
+            self.assertIn("TabError", line)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5,7 +5,14 @@
 set -euo pipefail
 
 SKILLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHON3="$(command -v python3)"
+# v32 FX5 — prefer the skill venv python (stable path, matches what the test
+# suite runs on) over whatever python3 the installing shell resolves. The
+# watchdog imports _outreach_core; drifting interpreters was how a syntax
+# error killed it silently for a month.
+PYTHON3="$SKILLS_DIR/jp-form-outreach/.venv/bin/python3"
+if [[ ! -x "$PYTHON3" ]]; then
+  PYTHON3="$(command -v python3)"
+fi
 LABEL="com.doorman.watchdog"
 PLIST_DST="$HOME/Library/LaunchAgents/${LABEL}.plist"
 UID_NUM="$(id -u)"
