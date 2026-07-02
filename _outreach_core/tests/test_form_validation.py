@@ -384,3 +384,73 @@ class TestAriaSnapshotLeakage(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHyphenateJpPhone(unittest.TestCase):
+    """v31 §WS5b — area-code-aware hyphenation tables."""
+
+    def test_two_digit_area_codes(self) -> None:
+        self.assertEqual(fv.hyphenate_jp_phone("0312345678"), "03-1234-5678")
+        self.assertEqual(fv.hyphenate_jp_phone("0612345678"), "06-1234-5678")
+
+    def test_three_digit_area_codes(self) -> None:
+        # the legacy 2-4-4 was wrong for these
+        self.assertEqual(fv.hyphenate_jp_phone("0431234567"), "043-123-4567")
+        self.assertEqual(fv.hyphenate_jp_phone("0451234567"), "045-123-4567")
+        self.assertEqual(fv.hyphenate_jp_phone("0521234567"), "052-123-4567")
+
+    def test_free_dial(self) -> None:
+        self.assertEqual(fv.hyphenate_jp_phone("0120345678"), "0120-345-678")
+        self.assertEqual(fv.hyphenate_jp_phone("0800123456"), "0800-123-456")
+
+    def test_mobile_and_ip(self) -> None:
+        self.assertEqual(fv.hyphenate_jp_phone("09012345678"), "090-1234-5678")
+        self.assertEqual(fv.hyphenate_jp_phone("05012345678"), "050-1234-5678")
+
+    def test_non_phone_passthrough(self) -> None:
+        self.assertEqual(fv.hyphenate_jp_phone("12345"), "12345")
+        self.assertEqual(fv.hyphenate_jp_phone("1234567890"), "1234567890")  # no leading 0
+        self.assertEqual(fv.hyphenate_jp_phone(""), "")
+
+
+class TestPhoneFormatCandidates(unittest.TestCase):
+    def test_from_hyphenated(self) -> None:
+        cands = fv.phone_format_candidates("043-123-4567")
+        self.assertEqual(cands[0], "0431234567")
+        self.assertNotIn("043-123-4567", cands)  # current excluded
+        self.assertEqual(len(cands), len(set(cands)))  # deduped
+
+    def test_from_digits_only(self) -> None:
+        cands = fv.phone_format_candidates("0431234567")
+        self.assertEqual(cands[0], "043-123-4567")  # area-aware first
+        self.assertIn("04-3123-4567", cands)        # legacy toggle last
+
+    def test_non_phone_yields_nothing(self) -> None:
+        self.assertEqual(fv.phone_format_candidates("abc"), [])
+        self.assertEqual(fv.phone_format_candidates(""), [])
+
+
+class TestZenkakuFixAllowed(unittest.TestCase):
+    """v31 §WS5a — guard corpus."""
+
+    def test_address_value_allowed(self) -> None:
+        self.assertTrue(fv.zenkaku_fix_allowed("addr2", "住所（番地）", "1-2-3", "text"))
+
+    def test_protected_input_types(self) -> None:
+        for t in ("email", "url", "tel", "number"):
+            self.assertFalse(fv.zenkaku_fix_allowed("f", "住所", "abc", t))
+
+    def test_protected_context_keywords(self) -> None:
+        self.assertFalse(fv.zenkaku_fix_allowed("mail_addr", "", "abc", "text"))
+        self.assertFalse(fv.zenkaku_fix_allowed("f", "メールアドレス", "abc", "text"))
+        self.assertFalse(fv.zenkaku_fix_allowed("f", "ホームページURL", "abc", "text"))
+        self.assertFalse(fv.zenkaku_fix_allowed("f", "電話番号", "0311112222", "text"))
+        self.assertFalse(fv.zenkaku_fix_allowed("f", "郵便番号", "2600003", "text"))
+
+    def test_protected_value_shapes(self) -> None:
+        self.assertFalse(fv.zenkaku_fix_allowed("f", "住所", "shida@torana.co.jp", "text"))
+        self.assertFalse(fv.zenkaku_fix_allowed("f", "住所", "https://torana.co.jp", "text"))
+        self.assertFalse(fv.zenkaku_fix_allowed("f", "住所", "043-123-4567", "text"))
+
+    def test_empty_value_rejected(self) -> None:
+        self.assertFalse(fv.zenkaku_fix_allowed("f", "住所", "", "text"))

@@ -569,6 +569,46 @@ def has_validation_errors(text: str | None) -> bool:
     return bool(parse_validation_errors(text))
 
 
+# v31 §WS5a — zenkaku conversion guard. The zenkaku fixer used to full-width
+# EVERYTHING ASCII in any input whose row context matched the error field
+# name; an email / URL / phone that legitimately must stay hankaku could be
+# corrupted when it sat in a plain text-typed input inside a matching row.
+_ZENKAKU_PROTECTED_TYPES = frozenset({"email", "url", "tel", "number"})
+_ZENKAKU_PROTECTED_CTX_RE = re.compile(
+    r"(mail|メール|url|http|ホームページ|website|サイト|\btel\b|電話|fax|"
+    r"ファックス|ファクス|携帯|郵便番号|postal|zip)",
+    re.IGNORECASE,
+)
+_PHONE_LIKE_VALUE_RE = re.compile(r"^[0-9０-９\-‐－ー+() 　.]{8,}$")
+
+
+def zenkaku_fix_allowed(
+    name: str | None,
+    label_ctx: str | None,
+    value: str | None,
+    input_type: str | None = None,
+) -> bool:
+    """May the zenkaku fixer full-width this field's value? (pure, v31 §WS5a)
+
+    Rejects fields whose type/name/context says email/URL/tel/postal, and
+    values that structurally look like an email, URL, or phone number —
+    those must stay hankaku regardless of what the error message matched.
+    """
+    if (input_type or "").strip().lower() in _ZENKAKU_PROTECTED_TYPES:
+        return False
+    blob = f"{name or ''} {label_ctx or ''}"
+    if _ZENKAKU_PROTECTED_CTX_RE.search(blob):
+        return False
+    v = (value or "").strip()
+    if not v:
+        return False
+    if "@" in v or "://" in v:
+        return False
+    if _PHONE_LIKE_VALUE_RE.match(v):
+        return False
+    return True
+
+
 def to_zenkaku(value: str | None) -> str:
     """Convert ASCII chars (digits, letters, symbols, space) to full-width.
 
@@ -640,6 +680,58 @@ def toggle_phone_hyphens(value: str | None) -> str:
     if len(digits) == 11:  # 090-1234-5678 / 0120-345-678 style → 3-4-4
         return f"{digits[:3]}-{digits[3:7]}-{digits[7:]}"
     return f"{digits[:2]}-{digits[2:6]}-{digits[6:]}"  # 10 digits → 2-4-4
+
+
+# v31 §WS5b — area-code-aware hyphenation. toggle_phone_hyphens only knows
+# 2-4-4 (10 digits) / 3-4-4 (11 digits); a form validating real JP area-code
+# grouping rejects 045/052/011-style numbers hyphenated as 2-4-4, and the
+# toggle then just oscillates between the same two wrong formats forever.
+# 03 (東京) and 06 (大阪) only. "04" also exists (柏/所沢) but is ambiguous
+# with the far-more-common 3-digit 04x codes (043 千葉, 045 横浜, 042 …), so
+# 04x numbers hyphenate as 3-3-4 — correct for the overwhelming majority.
+_TWO_DIGIT_AREA_CODES = ("03", "06")
+_FREE_DIAL_PREFIXES = ("0120", "0800")
+
+
+def hyphenate_jp_phone(digits: str | None) -> str:
+    """Hyphenate a digits-only JP phone number using area-code rules.
+
+    10 digits: 03/04/06 → 2-4-4; 0120/0800 free dial → 4-3-3; other 0xx
+    area codes → 3-3-4. 11 digits (mobile/050/IP) → 3-4-4. Anything that
+    isn't a plausible digits-only JP number is returned unchanged.
+    """
+    d = (digits or "").strip()
+    if not d.isdigit() or not d.startswith("0") or not 10 <= len(d) <= 11:
+        return d
+    if len(d) == 11:
+        return f"{d[:3]}-{d[3:7]}-{d[7:]}"
+    if d.startswith(_FREE_DIAL_PREFIXES):
+        return f"{d[:4]}-{d[4:7]}-{d[7:]}"
+    if d.startswith(_TWO_DIGIT_AREA_CODES):
+        return f"{d[:2]}-{d[2:6]}-{d[6:]}"
+    return f"{d[:3]}-{d[3:6]}-{d[6:]}"
+
+
+def phone_format_candidates(value: str | None) -> list[str]:
+    """Ordered alternative formats for a phone value (v31 §WS5b).
+
+    Deduped, excluding the current value, so a validation bounce can try a
+    NEW format each round instead of toggling between the same two:
+    digits-only first (most widely accepted), then area-code-aware
+    hyphenation, then the legacy naive toggle as a last resort.
+    """
+    v = (value or "").strip()
+    if not v:
+        return []
+    digits = re.sub(r"[-‐－ー\s().（）]", "", v)
+    if not digits.isdigit() or not 10 <= len(digits) <= 11:
+        return []
+    candidates = [digits, hyphenate_jp_phone(digits), toggle_phone_hyphens(digits)]
+    out: list[str] = []
+    for c in candidates:
+        if c and c != v and c not in out:
+            out.append(c)
+    return out
 
 
 # --- v15 §S2: special field value helpers ------------------------------------

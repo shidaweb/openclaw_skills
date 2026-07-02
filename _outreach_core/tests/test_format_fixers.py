@@ -119,3 +119,91 @@ class TestParseProductionFormatErrors(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestZenkakuGuard(unittest.TestCase):
+    """v31 §WS5a — harvest→decide→apply zenkaku fixer with the pure guard."""
+
+    def _run_fixer(self, rows):
+        applied: list[tuple] = []
+
+        def _apply(name, action, value):
+            applied.append((name, action, value))
+            return {"ok": True}
+
+        with mock.patch.object(run, "_evaluate", return_value=rows), \
+                mock.patch.object(run, "_apply_field_action", side_effect=_apply):
+            res = run._fix_zenkaku_errors([{"field": "住所（番地）", "kind": "zenkaku"}])
+        return res, applied
+
+    def test_address_field_is_converted(self) -> None:
+        res, applied = self._run_fixer([
+            {"name": "addr2", "value": "1-2-3", "ctx": "住所（番地）", "type": "text"},
+        ])
+        self.assertEqual(len(res), 1)
+        self.assertEqual(applied[0][2], "１－２－３")
+
+    def test_email_in_text_input_is_protected(self) -> None:
+        # the production hazard: an email in a text-typed input inside a
+        # matching row used to be corrupted to full-width
+        res, applied = self._run_fixer([
+            {"name": "email2", "value": "shida@torana.co.jp",
+             "ctx": "住所（番地）メールアドレス", "type": "text"},
+        ])
+        self.assertEqual(res, [])
+        self.assertEqual(applied, [])
+
+    def test_email_type_is_protected_regardless_of_ctx(self) -> None:
+        res, applied = self._run_fixer([
+            {"name": "m", "value": "abc", "ctx": "住所（番地）", "type": "email"},
+        ])
+        self.assertEqual(res, [])
+
+    def test_phone_like_value_is_protected(self) -> None:
+        res, applied = self._run_fixer([
+            {"name": "t", "value": "043-123-4567", "ctx": "住所（番地）", "type": "text"},
+        ])
+        self.assertEqual(res, [])
+
+    def test_url_value_is_protected(self) -> None:
+        res, applied = self._run_fixer([
+            {"name": "hp", "value": "https://torana.co.jp",
+             "ctx": "住所（番地）", "type": "text"},
+        ])
+        self.assertEqual(res, [])
+
+
+class TestPhoneFormatRotation(unittest.TestCase):
+    """v31 §WS5b — validation bounces walk NEW formats instead of toggling."""
+
+    ERRORS = [{"field": "電話番号", "kind": "format"}]
+
+    def _run_fixer(self, value, round_idx):
+        applied: list[tuple] = []
+
+        def _apply(name, action, v):
+            applied.append((name, action, v))
+            return {"ok": True}
+
+        rows = [{"name": "tel", "value": value}]
+        with mock.patch.object(run, "_evaluate", return_value=rows), \
+                mock.patch.object(run, "_apply_field_action", side_effect=_apply):
+            run._fix_phone_format_errors(self.ERRORS, round_idx=round_idx)
+        return applied[0][2] if applied else None
+
+    def test_round0_strips_hyphens(self) -> None:
+        self.assertEqual(self._run_fixer("043-123-4567", 0), "0431234567")
+
+    def test_round1_tries_second_candidate(self) -> None:
+        # hyphenated current: candidates = [digits, legacy 2-4-4 toggle]
+        # (area-aware 3-3-4 equals the current value so it's excluded)
+        self.assertEqual(self._run_fixer("043-123-4567", 1), "04-3123-4567")
+
+    def test_digits_only_round0_is_area_code_aware(self) -> None:
+        # 043 is a 3-digit area code → 3-3-4, not the legacy 2-4-4
+        self.assertEqual(self._run_fixer("0431234567", 0), "043-123-4567")
+
+    def test_rounds_wrap_around(self) -> None:
+        first = self._run_fixer("0431234567", 0)
+        wrapped = self._run_fixer("0431234567", 2)
+        self.assertEqual(first, wrapped)  # 2 candidates → round 2 wraps to 0

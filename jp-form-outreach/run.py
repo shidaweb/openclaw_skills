@@ -3261,16 +3261,17 @@ _PHONE_INPUTS_JS = r"""
 """
 
 
-# Convert ASCII→full-width in inputs whose label/row context matches a zenkaku
-# validation error (「住所（番地）は全角で入力してください」 — wacoal class, v26).
-_FIX_ZENKAKU_JS_TMPL = r"""
+# Harvest inputs whose label/row context matches a zenkaku validation error
+# (「住所（番地）は全角で入力してください」 — wacoal class, v26). v31 §WS5a:
+# this JS only OBSERVES — the convert/skip decision moved to the pure
+# fv.zenkaku_fix_allowed (harvest → decide in Python → apply), matching the
+# _fix_hiragana_errors structure, so an email/URL/phone in a text-typed input
+# inside a matching row can no longer be corrupted to full-width.
+_ZENKAKU_CANDIDATES_JS_TMPL = r"""
 (() => {
   const fields = __FIELDS__;
-  const toZ = (s) => s
-    .replace(/[!-~]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 0xFEE0))
-    .replace(/ /g, '　');
   const out = [];
-  for (const el of document.querySelectorAll('input[type="text"], input:not([type]), textarea')) {
+  for (const el of document.querySelectorAll('input[type="text"], input:not([type]), input[type="email"], input[type="url"], input[type="tel"], textarea')) {
     const v = String(el.value || '');
     if (!v || !/[!-~]/.test(v)) continue;
     let ctx = (el.name || '') + ' ' + (el.placeholder || '');
@@ -3287,14 +3288,12 @@ _FIX_ZENKAKU_JS_TMPL = r"""
     }
     ctx = ctx.replace(/\s+/g, '');
     if (!fields.some((f) => f && ctx.includes(f))) continue;
-    const nv = toZ(v);
-    if (nv === v) continue;
-    const proto = el.tagName === 'TEXTAREA'
-      ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
-    Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, nv);
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-    out.push({ name: el.name || el.id || '', value: nv.slice(0, 40) });
+    out.push({
+      name: el.name || el.id || '',
+      value: v,
+      ctx: ctx.slice(0, 160),
+      type: (el.type || '').toLowerCase(),
+    });
   }
   return out;
 })()
@@ -3303,6 +3302,8 @@ _FIX_ZENKAKU_JS_TMPL = r"""
 
 def _fix_zenkaku_errors(errors: list[dict[str, Any]]) -> list[str]:
     """ASCII→全角 conversion for fields named by zenkaku validation errors."""
+    from _outreach_core import form_validation as fv
+
     try:
         fields = [
             re.sub(r"\s+", "", str(e.get("field") or ""))
@@ -3311,15 +3312,30 @@ def _fix_zenkaku_errors(errors: list[dict[str, Any]]) -> list[str]:
         fields = [f for f in fields if len(f) >= 2]
         if not fields:
             return []
-        js = _FIX_ZENKAKU_JS_TMPL.replace(
+        js = _ZENKAKU_CANDIDATES_JS_TMPL.replace(
             "__FIELDS__", json.dumps(fields, ensure_ascii=False)
         )
         rows = _evaluate(js)
-        return [
-            f"zenkaku:{(r.get('name') or '?')[:24]}={r.get('value')}"
-            for r in (rows if isinstance(rows, list) else [])
-            if isinstance(r, dict)
-        ]
+        fixed: list[str] = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name") or "").strip()
+            cur = str(row.get("value") or "")
+            if not name or not cur:
+                continue
+            # v31 §WS5a — pure guard: never full-width email/URL/tel/postal.
+            if not fv.zenkaku_fix_allowed(
+                name, str(row.get("ctx") or ""), cur, str(row.get("type") or "")
+            ):
+                continue
+            new = fv.to_zenkaku(cur)
+            if new == cur:
+                continue
+            out = _apply_field_action(name, "set_text", new)
+            if out and out.get("ok"):
+                fixed.append(f"zenkaku:{name[:24]}={new[:40]}")
+        return fixed
     except Exception:  # noqa: BLE001 — recovery must not abort the send loop
         return []
 
@@ -3390,10 +3406,15 @@ def _fix_hiragana_errors(errors: list[dict[str, Any]]) -> list[str]:
         return []
 
 
-def _fix_phone_format_errors(errors: list[dict[str, Any]]) -> list[str]:
-    """Toggle hyphen format on phone inputs when a format error names them.
+def _fix_phone_format_errors(
+    errors: list[dict[str, Any]], round_idx: int = 0
+) -> list[str]:
+    """Try a NEW phone format when a format error names a phone field.
 
-    Returns diagnostics entries for every field rewritten. Never raises.
+    v31 §WS5b — ``round_idx`` (the caller's validation_rounds counter) walks
+    the ordered candidate list (digits-only → area-code-aware hyphenation →
+    legacy toggle) so consecutive bounces try different formats instead of
+    oscillating between the same two. Never raises.
     """
     from _outreach_core import form_validation as fv
 
@@ -3412,7 +3433,10 @@ def _fix_phone_format_errors(errors: list[dict[str, Any]]) -> list[str]:
             cur = str(row.get("value") or "").strip()
             if not name or not cur:
                 continue
-            new = fv.toggle_phone_hyphens(cur)
+            candidates = fv.phone_format_candidates(cur)
+            if not candidates:
+                continue
+            new = candidates[max(0, int(round_idx)) % len(candidates)]
             if new == cur:
                 continue
             out = _apply_field_action(name, "set_text", new)
@@ -3430,6 +3454,7 @@ def _harvest_and_fix_validation_errors(
     *,
     stage: str = "send",
     trace_dir: Path | None = None,
+    round_idx: int = 0,
 ) -> dict[str, Any]:
     """After a submit click, read the page's own inline validation errors and try
     to fix them deterministically (furigana script, required subject), then report
@@ -3475,7 +3500,7 @@ def _harvest_and_fix_validation_errors(
     sender = config.get("sender", {}) or {}
     diagnostics: dict[str, Any] = {"filled": [], "warnings": []}
     summary = _apply_fill_guardrails(target, sender, body, diagnostics)
-    phone_fixed = _fix_phone_format_errors(errors)
+    phone_fixed = _fix_phone_format_errors(errors, round_idx=round_idx)
     zenkaku_fixed = _fix_zenkaku_errors(errors)
     # v30 next — convert kana fields to hiragana when the page surfaces
     # 「ひらがなのみで入力してください」. Pairs with the parser's new
@@ -7344,8 +7369,11 @@ def _submission_loop(
 
         if state == "validation_error":
             validation_rounds += 1
+            # v31 §WS5b — round index rotates the phone-format candidates so
+            # bounce N tries format N instead of oscillating between two.
             vfix = _harvest_and_fix_validation_errors(
                 d, config, send_body, stage="send", trace_dir=trace,
+                round_idx=validation_rounds - 1,
             )
             native = _snapshot_native_validation(
                 trace_dir=trace, target_id=tid, phase="validation_error",
