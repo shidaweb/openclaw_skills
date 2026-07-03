@@ -38,6 +38,7 @@ from _outreach_core import captcha as core_captcha
 from _outreach_core import content_guard as core_content_guard
 from _outreach_core import contact_url as core_contact_url
 from _outreach_core import form_validation as fv
+from _outreach_core import gateway_gate as core_gateway_gate
 from _outreach_core import outcomes as core_outcomes
 from _outreach_core import resolve_queue as core_resolve_queue
 from _outreach_core import run_progress as core_progress
@@ -6499,6 +6500,80 @@ def _tab_is_open(target_id: str) -> bool:
     return core_tab_utils.is_tab_open(_list_tabs_payload(), target_id)
 
 
+# --- v32 FX4: gateway-outage grace gate --------------------------------------
+def _gateway_alive() -> bool:
+    """One cheap probe: can the shared gateway list tabs right now?"""
+    return _list_tabs_payload() is not None
+
+
+def _wait_for_gateway(hb: Any = None, *, reason: str = "") -> bool:
+    """Block until the shared gateway responds, within the wait budget.
+
+    Returns True on recovery (or if it was never down). Returns False when
+    the budget (default 45 min — covers the watchdog's worst-case burn-the-
+    budget + 30-min-abandoned-cooldown cycle) is exhausted; the caller then
+    raises GatewayUnavailableError so the run terminates with a CLEAR
+    message instead of grinding every remaining target into lead_crashed.
+
+    Each poll writes ``hb.note`` — a main-thread forward-progress signal —
+    so the FX1 stall detector correctly reads "waiting" as alive. A wedged
+    main thread cannot fake this.
+    """
+    if _gateway_alive():
+        return True
+    started = time.time()
+    limit = core_gateway_gate.wait_sec()
+    poll = core_gateway_gate.poll_sec()
+    print(f"  [send] ⚠ gateway応答なし — 復旧待機を開始 "
+          f"(最大{limit}s, poll={poll}s{', reason=' + reason if reason else ''})")
+    try:
+        from _outreach_core.notify import post as _notify_post
+        _notify_post(
+            f"⏸ ブラウザゲートウェイが応答しません。復旧を最大{limit // 60}分待機します"
+            f"（watchdog の再起動サイクルを含む）。{('原因: ' + reason[:120]) if reason else ''}",
+            level="warn",
+        )
+    except Exception:  # noqa: BLE001 — Slack must not break the wait
+        pass
+    _emit_event(
+        "send.gateway_wait", stage="send",
+        payload={"reason": reason[:200], "limit_sec": limit},
+    )
+    while core_gateway_gate.should_keep_waiting(started, time.time(), limit):
+        time.sleep(poll)
+        elapsed = int(time.time() - started)
+        if hb is not None:
+            try:
+                hb.note(f"gateway復旧待ち {elapsed}s")
+            except Exception:  # noqa: BLE001
+                pass
+        if _gateway_alive():
+            print(f"  [send] ✅ gateway復旧を確認（{elapsed}s待機）")
+            try:
+                from _outreach_core.notify import post as _notify_post
+                _notify_post(f"▶️ ブラウザゲートウェイの復旧を確認（{elapsed}s待機）。処理を再開します。")
+            except Exception:  # noqa: BLE001
+                pass
+            _emit_event(
+                "send.gateway_recovered", stage="send",
+                payload={"waited_sec": elapsed},
+            )
+            return True
+    _emit_event(
+        "send.gateway_wait_timeout", stage="send",
+        payload={"waited_sec": int(time.time() - started), "limit_sec": limit},
+    )
+    return False
+
+
+def _ensure_gateway_or_raise(hb: Any = None, *, reason: str = "") -> None:
+    if not _wait_for_gateway(hb, reason=reason):
+        raise core_gateway_gate.GatewayUnavailableError(
+            f"gateway did not recover within {core_gateway_gate.wait_sec()}s"
+            + (f" (trigger: {reason[:120]})" if reason else "")
+        )
+
+
 def _enforce_tab_cap(protect: set[str], cap: int = 12) -> None:
     """Close oldest page tabs beyond ``cap`` except protected (resolver-bound) and
     the newest. Keeps the browser from accumulating unbounded tabs over a batch."""
@@ -8857,6 +8932,11 @@ def stage_send(
                 except Exception:  # noqa: BLE001
                     pass
                 break
+            # v32 FX4 — one cheap gateway probe per target. Catches silent
+            # gateway death BETWEEN targets (watchdog kickstart, overload)
+            # before we open a tab / journal an attempt; waits for recovery
+            # instead of feeding the whole remaining batch into lead_crashed.
+            _ensure_gateway_or_raise(hb, reason="pre_target_check")
             idx = sendable.index(d) + 1
             tid = str(d.get("id") or d.get("name", "?"))
             # v31 §WS8e — batch position for the Slack [i/N] prefix. The
@@ -8950,6 +9030,13 @@ def stage_send(
                     pass
                 _close_tab_safely(d.get("_send_tab_id"))
                 result = {"outcome": "timed_out", "reason": str(exc)}
+                # v32 FX4 — a 300s lead timeout is often the gateway dying
+                # mid-target; wait for recovery before the next target so one
+                # outage doesn't convert the rest of the batch into timeouts.
+                if not _gateway_alive():
+                    _ensure_gateway_or_raise(hb, reason=f"lead_timeout:{tid}")
+            except core_gateway_gate.GatewayUnavailableError:
+                raise  # v32 FX4 — terminal; must not be absorbed as a lead crash
             except Exception as exc:  # noqa: BLE001 — per-lead isolation (v15 §R1)
                 tb = traceback.format_exc()
                 print(f"  [send] ✗ lead crashed: {exc} — continuing with next target",
@@ -8968,6 +9055,11 @@ def stage_send(
                     pass
                 _close_tab_safely(d.get("_send_tab_id"))
                 result = {"outcome": "crashed", "error": str(exc)[:200]}
+                # v32 FX4 — gateway-class crash (tab not found / transport
+                # timeout / page closed): wait for the shared gateway to come
+                # back before touching the next target.
+                if core_gateway_gate.is_gateway_error_text(f"{exc} {tb[-400:]}"):
+                    _ensure_gateway_or_raise(hb, reason=f"lead_crash:{tid}")
             try:
                 payload = core_outcomes.build_target_outcome_payload(
                     target=d,
@@ -9903,4 +9995,21 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except core_gateway_gate.GatewayUnavailableError as exc:
+        # v32 FX4 — the shared gateway stayed down past the wait budget.
+        # Exit 5 tells the supervisor NOT to relaunch (a run restart cannot
+        # revive the gateway — that is the watchdog's job) and not to burn
+        # the crash budget on it.
+        print(f"[run] ❌ gateway unavailable: {exc}", file=sys.stderr)
+        try:
+            from _outreach_core.notify import post as _notify_post
+            _notify_post(
+                "❌ ブラウザゲートウェイが待機時間内に復旧しませんでした。"
+                "run を中断します（watchdog の復旧後に再実行してください）。",
+                level="error",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        sys.exit(core_gateway_gate.EXIT_GATEWAY_UNAVAILABLE)

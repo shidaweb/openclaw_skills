@@ -646,6 +646,24 @@ def _supervise(skill: str, run_id: str, log_path: str, run_args: list[str]) -> i
                 channel_id=channel_id,
             )
             return 3
+        if code == 5:
+            # v32 FX4 — gateway unavailable past the run's wait budget.
+            # Relaunching run.py cannot revive the shared gateway (that is
+            # the watchdog's job), and burning the crash budget here would
+            # exhaust it for real crashes.
+            _job_post(
+                f"❌ ブラウザゲートウェイが復旧しないため中断しました (exit=5)。"
+                f"自動再起動はしません — gateway復旧は watchdog の責務です。"
+                f"復旧確認後に再実行してください: {skill} `{cmd_label}`。ログ: {log_path}",
+                run_id=run_id,
+                skill=skill,
+                log_path=log_path,
+                phase="terminal",
+                level="error",
+                thread_ts=thread_ts,
+                channel_id=channel_id,
+            )
+            return 5
         if code in (2, 4):
             # 2 = CLI/brief usage error, 4 = deterministic quality/completion
             # gate. Replaying the identical command cannot repair either one

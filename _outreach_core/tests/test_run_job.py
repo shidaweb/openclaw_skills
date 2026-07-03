@@ -282,6 +282,19 @@ class TestRunJob(unittest.TestCase):
         problem.assert_called_once()
         self.assertTrue(any(lvl == "error" for lvl, _t in posts))
 
+    def test_supervise_exit5_gateway_unavailable_no_restart(self) -> None:
+        # v32 FX4 — exit 5 = gateway stayed down; relaunching run.py cannot
+        # fix it, so the supervisor must terminate without burning budget.
+        posts: list[tuple[str, str]] = []
+        p1, p2, p3, p4, p5 = self._patches(posts)
+        with p1, p2, p3, p4, p5, mock.patch(
+            "subprocess.Popen", return_value=self._proc_returning(5)
+        ) as popen:
+            code = run_job._supervise("jp-form-outreach", "rid", "/tmp/x.log", ["send"])
+        self.assertEqual(code, 5)
+        self.assertEqual(popen.call_count, 1)  # never restarted
+        self.assertTrue(any("ゲートウェイ" in t for _lvl, t in posts))
+
     def test_supervise_posts_failure_on_spawn_exception(self) -> None:
         posts: list[tuple[str, str]] = []
         p1, p2, p3, p4, p5 = self._patches(posts)
