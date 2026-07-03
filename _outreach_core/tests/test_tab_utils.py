@@ -112,3 +112,81 @@ class TestExtractJson(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _tabs(*ids):
+    return {"tabs": [{"targetId": t, "type": "page", "url": f"https://{t}.co.jp/"}
+                     for t in ids]}
+
+
+class TestClosableOverflowOwned(unittest.TestCase):
+    """v32 FX3 — the per-run cap must be structurally unable to touch a
+    sibling brief's tabs on the shared browser."""
+
+    def test_siblings_tabs_never_returned_even_far_over_global_cap(self):
+        # 6 open tabs, we own only 2, cap 1 → close exactly our oldest own tab
+        payload = _tabs("SIB1", "SIB2", "SIB3", "OWN1", "SIB4", "OWN2")
+        out = T.closable_overflow_owned(
+            payload, owned={"OWN1", "OWN2"}, protect=set(), cap=1
+        )
+        self.assertEqual(out, ["OWN1"])
+        for sib in ("SIB1", "SIB2", "SIB3", "SIB4"):
+            self.assertNotIn(sib, out)
+
+    def test_under_own_cap_closes_nothing(self):
+        payload = _tabs("SIB1", "SIB2", "SIB3", "SIB4", "OWN1")
+        self.assertEqual(
+            T.closable_overflow_owned(payload, owned={"OWN1"}, protect=set(), cap=1),
+            [],
+        )
+
+    def test_protect_and_keep_newest_still_honored(self):
+        payload = _tabs("OWN1", "OWN2", "OWN3", "OWN4")
+        owned = {"OWN1", "OWN2", "OWN3", "OWN4"}
+        out = T.closable_overflow_owned(
+            payload, owned=owned, protect={"OWN1"}, cap=2
+        )
+        # OWN1 protected (resolver), OWN4 newest → OWN2/OWN3 candidates,
+        # over = 2 → both closed
+        self.assertEqual(out, ["OWN2", "OWN3"])
+
+    def test_empty_owned_set_degrades_to_nothing(self):
+        payload = _tabs("SIB1", "SIB2", "SIB3", "SIB4", "SIB5")
+        self.assertEqual(
+            T.closable_overflow_owned(payload, owned=set(), protect=set(), cap=1),
+            [],
+        )
+
+    def test_owned_but_already_closed_ids_ignored(self):
+        payload = _tabs("OWN1")
+        out = T.closable_overflow_owned(
+            payload, owned={"OWN1", "GONE1", "GONE2", "GONE3"}, protect=set(), cap=1
+        )
+        self.assertEqual(out, [])
+
+
+class TestOrphanTabIds(unittest.TestCase):
+    """v32 FX3 — dead-run sweep semantics."""
+
+    def test_dead_run_tabs_minus_resolver_pending(self):
+        out = T.orphan_tab_ids(
+            ["T1", "T2", "T3"],
+            open_page_ids={"T1", "T2", "T3", "UNKNOWN"},
+            resolver_tab_ids={"T2"},   # kept open on purpose for the resolver
+        )
+        self.assertEqual(out, {"T1", "T3"})
+
+    def test_unknown_open_tabs_never_touched(self):
+        out = T.orphan_tab_ids(["T1"], open_page_ids={"UNKNOWN", "T1"},
+                               resolver_tab_ids=set())
+        self.assertEqual(out, {"T1"})
+        self.assertNotIn("UNKNOWN", out)
+
+    def test_already_closed_recorded_tabs_skipped(self):
+        out = T.orphan_tab_ids(["GONE"], open_page_ids={"OTHER"},
+                               resolver_tab_ids=set())
+        self.assertEqual(out, set())
+
+    def test_empty_or_none_record_is_safe(self):
+        self.assertEqual(T.orphan_tab_ids(None, {"T1"}, set()), set())
+        self.assertEqual(T.orphan_tab_ids([], {"T1"}, set()), set())

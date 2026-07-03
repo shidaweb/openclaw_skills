@@ -6454,11 +6454,43 @@ def _tab_isolation_enabled(config: dict[str, Any] | None) -> bool:
     return bool(val)
 
 
+# v32 FX3 — tabs THIS run opened (targetIds). Feeds the per-run tab cap and
+# the owned_tabs.json record siblings use to sweep a DEAD run's leftovers.
+# Advisory only: staleness degrades to "close nothing", never to keeping a
+# wedged run alive or closing an unknown tab.
+_OWNED_TAB_IDS: set[str] = set()
+
+
+def _persist_owned_tabs() -> None:
+    """Best-effort atomic snapshot of this run's tab ownership."""
+    try:
+        path = DATA_DIR / "owned_tabs.json"
+        payload = json.dumps(
+            {
+                "pid": os.getpid(),
+                "tab_ids": sorted(_OWNED_TAB_IDS),
+                "updated_at": datetime.utcnow().isoformat() + "Z",
+            },
+            ensure_ascii=False,
+        )
+        import tempfile as _tempfile
+        fd, tmp = _tempfile.mkstemp(dir=str(path.parent), prefix=".ot_", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001 — bookkeeping must never break the run
+        pass
+
+
 def _open_tab(url: str) -> str | None:
     """Open url in a new tab; return its targetId (or None → caller falls back)."""
     try:
         payload = core_adapters.get_browser().browser_json("open", url)
-        return core_tab_utils.target_id_from_open(payload)
+        tid = core_tab_utils.target_id_from_open(payload)
+        if tid:
+            _OWNED_TAB_IDS.add(tid)
+            _persist_owned_tabs()
+        return tid
     except Exception:  # noqa: BLE001
         return None
 
@@ -6479,6 +6511,9 @@ def _close_tab(target_id: str | None) -> None:
         oc_browser("close", target_id)
     except Exception:  # noqa: BLE001
         pass
+    if target_id in _OWNED_TAB_IDS:
+        _OWNED_TAB_IDS.discard(target_id)
+        _persist_owned_tabs()
 
 
 def _close_tab_safely(target_id: str | None) -> None:
@@ -6575,13 +6610,76 @@ def _ensure_gateway_or_raise(hb: Any = None, *, reason: str = "") -> None:
 
 
 def _enforce_tab_cap(protect: set[str], cap: int = 12) -> None:
-    """Close oldest page tabs beyond ``cap`` except protected (resolver-bound) and
-    the newest. Keeps the browser from accumulating unbounded tabs over a batch."""
+    """Close this run's oldest tabs beyond ``cap`` except protected
+    (resolver-bound) and the newest.
+
+    v32 FX3 — scoped to _OWNED_TAB_IDS: the old global-cap version counted
+    AND closed sibling briefs' tabs on the shared browser, crashing their
+    in-flight targets with "tab not found". The cap is now per-run (3 briefs
+    → ≤3×cap tabs total); sibling and unknown tabs are structurally
+    unreachable."""
     try:
         payload = _list_tabs_payload()
-        for tid in core_tab_utils.closable_overflow(payload, protect=protect, cap=cap):
+        for tid in core_tab_utils.closable_overflow_owned(
+            payload, owned=_OWNED_TAB_IDS, protect=protect, cap=cap
+        ):
             _close_tab(tid)
     except Exception:  # noqa: BLE001
+        pass
+
+
+def _sweep_orphan_tabs() -> None:
+    """v32 FX3 — close tabs left open by DEAD sibling runs, once per stage.
+
+    Reads every sibling brief's owned_tabs.json; a brief whose
+    active_run.lock is absent/dead is a dead run, and its recorded tabs —
+    MINUS its pending resolve_queue tabs (kept open on purpose for in-place
+    resolution) — are orphans. Live siblings, unknown tabs, and our own
+    brief are never touched. Best-effort; never raises."""
+    try:
+        from _outreach_core.active_run import is_lock_alive, read_lock
+
+        briefs_root = SKILL_DIR / "data" / "briefs"
+        if not briefs_root.is_dir():
+            return
+        open_ids = set(core_tab_utils.page_target_ids(_list_tabs_payload()))
+        if not open_ids:
+            return
+        swept_total = 0
+        for brief_dir in briefs_root.iterdir():
+            if not brief_dir.is_dir() or brief_dir.resolve() == DATA_DIR.resolve():
+                continue
+            record_path = brief_dir / "owned_tabs.json"
+            if not record_path.is_file():
+                continue
+            lock = read_lock(brief_dir)
+            if lock and is_lock_alive(lock):
+                continue  # live sibling — hands off
+            try:
+                record = json.loads(record_path.read_text(encoding="utf-8"))
+                recorded = record.get("tab_ids") or []
+            except (OSError, json.JSONDecodeError):
+                recorded = []
+            resolver_ids = {
+                str(e.get("tab_id"))
+                for e in core_resolve_queue.pending(brief_dir)
+                if e.get("tab_id")
+            }
+            orphans = core_tab_utils.orphan_tab_ids(recorded, open_ids, resolver_ids)
+            for tid in orphans:
+                _close_tab(tid)
+                swept_total += 1
+            try:
+                record_path.unlink()
+            except OSError:
+                pass
+        if swept_total:
+            print(f"  [send] 🧹 swept {swept_total} orphan tab(s) from dead sibling runs")
+            _emit_event(
+                "send.orphan_tabs_swept", stage="send",
+                payload={"count": swept_total},
+            )
+    except Exception:  # noqa: BLE001 — cleanup must never break the run
         pass
 
 
@@ -8898,6 +8996,9 @@ def stage_send(
     hb = HeartbeatSession(SKILL_DIR, "send", len(targets), heartbeat=hb_mode, data_dir=DATA_DIR)
     hb.start(f"send {len(targets)} targets")
     core_progress.start(DATA_DIR, "send", len(targets))
+    # v32 FX3 — close tabs abandoned by DEAD sibling runs before we start
+    # opening our own (bounded browser growth without touching live runs).
+    _sweep_orphan_tabs()
 
     # v27: inbound thread control. A human reply in the progress thread can stop
     # the batch between targets. Disabled (no-op) when Slack isn't configured.

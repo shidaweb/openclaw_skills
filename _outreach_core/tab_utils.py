@@ -78,6 +78,57 @@ def closable_overflow(tabs_payload: Any, *, protect: set[str], cap: int,
     return out
 
 
+def closable_overflow_owned(
+    tabs_payload: Any,
+    *,
+    owned: set[str],
+    protect: set[str],
+    cap: int,
+    keep_newest: int = 1,
+) -> list[str]:
+    """v32 FX3 — like :func:`closable_overflow`, but scoped to OUR OWN tabs.
+
+    Multiple briefs share one browser; the old global cap made run A count
+    (and close) run B's active tab — B's next evaluate then failed with
+    "tab not found" → lead_crashed. Here both the candidate set and the
+    overflow arithmetic use ``owned ∩ open page tabs`` only, so the cap is
+    per-run and a sibling's tab is structurally unreachable. ``protect``
+    (resolver-bound) and the ``keep_newest`` most-recent OWN tabs are still
+    spared. An empty/stale ``owned`` set degrades to closing nothing.
+    """
+    ids = page_target_ids(tabs_payload)
+    owned_open = [tid for tid in ids if tid in owned]
+    if len(owned_open) <= cap:
+        return []
+    protected_tail = set(owned_open[-keep_newest:]) if keep_newest > 0 else set()
+    out: list[str] = []
+    over = len(owned_open) - cap
+    for tid in owned_open:
+        if over <= 0:
+            break
+        if tid in protect or tid in protected_tail:
+            continue
+        out.append(tid)
+        over -= 1
+    return out
+
+
+def orphan_tab_ids(
+    recorded_tab_ids: list[str] | set[str] | None,
+    open_page_ids: set[str],
+    resolver_tab_ids: set[str],
+) -> set[str]:
+    """v32 FX3 — which of a DEAD run's recorded tabs may be closed.
+
+    Only tabs the dead run recorded as its own AND that are still open,
+    MINUS its pending resolve_queue tabs — dead runs legitimately leave
+    error tabs open on purpose so a later resolver pass can fix them
+    in-place. Unknown tabs (not recorded by anyone) are never returned.
+    """
+    recorded = {str(t) for t in (recorded_tab_ids or []) if t}
+    return (recorded & set(open_page_ids)) - set(resolver_tab_ids)
+
+
 # Japanese second-level domains (and a few generic) for registrable-domain calc.
 # Without these, "a.co.jp" and "b.co.jp" would wrongly collapse to "co.jp".
 _MULTI_SLD = {"co", "or", "ne", "ac", "go", "ad", "ed", "gr", "lg", "gov", "com"}
