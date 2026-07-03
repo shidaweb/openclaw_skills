@@ -2179,6 +2179,7 @@ def stage_campaign(
             )
             return
 
+        from _outreach_core import campaign as core_campaign
         from _outreach_core.campaign import (
             CampaignContext,
             CampaignRunner,
@@ -2278,6 +2279,22 @@ def stage_campaign(
             replace_context=clean,
         )
         if result.status == "failed":
+            # v32 FX6 — 0 targets from bootstrap is not a crash: an exhausted
+            # brief (all sent/skipped) ends cleanly, a stale --ids filter is
+            # a deterministic input error (exit 2, supervisor never retries).
+            # Raising here used to burn 3 futile restarts per occurrence.
+            if core_campaign.is_empty_list_result(result):
+                message = core_campaign.empty_list_message(BRIEF_ID, only_ids)
+                print(f"[campaign] {message}")
+                try:
+                    from _outreach_core.notify import post as _notify_post
+                    _notify_post(
+                        message,
+                        level="warn" if only_ids else "info",
+                    )
+                except Exception:  # noqa: BLE001 — Slack must not break exit
+                    pass
+                sys.exit(core_campaign.empty_list_exit_code(only_ids))
             raise RuntimeError(f"campaign failed in {result.stopped_after}")
         if not send_authorized:
             print(f"\n{bar}\nPREVIEW — no send authorization in this run\n{bar}")

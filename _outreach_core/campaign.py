@@ -57,6 +57,47 @@ class CampaignResult:
         return next((row for row in self.phases if row.phase == name), None)
 
 
+# v32 FX6 — an empty LIST phase is not a crash. Bootstrap legitimately
+# writes 0 targets when the brief is exhausted (everything sent/skipped)
+# or when a stale --ids filter matches nothing; raising RuntimeError here
+# used to burn 3 futile supervisor restarts per occurrence.
+
+def is_empty_list_result(result: "CampaignResult") -> bool:
+    """True when the campaign failed ONLY because LIST produced 0 targets."""
+    if result.status != "failed" or result.stopped_after != "list":
+        return False
+    list_phase = result.phase("list")
+    if list_phase is None:
+        return False
+    return str(list_phase.detail.get("reason") or "") == "no targets"
+
+
+def empty_list_exit_code(only_ids: list | None) -> int:
+    """Exit code for the empty-list terminal.
+
+    - ``--ids`` was given (2): the operator named ids that matched nothing —
+      a deterministic input error; the supervisor never retries exit 2.
+    - no filter (0): the brief is simply exhausted — a normal, successful
+      no-op terminal.
+    """
+    return 2 if only_ids else 0
+
+
+def empty_list_message(brief_id: str | None, only_ids: list | None) -> str:
+    brief = brief_id or "?"
+    if only_ids:
+        ids = ",".join(str(x) for x in list(only_ids)[:10])
+        return (
+            f"リスト0件のため送信対象がありません（brief={brief}）。"
+            f"--ids 指定（{ids}）が古い/存在しない可能性があります。"
+            "targets.yaml の id を確認してください。"
+        )
+    return (
+        f"リスト0件のため送信対象がありません（brief={brief}）。"
+        "全件が送信済み/スキップ済みの可能性があります（正常終了扱い）。"
+    )
+
+
 class OutreachChannelAdapter(Protocol):
     """Channel boundary. List/enrich/send differ; draft may reuse core draft."""
 
