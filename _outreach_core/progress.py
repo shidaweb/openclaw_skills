@@ -11,7 +11,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from _outreach_core.config import heartbeat_interval_sec, load_merged_config, load_runtime_config
+from _outreach_core.config import (
+    BriefError,
+    heartbeat_interval_sec,
+    load_merged_config,
+    load_runtime_config,
+)
 from _outreach_core.notify import webhook_configured
 
 _log = logging.getLogger(__name__)
@@ -151,7 +156,11 @@ class HeartbeatSession:
         self._heartbeat_poll_interval = 5.0
         try:
             cfg = load_merged_config(skill_dir, brief_id)
-        except FileNotFoundError:
+        except (FileNotFoundError, BriefError):
+            # Heartbeat config is best-effort: a missing skill config OR an
+            # unresolvable brief (mistyped _active.txt, clean checkout) must
+            # degrade to defaults, never crash the session that exists to
+            # keep the run observable.
             cfg = load_runtime_config(brief_id)
         self._interval = heartbeat_interval_sec(cfg)
 

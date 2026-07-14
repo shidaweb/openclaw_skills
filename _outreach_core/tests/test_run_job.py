@@ -195,6 +195,7 @@ class TestRunJob(unittest.TestCase):
         }
         with mock.patch.object(run_job, "_skill_dir", return_value=Path("/tmp/skill")), \
                 mock.patch.object(run_job, "brief_data_dir", return_value=Path("/tmp/brief")), \
+                mock.patch.object(run_job, "resolve_brief_id", side_effect=lambda b: b), \
                 mock.patch("_outreach_core.run_progress.read", return_value=snap):
             out = run_job._completion_summary(
                 "jp-form-outreach", ["campaign", "--brief", "doorman-ai"]

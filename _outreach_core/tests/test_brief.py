@@ -19,12 +19,35 @@ from _outreach_core.config import (
 
 
 class TestBriefConfig(unittest.TestCase):
+    # Hermetic since v32.1: these used to resolve against the MACHINE's real
+    # briefs/ (gitignored) and _active.txt, so they passed locally and failed
+    # on every clean checkout — invisible while CI itself was broken.
+
+    def _brief_env(self, td: str, active: str | None):
+        from _outreach_core import config as cfg_mod
+
+        briefs = Path(td) / "briefs"
+        briefs.mkdir()
+        (briefs / "fixture-brief.yaml").write_text("brief:\n  goal: test\n")
+        active_file = briefs / "_active.txt"
+        if active is not None:
+            active_file.write_text(active + "\n")
+        return (
+            mock.patch.object(cfg_mod, "BRIEFS_DIR", briefs),
+            mock.patch.object(cfg_mod, "ACTIVE_BRIEF_FILE", active_file),
+        )
+
     def test_resolve_from_active(self) -> None:
-        bid = resolve_brief_id(None)
-        self.assertEqual(bid, "torana-line-crm")
+        with tempfile.TemporaryDirectory() as td:
+            p1, p2 = self._brief_env(td, active="fixture-brief")
+            with p1, p2:
+                self.assertEqual(resolve_brief_id(None), "fixture-brief")
 
     def test_resolve_explicit(self) -> None:
-        self.assertEqual(resolve_brief_id("torana-line-crm"), "torana-line-crm")
+        with tempfile.TemporaryDirectory() as td:
+            p1, p2 = self._brief_env(td, active=None)
+            with p1, p2:
+                self.assertEqual(resolve_brief_id("fixture-brief"), "fixture-brief")
 
     def test_missing_brief_raises(self) -> None:
         with self.assertRaises(BriefError):

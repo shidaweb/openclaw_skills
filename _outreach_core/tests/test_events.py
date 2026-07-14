@@ -92,22 +92,35 @@ class TestEvents(unittest.TestCase):
     def test_report_draft_quality_empty(self) -> None:
         repo = Path(__file__).resolve().parent.parent.parent
         env = {**os.environ, "PYTHONPATH": str(repo)}
-        proc = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "_outreach_core.helpers.report",
-                "draft-quality",
-                "--since",
-                "7d",
-                "--skill",
-                "jp-form-outreach",
-            ],
-            cwd=str(repo),
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        # Hermetic since v32.1: without --brief the report resolves the
+        # machine's _active.txt / briefs/*.yaml (both gitignored), so this
+        # passed locally and failed on clean checkouts. Create a throwaway
+        # fixture brief in the real briefs/ dir (the CLI anchors to the repo
+        # root by package location — there is no env override) and always
+        # remove it.
+        fixture = repo / "briefs" / "_ci_report_fixture.yaml"
+        fixture.write_text("brief:\n  goal: ci fixture\n", encoding="utf-8")
+        try:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "_outreach_core.helpers.report",
+                    "draft-quality",
+                    "--brief",
+                    "_ci_report_fixture",
+                    "--since",
+                    "7d",
+                    "--skill",
+                    "jp-form-outreach",
+                ],
+                cwd=str(repo),
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            fixture.unlink(missing_ok=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("Draft Quality Report", proc.stdout)
 

@@ -132,8 +132,18 @@ def load_merged_config(
 
 
 def load_runtime_config(brief_id: str | None = None) -> dict[str, Any]:
-    """Brief-only config (slack, heartbeat, browser) for notify/progress without skill dir."""
-    return load_brief(brief_id)
+    """Brief-only config (slack, heartbeat, browser) for notify/progress without skill dir.
+
+    Best-effort BY CONTRACT: every caller is observability plumbing
+    (heartbeat mode, notify webhook, keepalive interval), and a missing or
+    mistyped brief must degrade to defaults there — never crash a run.
+    Callers that REQUIRE a brief use load_brief/load_merged_config, which
+    still raise BriefError loudly.
+    """
+    try:
+        return load_brief(brief_id)
+    except BriefError:
+        return {}
 
 
 def heartbeat_interval_sec(merged_config: dict[str, Any] | None = None) -> int:
