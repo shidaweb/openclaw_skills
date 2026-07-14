@@ -87,7 +87,11 @@ class TestSendPerLeadIsolation(unittest.TestCase):
              patch.object(m, "_emit_event", side_effect=emit_event), \
              patch.object(m, "append_sent_history"), \
              patch("_outreach_core.notify.post_problem", return_value=False), \
+             patch.object(m, "_gateway_alive", return_value=True), \
              patch.object(m.time, "sleep"):
+            # _gateway_alive is patched True: with sleep no-op'd, an
+            # unreachable gateway (e.g. CI has no openclaw CLI) would turn
+            # the FX4 recovery wait into a 45-minute busy-spin.
             m.stage_send(drafts, ids or {1, 2}, mode="auto", config={"sender": {}})
         hb = _FakeHeartbeat.instances[-1]
         hb.events = emitted

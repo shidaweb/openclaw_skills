@@ -102,6 +102,7 @@ class TestWaitForGatewayWiring(unittest.TestCase):
                                side_effect=lambda: next(payloads)), \
                 mock.patch.object(run, "_emit_event"), \
                 mock.patch("_outreach_core.notify.post", return_value=True), \
+                mock.patch("shutil.which", return_value="/usr/local/bin/openclaw"), \
                 mock.patch.object(run.time, "sleep"):
             self.assertTrue(run._wait_for_gateway(hb, reason="test"))
         # each poll wrote a main-thread forward-progress note (FX1 contract:
@@ -120,6 +121,7 @@ class TestWaitForGatewayWiring(unittest.TestCase):
         with mock.patch.object(run, "_list_tabs_payload", return_value=None), \
                 mock.patch.object(run, "_emit_event"), \
                 mock.patch("_outreach_core.notify.post", return_value=True), \
+                mock.patch("shutil.which", return_value="/usr/local/bin/openclaw"), \
                 mock.patch.object(run.time, "sleep"), \
                 mock.patch.object(run.time, "time", side_effect=_fake_time), \
                 mock.patch.dict("os.environ", {"DOORMAN_GATEWAY_WAIT_SEC": "60"}):

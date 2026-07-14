@@ -6556,6 +6556,15 @@ def _wait_for_gateway(hb: Any = None, *, reason: str = "") -> bool:
     """
     if _gateway_alive():
         return True
+    # A missing `openclaw` CLI is an ENVIRONMENT problem (bare checkout, CI,
+    # broken PATH), not a gateway outage — waiting cannot fix it, and with a
+    # mocked/no-op sleep the wait loop would busy-spin. Proceed and let the
+    # per-target calls fail loudly, exactly as they did before this gate
+    # existed.
+    import shutil as _shutil
+    if _shutil.which("openclaw") is None:
+        print("  [send] ⚠ openclaw CLI が見つかりません — gateway待機をスキップ（環境問題）")
+        return True
     started = time.time()
     limit = core_gateway_gate.wait_sec()
     poll = core_gateway_gate.poll_sec()
