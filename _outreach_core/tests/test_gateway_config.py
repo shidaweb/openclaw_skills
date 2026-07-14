@@ -103,8 +103,12 @@ class TestPathResolution(unittest.TestCase):
         self.assertEqual(env["PATH"], gw.augmented_path())
 
     def test_resolve_argv_makes_launchctl_absolute(self) -> None:
-        # launchctl resolves under the minimal default PATH already.
-        argv = gw.resolve_argv(["launchctl", "list"])
+        # Hermetic: launchctl exists only on macOS — on Linux CI the real
+        # lookup returns None and argv stays unchanged, which is a different
+        # (also-tested) contract. Mock the lookup so THIS test pins
+        # "absolutize argv[0], keep the rest" independent of the host OS.
+        with mock.patch.object(gw.shutil, "which", return_value="/bin/launchctl"):
+            argv = gw.resolve_argv(["launchctl", "list"])
         self.assertTrue(argv[0].endswith("/launchctl"))
         self.assertEqual(argv[1:], ["list"])
 
