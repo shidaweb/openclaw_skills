@@ -107,3 +107,6 @@ data/pw_profile/
 data/pw_shot_*.png
 data/run_progress.json
 data/run_progress.html
+
+# per-client persona prompts not meant for the public repo
+jp-form-outreach/prompts/channeltalk-clinic/
