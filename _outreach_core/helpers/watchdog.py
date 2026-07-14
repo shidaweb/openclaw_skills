@@ -71,6 +71,25 @@ _OPENCLAW_CLI_TIMEOUT_PATTERNS = (
     "no-output stall",
 )
 
+# v32.1 — auth-failure streak → gateway restart.
+#
+# The Slack agent authenticates with the Claude OAuth token read from the
+# CLI keychain at gateway startup. When the token expires, EVERY reply turn
+# 401s ("Embedded agent failed before reply") and — with no model fallback
+# configured — Slack goes silent with no visible error. Production evidence:
+# 44 hours of continuous 401s (2026-07-12 15:00Z → 07-14 11:42Z) that a
+# gateway restart fixed instantly (the restart re-reads the keychain).
+# Patterns confirmed against the production gateway log.
+_OPENCLAW_AUTH_FAILURE_PATTERNS = (
+    "invalid authentication credentials",
+    "failed to authenticate. api error: 401",
+)
+# ≥2 hits within the lookback = a sustained outage, not a mid-refresh blip.
+# The agent heartbeat fails every ~10 min when auth is dead, so 2 hits in
+# 25 min detects the outage within ~20 minutes of onset.
+AUTH_FAIL_RESTART_THRESHOLD = 2
+AUTH_FAIL_LOOKBACK_SEC = 1500
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -324,6 +343,53 @@ def latest_cli_backend_timeout(
             }
             if latest is None or item["epoch"] > latest["epoch"]:
                 latest = item
+    return latest
+
+
+def _is_auth_failure_line(line: str) -> bool:
+    lower = line.lower()
+    return any(pattern in lower for pattern in _OPENCLAW_AUTH_FAILURE_PATTERNS)
+
+
+def recent_auth_failures(
+    *,
+    log_paths: list[Path] | None = None,
+    now_epoch: float | None = None,
+    lookback_sec: int = AUTH_FAIL_LOOKBACK_SEC,
+) -> dict[str, Any] | None:
+    """v32.1 — recent gateway auth failures (401 / invalid credentials).
+
+    Returns ``{"count", "epoch", "ts", "marker"}`` for the NEWEST failure
+    within ``lookback_sec``, with ``count`` = total failures in the window,
+    or None when the window is clean. The marker dedupes restarts: after a
+    successful restart the old lines age out of the window / keep the same
+    marker, so only NEW failures can trigger another restart.
+    """
+    now = now_epoch if now_epoch is not None else datetime.now(timezone.utc).timestamp()
+    count = 0
+    latest: dict[str, Any] | None = None
+    for path in log_paths or _openclaw_log_candidates():
+        for line in _tail_lines(path):
+            if not _is_auth_failure_line(line):
+                continue
+            ts = _line_timestamp(line, path)
+            if not ts:
+                continue
+            epoch = ts.astimezone(timezone.utc).timestamp()
+            if now - epoch > lookback_sec:
+                continue
+            count += 1
+            item = {
+                "epoch": epoch,
+                "ts": ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "path": str(path),
+                "marker": f"{path}:{int(epoch)}:{line[:180]}",
+            }
+            if latest is None or item["epoch"] > latest["epoch"]:
+                latest = item
+    if latest is None:
+        return None
+    latest["count"] = count
     return latest
 
 
@@ -1018,6 +1084,48 @@ def tick(skills_root: Path | None = None) -> str:
             )
             save_state(state, root)
             append_log(f"cli backend timeout detected but restart budget exhausted {cli_timeout.get('ts')}", root)
+            return "stuck"
+
+        # v32.1 — auth-failure streak (expired OAuth token). The gateway holds
+        # the token it read at startup; when it expires, every Slack reply
+        # 401s SILENTLY (no fallback configured). A restart re-reads the
+        # keychain — the manually-proven recovery, now automatic.
+        auth_fail = recent_auth_failures(now_epoch=now_epoch)
+        if (
+            auth_fail
+            and int(auth_fail.get("count") or 0) >= int(
+                tuning.get("auth_fail_threshold", AUTH_FAIL_RESTART_THRESHOLD)
+            )
+            and auth_fail.get("marker") != state.get("last_auth_failure_marker")
+        ):
+            state["last_auth_failure_marker"] = auth_fail.get("marker")
+            state["last_auth_failure_epoch"] = auth_fail.get("epoch")
+            if can_restart(state, tuning):
+                notify_slack(
+                    "⚠️ Claude認証エラー(401)が連続検知されました（トークン期限切れの可能性）。"
+                    "gatewayを再起動して認証情報を読み直します。"
+                    "再起動後も続く場合は `claude /login` での再ログインが必要です。",
+                    level="warn",
+                )
+                restart_gateway(cfg)
+                record_restart(state, "auth-failure", tuning)
+                save_state(state, root)
+                append_log(
+                    f"restarted gateway (auth failures x{auth_fail.get('count')} "
+                    f"newest={auth_fail.get('ts')})",
+                    root,
+                )
+                return "restarted"
+            notify_slack(
+                "🚨 Claude認証エラー(401)が続いていますが、再起動上限に達しています。"
+                "`claude /login` で再ログインしてください（トークン失効の可能性が高い）。",
+                level="error",
+            )
+            save_state(state, root)
+            append_log(
+                f"auth failures x{auth_fail.get('count')} but restart budget exhausted",
+                root,
+            )
             return "stuck"
 
         health = read_health(root)

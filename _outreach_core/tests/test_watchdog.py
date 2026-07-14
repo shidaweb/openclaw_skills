@@ -467,6 +467,119 @@ class TestOpenClawRuntimePatch(unittest.TestCase):
         self.assertEqual(item["ts"], "2026-06-26T04:31:00Z")
 
 
+class TestRecentAuthFailures(unittest.TestCase):
+    """v32.1 — expired-OAuth 401 streak detection from the gateway log."""
+
+    # Real production shapes (2026-07-12 → 07-14 outage).
+    LINE_EMBEDDED = (
+        '{"0":"Embedded agent failed before reply: Invalid authentication '
+        'credentials","_meta":{"date":"%s","logLevelName":"ERROR"}}'
+    )
+    LINE_401 = (
+        '{"0":"Embedded agent failed before reply: Failed to authenticate. '
+        'API Error: 401 The socket connection was closed unexpectedly",'
+        '"_meta":{"date":"%s"}}'
+    )
+
+    def _write(self, td: str, *lines: str) -> Path:
+        log = Path(td) / "openclaw.log"
+        log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return log
+
+    def test_streak_detected_with_count_and_newest_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log = self._write(
+                td,
+                self.LINE_EMBEDDED % "2026-07-14T11:32:04.096Z",
+                self.LINE_401 % "2026-07-14T11:42:07.649Z",
+            )
+            now = wd._parse_ts("2026-07-14T11:45:00Z").timestamp()
+            item = wd.recent_auth_failures(log_paths=[log], now_epoch=now, lookback_sec=1500)
+        self.assertIsNotNone(item)
+        self.assertEqual(item["count"], 2)
+        self.assertEqual(item["ts"], "2026-07-14T11:42:07Z")
+
+    def test_old_failures_outside_lookback_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log = self._write(td, self.LINE_EMBEDDED % "2026-07-14T08:00:00Z")
+            now = wd._parse_ts("2026-07-14T11:45:00Z").timestamp()
+            self.assertIsNone(
+                wd.recent_auth_failures(log_paths=[log], now_epoch=now, lookback_sec=1500)
+            )
+
+    def test_non_auth_errors_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log = self._write(
+                td,
+                '{"0":"GatewayTransportError: gateway timeout after 25000ms",'
+                '"_meta":{"date":"2026-07-14T11:42:00Z"}}',
+            )
+            now = wd._parse_ts("2026-07-14T11:45:00Z").timestamp()
+            self.assertIsNone(
+                wd.recent_auth_failures(log_paths=[log], now_epoch=now, lookback_sec=1500)
+            )
+
+
+class TestTickAuthFailureRestart(unittest.TestCase):
+    """v32.1 — tick wiring: streak → restart; single blip → no restart;
+    same marker → no double restart."""
+
+    def _tick(self, state, auth_fail, can_restart=True):
+        from contextlib import ExitStack
+        with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
+            root = Path(td)
+            patches = [
+                mock.patch.object(wd, "read_state", return_value=state),
+                _no_self_heal(),
+                mock.patch.object(wd, "is_gateway_loaded", return_value=True),
+                mock.patch.object(wd, "is_gateway_healthy", return_value=True),
+                mock.patch.object(wd, "configured_but_down_channels", return_value=[]),
+                mock.patch.object(wd, "latest_cli_backend_timeout", return_value=None),
+                mock.patch.object(wd, "recent_auth_failures", return_value=auth_fail),
+                mock.patch.object(wd, "can_restart", return_value=can_restart),
+                mock.patch.object(wd, "notify_slack", return_value=True),
+                mock.patch.object(wd, "record_restart"),
+                mock.patch.object(wd, "save_state"),
+                mock.patch.object(wd, "append_log"),
+                mock.patch.object(wd, "collect_active_runs", return_value=[]),
+                mock.patch.object(wd, "read_health", return_value=None),
+            ]
+            for p in patches:
+                stack.enter_context(p)
+            kick = stack.enter_context(
+                mock.patch.object(wd, "restart_gateway", return_value=True)
+            )
+            outcome = wd.tick(root)
+            return outcome, kick
+
+    def test_streak_triggers_restart(self) -> None:
+        state = {"restart_attempts": []}
+        auth_fail = {"marker": "a1", "epoch": 1.0, "ts": "t", "count": 3}
+        outcome, kick = self._tick(state, auth_fail)
+        self.assertEqual(outcome, "restarted")
+        kick.assert_called_once()
+        self.assertEqual(state["last_auth_failure_marker"], "a1")
+
+    def test_single_blip_below_threshold_no_restart(self) -> None:
+        state = {"restart_attempts": []}
+        auth_fail = {"marker": "a1", "epoch": 1.0, "ts": "t", "count": 1}
+        outcome, kick = self._tick(state, auth_fail)
+        kick.assert_not_called()
+
+    def test_same_marker_not_restarted_twice(self) -> None:
+        state = {"restart_attempts": [], "last_auth_failure_marker": "a1"}
+        auth_fail = {"marker": "a1", "epoch": 1.0, "ts": "t", "count": 5}
+        outcome, kick = self._tick(state, auth_fail)
+        kick.assert_not_called()
+
+    def test_budget_exhausted_escalates_to_relogin_message(self) -> None:
+        state = {"restart_attempts": []}
+        auth_fail = {"marker": "a2", "epoch": 1.0, "ts": "t", "count": 4}
+        outcome, kick = self._tick(state, auth_fail, can_restart=False)
+        self.assertEqual(outcome, "stuck")
+        kick.assert_not_called()
+
+
 class TestWatchdogLiveness(unittest.TestCase):
     def test_recent_tick_is_ok(self) -> None:
         self.assertEqual(
